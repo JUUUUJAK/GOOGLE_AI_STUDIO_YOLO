@@ -556,7 +556,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
             ? 'bg-blue-600 text-white border-blue-500'
             : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
             }`}
-          title={activeTool === 'PAN' ? "Switch to Select (V)" : "Switch to Pan (H)"}
+          title={activeTool === 'PAN' ? "이미지 조절 (V)" : "박스 생성 (V)"}
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11" />
@@ -568,7 +568,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
             ? 'bg-blue-600 text-white border-blue-500'
             : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
             }`}
-          title="Toggle Labels"
+          title="레이블 표시 켜기/끄기"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg>
         </button>
@@ -578,21 +578,21 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
             ? 'bg-blue-600 text-white border-blue-500'
             : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
             }`}
-          title="Dim Boxes (B)"
+          title="박스 표시 켜기/끄기 (B)"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
         </button>
         <button
           onClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}
           className="p-2.5 bg-gray-800 text-gray-300 rounded-lg shadow-lg border border-gray-700 hover:bg-gray-700 hover:text-white transition-colors"
-          title="Reset View"
+          title="이미지 크기 재조정"
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
         </button>
         <button
           onClick={() => setIsHelpOpen(true)}
           className="p-2.5 bg-gray-800 text-gray-300 rounded-lg shadow-lg border border-gray-700 hover:bg-gray-700 hover:text-white transition-colors font-bold font-mono"
-          title="Shortcuts & Help"
+          title="단축키 & 안내"
         >
           ?
         </button>
@@ -604,9 +604,9 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           className="absolute inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200"
           onClick={() => setIsHelpOpen(false)}
         >
-          <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl max-w-sm w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+          <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl max-w-md w-full overflow-hidden" onClick={e => e.stopPropagation()}>
             <div className="p-5 border-b border-gray-800 flex justify-between items-center">
-              <h3 className="font-bold text-lg text-white">Controls & Shortcuts</h3>
+              <h3 className="font-bold text-lg text-white">단축키 안내</h3>
               <button onClick={() => setIsHelpOpen(false)} className="text-gray-500 hover:text-white">
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
               </button>
@@ -614,47 +614,55 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
             <div className="p-5 space-y-4">
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Zoom</span>
-                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Mouse Wheel</span>
+                  <span className="text-gray-400">확대</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">마우스 휠</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Pan</span>
-                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Space + Drag / Middle Click</span>
+                  <span className="text-gray-400">이미지 이동</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">스페이스바 or 마우스 가운데 버튼 + 드래그</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Pan Tool</span>
-                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Hand Icon (Top Right)</span>
+                  <span className="text-gray-400">이미지 이동 토글</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">V or 손 아이콘(왼쪽 상단)</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Draw Box</span>
-                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Click + Drag</span>
+                  <span className="text-gray-400">박스 생성</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">클릭 + 드래그</span>
                 </div>
               </div>
               <div className="h-px bg-gray-800 my-2"></div>
               <div className="space-y-2">
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Delete Box</span>
+                  <span className="text-gray-400">박스 삭제</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Del / Backspace / F</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Change Class</span>
-                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">E (Selected Box)</span>
+                  <span className="text-gray-400">클래스 변경</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">E (선택된 클래스로 변경)</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Select Class</span>
+                  <span className="text-gray-400">클래스 선택</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">1 - 9</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Toggle BBox Dimming</span>
+                  <span className="text-gray-400">박스 표시 켜기/끄기</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">B</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Submit/Next</span>
+                  <span className="text-gray-400">제출&다음 이미지</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">D</span>
                 </div>
                 <div className="flex justify-between text-sm">
-                  <span className="text-gray-400">Submit/Prev</span>
+                  <span className="text-gray-400">제출& 이전 이미지</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">A</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-400">되돌리기</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Ctrl+Z</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-400">선택 Box 복사/붙여넣기</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">Ctrl+C / Ctrl+V</span>
                 </div>
               </div>
             </div>

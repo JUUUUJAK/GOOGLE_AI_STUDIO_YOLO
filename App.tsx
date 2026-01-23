@@ -467,17 +467,17 @@ const App: React.FC = () => {
                                                 <button
                                                     onClick={() => handleSubmit('PREV')}
                                                     className="flex-1 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-lg shadow-sm border border-gray-700 transition-all text-sm flex items-center justify-center gap-2"
-                                                    title="Submit & Prev (A)"
+                                                    title="제출 & 이전 (A)"
                                                 >
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-                                                    Prev
+                                                    이전
                                                 </button>
                                                 <button
                                                     onClick={() => handleSubmit('NEXT')}
                                                     className="flex-[1.5] py-3 bg-green-600 hover:bg-green-500 text-white font-bold rounded-lg shadow-lg transition-transform active:scale-[0.98] text-sm flex items-center justify-center gap-2"
-                                                    title="Submit & Next (D)"
+                                                    title="제출 & 다음 (D)"
                                                 >
-                                                    <span>Submit & Next</span>
+                                                    <span>제출 & 다음</span>
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
                                                 </button>
                                             </div>
