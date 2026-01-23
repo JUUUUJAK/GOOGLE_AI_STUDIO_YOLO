@@ -1,0 +1,14 @@
+person
+car
+head
+wheelchair
+storller
+plate
+dump_truck
+forklift
+crane_truck
+excavator
+concrete_mixer_truck
+etc
+blank
+two

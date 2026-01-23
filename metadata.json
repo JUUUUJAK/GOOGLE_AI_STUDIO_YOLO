@@ -1,0 +1,5 @@
+{
+  "name": "YOLOv7 Data Studio",
+  "description": "A professional collaborative annotation tool for YOLOv7 datasets. Features distinct Worker/Reviewer workflows, time-tracking metrics, auto-labeling via Gemini, and dataset export capabilities.",
+  "requestFramePermissions": []
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "id": "local_task_01",
+    "imageUrl": "https://images.unsplash.com/photo-1568605117036-5fe5e7bab0b7?auto=format&fit=crop&w=1000&q=80",
+    "name": "sample_street_view.jpg",
+    "folder": "local_dataset_v1",
+    "status": "TODO",
+    "annotations": []
+  },
+  {
+    "id": "local_task_02",
+    "imageUrl": "https://images.unsplash.com/photo-1541443131876-44b03de101c5?auto=format&fit=crop&w=1000&q=80",
+    "name": "sample_pedestrians.jpg",
+    "folder": "local_dataset_v1",
+    "status": "TODO",
+    "annotations": []
+  },
+  {
+    "id": "local_task_03",
+    "imageUrl": "https://images.unsplash.com/photo-1534361960057-19889db9621e?auto=format&fit=crop&w=1000&q=80",
+    "name": "sample_dog.jpg",
+    "folder": "local_dataset_v2",
+    "status": "TODO",
+    "annotations": []
+  }
+]

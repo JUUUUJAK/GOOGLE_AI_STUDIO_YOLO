@@ -1,0 +1,19 @@
+person
+car
+body_upper
+body_upper_safty_vest
+body_harness
+body_lower
+head_no_gear
+head_safety_gear
+head_hat
+head_dust cap
+EQ_carabiner
+EQ_safety_block
+EQ_traffic_cone
+VH_Two wheel
+VH_fork_lift
+VH_stacker
+VH_excavator
+VH_remicon
+etc
