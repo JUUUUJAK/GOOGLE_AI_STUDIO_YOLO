@@ -81,10 +81,13 @@ export const initStorage = async () => {
         txtPath: f.txtPath, // Path to save to/read from
         // If existing status is something meaningful, keep it. 
         // Else, if persistence file exists, it's Draft/In Progress.
-        status: existing?.status || (f.txtPath ? TaskStatus.IN_PROGRESS : TaskStatus.TODO),
+        // Server-side metadata takes precedence for persistence
+        status: f.status || existing?.status || (f.txtPath ? TaskStatus.IN_PROGRESS : TaskStatus.TODO),
         annotations: existing?.annotations || [], // Will be loaded on demand
-        lastUpdated: existing?.lastUpdated || Date.now(),
-        assignedWorker: existing?.assignedWorker
+        lastUpdated: f.lastUpdated || existing?.lastUpdated || Date.now(),
+        assignedWorker: f.assignedWorker || existing?.assignedWorker,
+        reviewerNotes: f.reviewerNotes || existing?.reviewerNotes,
+        isModified: f.isModified || existing?.isModified
       };
     });
 
@@ -189,6 +192,34 @@ export const updateTask = async (taskId: string, updates: Partial<Task>, userId:
     }
   }
 
+
+  // 3. Persist Metadata (status, isModified, assignedWorker, reviewerNotes)
+  // We save this to _metadata.json via /api/metadata
+  if (updates.status || updates.isModified !== undefined || updates.assignedWorker !== undefined || updates.reviewerNotes !== undefined) {
+    try {
+      // Construct key relative to datasets root: folder/filename
+      const folderPart = updatedTask.folder === 'Unsorted' ? '' : updatedTask.folder;
+      const key = folderPart ? `${folderPart}/${updatedTask.name}` : updatedTask.name;
+
+      await fetch('/api/metadata', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          key,
+          updates: {
+            status: updatedTask.status,
+            isModified: updatedTask.isModified,
+            assignedWorker: updatedTask.assignedWorker,
+            reviewerNotes: updatedTask.reviewerNotes,
+            lastUpdated: updatedTask.lastUpdated
+          }
+        })
+      });
+    } catch (e) {
+      console.error("Failed to save metadata", e);
+    }
+  }
+
   return updatedTask;
 };
 
@@ -229,6 +260,7 @@ export const logAction = (
     action,
     timestamp: Date.now(),
     durationSeconds,
+    isModified: task?.isModified,
     stats
   };
   logs.push(newLog);

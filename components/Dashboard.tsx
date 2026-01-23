@@ -73,6 +73,43 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     const [newTagInput, setNewTagInput] = useState('');
     const [isExporting, setIsExporting] = useState(false);
 
+    const [noticeContent, setNoticeContent] = useState('');
+    const [isEditingNotice, setIsEditingNotice] = useState(false);
+    const [tempNotice, setTempNotice] = useState('');
+
+    useEffect(() => {
+        const fetchNotice = async () => {
+            try {
+                const res = await fetch('/api/label?path=datasets/_notice.txt');
+                if (res.ok) {
+                    const text = await res.text();
+                    setNoticeContent(text);
+                    setTempNotice(text);
+                }
+            } catch (e) {
+                console.error("Failed to fetch notice", e);
+            }
+        };
+        fetchNotice();
+    }, []);
+
+    const handleSaveNotice = async () => {
+        try {
+            await fetch('/api/save', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    path: 'datasets/_notice.txt',
+                    content: tempNotice
+                })
+            });
+            setNoticeContent(tempNotice);
+            setIsEditingNotice(false);
+        } catch (e) {
+            alert('Failed to save notice');
+        }
+    };
+
     useEffect(() => {
         if (!selectedFolder) {
             if (role === UserRole.REVIEWER) {
@@ -130,10 +167,10 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     const activeFolderDetails = useMemo(() => {
         if (!selectedFolder || selectedFolder === ALL_FOLDERS_VIEW) return null;
         const allInFolder = tasks.filter(t => t.folder === selectedFolder);
-        const annotations = allInFolder.reduce((acc, t) => acc + t.annotations.length, 0);
+        const modifiedCount = allInFolder.filter(t => t.isModified).length;
         const uniqueClasses = new Set<number>();
         allInFolder.forEach(t => t.annotations.forEach(a => uniqueClasses.add(a.classId)));
-        return { annotations, classCount: uniqueClasses.size };
+        return { modifiedCount, classCount: uniqueClasses.size };
     }, [tasks, selectedFolder]);
 
     const displayLimit = 50;
@@ -158,7 +195,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     };
 
     return (
-        <div className="w-full max-w-5xl mx-auto h-full flex flex-col bg-gray-950 p-6 overflow-hidden">
+        <div className="w-full h-full flex flex-col bg-gray-950 p-6 overflow-hidden">
 
             {/* --- Top Status Card --- */}
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-5 mb-6 shadow-md flex flex-wrap gap-8 items-center justify-between shrink-0">
@@ -205,7 +242,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             <div className="flex-1 flex gap-6 overflow-hidden">
 
                 {/* Left Sidebar: Folder List */}
-                <div className="w-72 flex-shrink-0 flex flex-col bg-gray-900 border border-gray-800 rounded-xl shadow-md overflow-hidden">
+                <div className="w-[340px] flex-shrink-0 flex flex-col bg-gray-900 border border-gray-800 rounded-xl shadow-md overflow-hidden">
                     <div className="p-4 border-b border-gray-800 bg-gray-800/30">
                         <h3 className="font-bold text-gray-300 text-sm uppercase tracking-wide">Folders</h3>
                     </div>
@@ -214,8 +251,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                             <button
                                 onClick={() => setSelectedFolder(ALL_FOLDERS_VIEW)}
                                 className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-all mb-3 ${selectedFolder === ALL_FOLDERS_VIEW
-                                        ? 'bg-purple-900/30 text-purple-200 border border-purple-700/50 shadow-sm'
-                                        : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
+                                    ? 'bg-purple-900/30 text-purple-200 border border-purple-700/50 shadow-sm'
+                                    : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200'
                                     }`}
                             >
                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
@@ -234,8 +271,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                     key={folder.name}
                                     onClick={() => setSelectedFolder(folder.name)}
                                     className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm transition-all group ${selectedFolder === folder.name
-                                            ? 'bg-blue-900/20 text-blue-300 border border-blue-800/50 shadow-sm'
-                                            : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200 border border-transparent'
+                                        ? 'bg-blue-900/20 text-blue-300 border border-blue-800/50 shadow-sm'
+                                        : 'text-gray-400 hover:bg-gray-800 hover:text-gray-200 border border-transparent'
                                         }`}
                                 >
                                     <span className="flex items-center gap-3 truncate">
@@ -251,8 +288,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                     </div>
                 </div>
 
-                {/* Right Content */}
-                <div className="flex-1 bg-gray-900 border border-gray-800 rounded-xl shadow-md overflow-hidden flex flex-col relative">
+                {/* Center Content: Task List */}
+                <div className="flex-1 bg-gray-900 border border-gray-800 rounded-xl shadow-md overflow-hidden flex flex-col relative min-w-0">
 
                     {/* --- ADMIN OVERVIEW MODE --- */}
                     {selectedFolder === ALL_FOLDERS_VIEW && role === UserRole.REVIEWER ? (
@@ -382,6 +419,41 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                 className="w-full h-20 bg-gray-900 border border-gray-700 rounded-lg px-3 py-2 text-sm text-gray-200 focus:border-blue-500 outline-none resize-none"
                                                 placeholder="Instructions..."
                                             />
+                                            <div className="flex gap-2">
+                                                <button
+                                                    onClick={() => {
+                                                        const folderTasks = tasks.filter(t => t.folder === selectedFolder);
+                                                        // Sort by name A-Z to find the "first" TODO
+                                                        folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+
+                                                        const firstTodo = folderTasks.find(t => t.status === TaskStatus.TODO);
+                                                        if (firstTodo) {
+                                                            onSelectTask(firstTodo.id);
+                                                        } else {
+                                                            alert("No pending tasks found in this folder!");
+                                                        }
+                                                    }}
+                                                    className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-blue-900/20"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                                    Continue Work
+                                                </button>
+                                                <button
+                                                    onClick={() => handleAssignWorker(selectedFolder, username)}
+                                                    className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
+                                                >
+                                                    Assign to Me
+                                                </button>
+                                                <button
+                                                    onClick={() => {
+                                                        const newOwner = prompt('Enter username to assign folder to:');
+                                                        if (newOwner) handleAssignWorker(selectedFolder, newOwner);
+                                                    }}
+                                                    className="bg-gray-800 hover:bg-gray-700 text-gray-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
+                                                >
+                                                    Assign...
+                                                </button>
+                                            </div>
                                             <div className="flex justify-end">
                                                 <button
                                                     onClick={handleSaveMeta}
@@ -409,6 +481,33 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                     )}
                                 </div>
 
+                                {/* Action Buttons */}
+                                <div className="px-6 pt-4 pb-4 flex gap-2">
+                                    <button
+                                        onClick={() => {
+                                            const folderTasks = tasks.filter(t => t.folder === selectedFolder);
+                                            // Sort by name A-Z to find the "first" pending
+                                            folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+
+                                            const firstPending = folderTasks.find(t =>
+                                                t.status === TaskStatus.TODO ||
+                                                t.status === TaskStatus.IN_PROGRESS ||
+                                                t.status === TaskStatus.REJECTED
+                                            );
+
+                                            if (firstPending) {
+                                                onSelectTask(firstPending.id);
+                                            } else {
+                                                alert("No pending tasks (TODO, IN_PROGRESS, REJECTED) found in this folder!");
+                                            }
+                                        }}
+                                        className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-blue-900/20"
+                                    >
+                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                        Continue Work
+                                    </button>
+                                </div>
+
                                 {/* Stats Row */}
                                 {activeFolderStats && activeFolderDetails && (
                                     <div className="p-6 border-b border-gray-800 grid grid-cols-4 gap-4">
@@ -431,8 +530,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                             <div className="mt-1 text-xl font-bold text-red-400">{activeFolderStats.rejected}</div>
                                         </div>
                                         <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
-                                            <span className="text-xs text-gray-500 font-bold uppercase">Objects</span>
-                                            <div className="mt-1 text-xl font-bold text-purple-400">{activeFolderDetails.annotations}</div>
+                                            <span className="text-xs text-gray-500 font-bold uppercase">User Modified</span>
+                                            <div className="mt-1 text-xl font-bold text-purple-400">{activeFolderDetails.modifiedCount}</div>
                                         </div>
                                     </div>
                                 )}
@@ -503,8 +602,46 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                         )
                     )}
                 </div>
+
+                {/* Right Panel: Notice Board */}
+                <div className="w-[800px] flex-shrink-0 flex flex-col bg-gray-900 border border-gray-800 rounded-xl shadow-md overflow-hidden">
+                    <div className="p-4 border-b border-gray-800 bg-gray-800/30 flex items-center justify-between">
+                        <h3 className="font-bold text-red-400 text-sm uppercase tracking-wide">Notice</h3>
+                        {accountType === AccountType.ADMIN && (
+                            <button
+                                onClick={() => setIsEditingNotice(!isEditingNotice)}
+                                className="text-xs text-blue-400 hover:text-blue-300"
+                            >
+                                {isEditingNotice ? 'Cancel' : 'Edit'}
+                            </button>
+                        )}
+                    </div>
+                    <div className="flex-1 p-4 overflow-y-auto">
+                        {isEditingNotice ? (
+                            <div className="flex flex-col gap-2 h-full">
+                                <textarea
+                                    className="flex-1 w-full bg-gray-800 border border-gray-700 rounded-lg p-3 text-sm text-gray-200 outline-none focus:border-blue-500 resize-none"
+                                    value={tempNotice}
+                                    onChange={(e) => setTempNotice(e.target.value)}
+                                    placeholder="Write a notice..."
+                                />
+                                <button
+                                    onClick={handleSaveNotice}
+                                    className="w-full bg-blue-600 text-white font-bold py-2 rounded-lg hover:bg-blue-500"
+                                >
+                                    Save Notice
+                                </button>
+                            </div>
+                        ) : (
+                            <div className="text-sm text-gray-300 whitespace-pre-wrap leading-relaxed">
+                                {noticeContent || <span className="text-gray-500 italic">No notices posted.</span>}
+                            </div>
+                        )}
+                    </div>
+                </div>
+
             </div>
-        </div>
+        </div >
     );
 };
 

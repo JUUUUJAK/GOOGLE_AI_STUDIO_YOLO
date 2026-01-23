@@ -128,7 +128,7 @@ const App: React.FC = () => {
 
     const handleUpdateAnnotations = async (newAnnotations: any[]) => {
         if (!currentTask || !user) return;
-        const updated = await Storage.updateTask(currentTask.id, { annotations: newAnnotations }, user.username, currentUserRole);
+        const updated = await Storage.updateTask(currentTask.id, { annotations: newAnnotations, isModified: true }, user.username, currentUserRole);
         setCurrentTask(updated);
     };
 
@@ -422,13 +422,13 @@ const App: React.FC = () => {
                                         </select>
                                     </div>
 
-                                    <div className="flex-1 overflow-y-auto p-4 space-y-2">
+                                    <div className="flex-1 overflow-y-auto p-4 space-y-0.5">
                                         <h3 className="px-2 text-xs font-bold text-gray-500 uppercase tracking-wider mb-2">Classes (1-9)</h3>
                                         {currentClasses.map((cls, idx) => (
                                             <button
                                                 key={cls.id}
                                                 onClick={() => setSelectedClass(cls)}
-                                                className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-md border transition-all ${selectedClass?.id === cls.id
+                                                className={`w-full flex items-center gap-3 px-3 py-1.5 rounded-md border transition-all ${selectedClass?.id === cls.id
                                                     ? 'bg-gray-800 border-gray-600 shadow-md'
                                                     : 'border-transparent hover:bg-gray-800/50'
                                                     }`}

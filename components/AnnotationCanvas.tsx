@@ -32,6 +32,8 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
   // UI State
   const [activeTool, setActiveTool] = useState<ToolMode>('SELECT');
   const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [showLabels, setShowLabels] = useState(true);
+  const [dimBoxes, setDimBoxes] = useState(false);
 
   // Track space key state for temporary panning
   const isSpacePressedRef = useRef(false);
@@ -47,13 +49,22 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
   const [draggingBoxSnapshot, setDraggingBoxSnapshot] = useState<BoundingBox | null>(null);
   const [resizingHandle, setResizingHandle] = useState<ResizeHandle | null>(null);
 
+  // Undo/Redo & Clipboard
+  const [undoStack, setUndoStack] = useState<BoundingBox[][]>([]);
+  const clipboardRef = useRef<BoundingBox | null>(null);
+
+  const saveHistory = useCallback(() => {
+    setUndoStack(prev => [...prev, annotations]);
+  }, [annotations]);
+
   const handleDelete = useCallback((id: string) => {
     if (readOnly) return;
+    saveHistory(); // Save before delete
     onUpdateAnnotations(annotations.filter(a => a.id !== id));
     if (selectedBoxId === id) {
       setSelectedBoxId(null);
     }
-  }, [annotations, onUpdateAnnotations, readOnly, selectedBoxId]);
+  }, [annotations, onUpdateAnnotations, readOnly, selectedBoxId, saveHistory]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -61,6 +72,50 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       if (readOnly) return;
 
       const key = e.key.toLowerCase();
+      const isCtrl = e.ctrlKey || e.metaKey;
+
+      if (isCtrl) {
+        // Undo: Ctrl + Z
+        if (key === 'z') {
+          e.preventDefault();
+          setUndoStack(prev => {
+            if (prev.length === 0) return prev;
+            const newStack = [...prev];
+            const lastState = newStack.pop();
+            if (lastState) {
+              onUpdateAnnotations(lastState);
+            }
+            return newStack;
+          });
+          return;
+        }
+
+        // Copy: Ctrl + C
+        if (key === 'c' && selectedBoxId) {
+          e.preventDefault();
+          const box = annotations.find(b => b.id === selectedBoxId);
+          if (box) clipboardRef.current = box;
+          return;
+        }
+
+        // Paste: Ctrl + V
+        if (key === 'v') {
+          e.preventDefault();
+          if (clipboardRef.current) {
+            saveHistory(); // Save before paste
+            const newBox = {
+              ...clipboardRef.current,
+              id: Math.random().toString(36).substr(2, 9),
+              x: Math.min(Math.max(0, clipboardRef.current.x + 0.02), 0.9), // Offset
+              y: Math.min(Math.max(0, clipboardRef.current.y + 0.02), 0.9), // Offset
+              isAutoLabel: false
+            };
+            onUpdateAnnotations([...annotations, newBox]);
+            setSelectedBoxId(newBox.id);
+          }
+          return;
+        }
+      }
 
       // Delete shortcuts
       if (selectedBoxId && (e.key === 'Delete' || e.key === 'Backspace' || key === 'f')) {
@@ -71,6 +126,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       // Change Class of selected box: 'e'
       if (selectedBoxId && key === 'e') {
         e.preventDefault();
+        saveHistory(); // Save before modify
         const updated = annotations.map(box =>
           box.id === selectedBoxId ? { ...box, classId: currentClass.id, isAutoLabel: false } : box
         );
@@ -89,6 +145,20 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
         setDraggingBoxSnapshot(null);
         setResizingHandle(null);
         setActiveTool('SELECT'); // Revert to select on Escape
+      }
+
+      // Tool Shortcuts
+      if (key === 'h') {
+        setActiveTool('PAN');
+      }
+
+      // Box Visibility Shortcut
+      if (key === 'b') {
+        setDimBoxes(prev => !prev);
+      }
+
+      if (key === 'v') {
+        setActiveTool(prev => prev === 'SELECT' ? 'PAN' : 'SELECT');
       }
     };
     window.addEventListener('keydown', handleKeyDown);
@@ -153,29 +223,37 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       }
     }
 
-    // 3. Check Box Click (Move)
-    const boxElement = target.closest('[data-boxid]');
+    // 3. Check Box Click (Select / Move)
+    // Use elementsFromPoint to handle overlapping boxes (Cycle Selection)
+    const elements = document.elementsFromPoint(e.clientX, e.clientY);
+    const boxElements = elements.filter(el => (el as HTMLElement).dataset?.boxid);
 
-    // If clicking a delete button, let the button's onClick handle it
-    if (target.closest('button')) return;
+    if (boxElements.length > 0) {
+      // Find all box IDs under the cursor
+      const boxIds = boxElements.map(el => (el as HTMLElement).dataset.boxid as string);
 
-    if (boxElement) {
-      const id = (boxElement as HTMLElement).dataset.boxid;
-      if (id) {
-        setSelectedBoxId(id);
-
-        // Initialize Drag logic if it's the selected box
-        const box = annotations.find(b => b.id === id);
-        if (box) {
-          const pos = getNormalizedPos(e);
-          setDragStartPos(pos);
-          setDraggingBoxSnapshot(box);
-        }
-        return; // Stop drawing logic
+      // Determine next box to select
+      let nextBoxId = boxIds[0];
+      if (selectedBoxId && boxIds.includes(selectedBoxId)) {
+        const currentIndex = boxIds.indexOf(selectedBoxId);
+        nextBoxId = boxIds[(currentIndex + 1) % boxIds.length];
       }
+
+      setSelectedBoxId(nextBoxId);
+
+      // Initialize Drag logic if it's the selected box
+      const box = annotations.find(b => b.id === nextBoxId);
+      if (box) {
+        saveHistory(); // Save before drag/resize
+        const pos = getNormalizedPos(e);
+        setDragStartPos(pos);
+        setDraggingBoxSnapshot(box);
+      }
+      return; // Stop drawing logic
     }
 
     // 4. Click Empty Space (Start Drawing)
+    saveHistory(); // Save before drawing new box
     setSelectedBoxId(null);
     setDragStartPos(null);
     setDraggingBoxSnapshot(null);
@@ -365,6 +443,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       className="relative w-full h-full bg-gray-950 overflow-hidden select-none"
       onMouseDown={handleMouseDown}
       onWheel={handleWheel}
+      onContextMenu={(e) => e.preventDefault()}
       style={{ cursor: activeTool === 'PAN' || isPanning ? 'grab' : (readOnly ? 'default' : 'crosshair') }}
     >
       {/* Transform Container */}
@@ -402,23 +481,26 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                   : `inset 0 0 0 ${2 / scale}px ${color}`,
                 border: `${1 / scale}px ${borderStyle} ${color}`,
                 backgroundColor: isSelected ? `${color}33` : `${color}0D`,
+                opacity: dimBoxes && !isSelected ? 0.15 : 1,
                 cursor: readOnly || activeTool === 'PAN' ? 'inherit' : (isSelected ? 'move' : 'pointer')
               }}
             >
-              {/* Label Tag */}
-              <span
-                className={`absolute left-0 px-2 py-0.5 font-bold text-white rounded-sm shadow-sm whitespace-nowrap pointer-events-none origin-bottom-left flex items-center justify-center`}
-                style={{
-                  backgroundColor: color,
-                  bottom: '100%',
-                  fontSize: `${12 / scale}px`,
-                  lineHeight: `${14 / scale}px`,
-                  padding: `${2 / scale}px ${4 / scale}px`,
-                  marginBottom: `${2 / scale}px`,
-                }}
-              >
-                {cls?.name} {box.isAutoLabel && '(AI)'}
-              </span>
+              {/* Label Tag (Conditional) */}
+              {showLabels && (
+                <span
+                  className={`absolute left-0 px-2 py-0.5 font-bold text-white rounded-sm shadow-sm whitespace-nowrap pointer-events-none origin-bottom-left flex items-center justify-center`}
+                  style={{
+                    backgroundColor: color,
+                    bottom: '100%',
+                    fontSize: `${12 / scale}px`,
+                    lineHeight: `${14 / scale}px`,
+                    padding: `${2 / scale}px ${4 / scale}px`,
+                    marginBottom: `${2 / scale}px`,
+                  }}
+                >
+                  {cls?.name} {box.isAutoLabel && '(AI)'}
+                </span>
+              )}
 
               {/* Resize Handles */}
               {isSelected && !readOnly && activeTool !== 'PAN' && (
@@ -467,18 +549,38 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       </div>
 
       {/* Floating Toolbar (Tools & Zoom) */}
-      <div className="absolute top-4 right-4 flex flex-col gap-2 z-50">
+      <div className="absolute top-4 left-4 flex flex-col gap-2 z-50">
         <button
           onClick={() => setActiveTool(activeTool === 'PAN' ? 'SELECT' : 'PAN')}
           className={`p-2.5 rounded-lg shadow-lg border transition-all ${activeTool === 'PAN'
-              ? 'bg-blue-600 text-white border-blue-500'
-              : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+            ? 'bg-blue-600 text-white border-blue-500'
+            : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
             }`}
           title={activeTool === 'PAN' ? "Switch to Select (V)" : "Switch to Pan (H)"}
         >
           <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 11.5V14m0-2.5v-6a1.5 1.5 0 113 0m-3 6a1.5 1.5 0 00-3 0v2a7.5 7.5 0 0015 0v-5a1.5 1.5 0 00-3 0m-6-3V11m0-5.5v-1a1.5 1.5 0 013 0v1m0 0V11m0-5.5a1.5 1.5 0 013 0v3m0 0V11" />
           </svg>
+        </button>
+        <button
+          onClick={() => setShowLabels(!showLabels)}
+          className={`p-2.5 rounded-lg shadow-lg border transition-all ${showLabels
+            ? 'bg-blue-600 text-white border-blue-500'
+            : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+            }`}
+          title="Toggle Labels"
+        >
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg>
+        </button>
+        <button
+          onClick={() => setDimBoxes(!dimBoxes)}
+          className={`p-2.5 rounded-lg shadow-lg border transition-all ${dimBoxes
+            ? 'bg-blue-600 text-white border-blue-500'
+            : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+            }`}
+          title="Dim Boxes (B)"
+        >
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
         </button>
         <button
           onClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}
@@ -541,6 +643,10 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                 <div className="flex justify-between text-sm">
                   <span className="text-gray-400">Select Class</span>
                   <span className="text-white font-mono bg-gray-800 px-1.5 rounded">1 - 9</span>
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span className="text-gray-400">Toggle BBox Dimming</span>
+                  <span className="text-white font-mono bg-gray-800 px-1.5 rounded">B</span>
                 </div>
                 <div className="flex justify-between text-sm">
                   <span className="text-gray-400">Submit/Next</span>

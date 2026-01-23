@@ -41,7 +41,11 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
       };
 
       current.taskCount += 1;
-      current.manualObjects += (log.stats?.manualBoxCount || 0);
+      // Count as modified if isModified flag is true.
+      // Backward compatibility: If isModified is undefined, assume modified if manualBoxCount > 0
+      if (log.isModified || (log.isModified === undefined && (log.stats?.manualBoxCount || 0) > 0)) {
+        current.manualObjects += 1;
+      }
       current.totalTime += (log.durationSeconds || 0);
       current.lastActive = Math.max(current.lastActive, log.timestamp);
 
@@ -61,7 +65,7 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
     const csvRows = [
       ['Folder', 'Worker', 'Tasks Completed', 'Manual Objects (New/Edited)', 'Total Time (h)', 'Avg Time/Task (s)', 'Last Active']
     ];
-    
+
     historyData.forEach(row => {
       csvRows.push([
         row.folderName,
@@ -89,17 +93,17 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
         <div>
           <h2 className="text-2xl font-bold text-white tracking-tight">Work History & Performance</h2>
           <p className="text-gray-400 mt-1">
-            {accountType === AccountType.ADMIN 
-              ? "Aggregated performance metrics across all folders and workers." 
+            {accountType === AccountType.ADMIN
+              ? "Aggregated performance metrics across all folders and workers."
               : "Your contribution history across different folders."}
           </p>
         </div>
-        <button 
-            onClick={handleDownloadCSV}
-            className="bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 hover:text-white px-5 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors"
+        <button
+          onClick={handleDownloadCSV}
+          className="bg-gray-800 hover:bg-gray-700 border border-gray-600 text-gray-300 hover:text-white px-5 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors"
         >
-            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
-            Export Report
+          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+          Export Report
         </button>
       </div>
 
@@ -111,7 +115,7 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
                 <th className="p-4 font-semibold">Folder</th>
                 <th className="p-4 font-semibold">Worker</th>
                 <th className="p-4 font-semibold text-right">Tasks Completed</th>
-                <th className="p-4 font-semibold text-right text-blue-400">Manual Objects*</th>
+                <th className="p-4 font-semibold text-right text-blue-400">Modified Images*</th>
                 <th className="p-4 font-semibold text-right">Total Time</th>
                 <th className="p-4 font-semibold text-right">Avg Time / Task</th>
                 <th className="p-4 font-semibold">Last Active</th>
@@ -129,23 +133,23 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
                   <tr key={idx} className="hover:bg-gray-800/30 transition-colors">
                     <td className="p-4 font-medium text-white">{row.folderName}</td>
                     <td className="p-4">
-                        <div className="flex items-center gap-2">
-                            <div className="w-6 h-6 rounded-full bg-gray-700 flex items-center justify-center text-xs font-bold text-gray-400">
-                                {row.workerName.charAt(0).toUpperCase()}
-                            </div>
-                            {row.workerName}
+                      <div className="flex items-center gap-2">
+                        <div className="w-6 h-6 rounded-full bg-gray-700 flex items-center justify-center text-xs font-bold text-gray-400">
+                          {row.workerName.charAt(0).toUpperCase()}
                         </div>
+                        {row.workerName}
+                      </div>
                     </td>
                     <td className="p-4 text-right font-mono text-base">{row.taskCount}</td>
                     <td className="p-4 text-right font-mono text-base text-blue-300 font-bold bg-blue-900/10">
-                        {row.manualObjects}
+                      {row.manualObjects}
                     </td>
                     <td className="p-4 text-right font-mono text-gray-400">{formatTime(row.totalTime)}</td>
                     <td className="p-4 text-right font-mono text-gray-400">
-                        {row.taskCount > 0 ? Math.round(row.totalTime / row.taskCount) + 's' : '-'}
+                      {row.taskCount > 0 ? Math.round(row.totalTime / row.taskCount) + 's' : '-'}
                     </td>
                     <td className="p-4 text-gray-500 text-xs">
-                      {new Date(row.lastActive).toLocaleDateString()} {new Date(row.lastActive).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'})}
+                      {new Date(row.lastActive).toLocaleDateString()} {new Date(row.lastActive).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                     </td>
                   </tr>
                 ))
@@ -154,7 +158,7 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
           </table>
         </div>
         <div className="p-4 bg-gray-900 border-t border-gray-800 text-xs text-gray-500">
-            * <strong>Manual Objects</strong>: Counts objects manually drawn or AI-generated objects that were modified (moved/resized) by the worker. Untouched AI predictions are excluded.
+          * <strong>Modified Images</strong>: Counts the number of images where the worker made manual edits (create, update, delete).
         </div>
       </div>
     </div>

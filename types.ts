@@ -48,6 +48,7 @@ export interface Task {
   assignedWorker?: string;
   reviewerNotes?: string;
   lastUpdated: number;
+  isModified?: boolean; // True if annotations have been modified by a user
 }
 
 export interface FolderMetadata {
@@ -64,6 +65,7 @@ export interface WorkLog {
   action: 'START' | 'SAVE' | 'SUBMIT' | 'APPROVE' | 'REJECT' | 'AUTO_LABEL';
   timestamp: number;
   durationSeconds?: number; // For session tracking
+  isModified?: boolean;
   stats?: {
     totalBoxCount: number;
     manualBoxCount: number; // Count of boxes where isAutoLabel is false/undefined
