@@ -141,8 +141,8 @@ const App: React.FC = () => {
         validStatuses: TaskStatus[]
     ): Task | null => {
         const folderTasks = allTasks.filter(t => t.folder === currentFolder);
-        // Sort Z-A
-        folderTasks.sort((a, b) => b.name.localeCompare(a.name));
+        // Sort A-Z
+        folderTasks.sort((a, b) => a.name.localeCompare(b.name));
 
         const currentIndex = folderTasks.findIndex(t => t.id === currentId);
         let targetTask = null;
@@ -155,10 +155,8 @@ const App: React.FC = () => {
                 const forwardSearch = folderTasks.slice(currentIndex + 1).find(t => validStatuses.includes(t.status));
                 if (forwardSearch) {
                     targetTask = forwardSearch;
-                } else {
-                    const anyValid = folderTasks.find(t => t.id !== currentId && validStatuses.includes(t.status));
-                    if (anyValid) targetTask = anyValid;
                 }
+                // Removed wrapping logic: Do not go back to start if end is reached.
             }
         } else {
             if (currentIndex > 0) {
@@ -167,6 +165,22 @@ const App: React.FC = () => {
         }
         return targetTask;
     };
+
+    const navigateTask = useCallback((direction: 'NEXT' | 'PREV', validStatuses: TaskStatus[]) => {
+        if (!currentTask) return;
+        const allTasks = Storage.getTasks();
+        const targetTask = findNextTask(allTasks, currentTask.id, currentTask.folder, direction, validStatuses);
+
+        if (targetTask) {
+            handleTaskSelect(targetTask.id);
+        } else {
+            if (direction === 'NEXT') {
+                // alert("End of folder.");
+            } else {
+                alert("Start of folder.");
+            }
+        }
+    }, [currentTask, handleTaskSelect]);
 
     const handleSubmit = useCallback(async (direction: 'NEXT' | 'PREV' = 'NEXT') => {
         if (!currentTask || !user) return;
@@ -186,7 +200,6 @@ const App: React.FC = () => {
         } else {
             if (direction === 'NEXT') {
                 alert("All tasks in this folder are completed!");
-                // handleCloseTask();
             } else {
                 alert("This is the first task in the folder.");
             }
@@ -205,7 +218,7 @@ const App: React.FC = () => {
         setTasks(allTasks);
 
         if (!direction) {
-            handleCloseTask();
+            alert(approved ? "Task Approved" : "Task Rejected");
             return;
         }
 
@@ -217,7 +230,6 @@ const App: React.FC = () => {
         } else {
             if (direction === 'NEXT') {
                 alert("All submitted tasks in this folder are reviewed!");
-                // handleCloseTask();
             } else {
                 alert("Start of folder.");
             }
@@ -245,16 +257,32 @@ const App: React.FC = () => {
                 if (key === 'd') handleSubmit('NEXT');
             } else {
                 // Reviewer Shortcuts
-                // a - Approve & Prev
-                if (key === 'a') handleReview(true, 'PREV');
-                // d - Approve & Next
-                if (key === 'd') handleReview(true, 'NEXT');
+
+                // A: Prev
+                if (key === 'a') {
+                    // If already reviewed, just move PREV
+                    if (currentTask.status === TaskStatus.APPROVED || currentTask.status === TaskStatus.REJECTED) {
+                        navigateTask('PREV', [TaskStatus.SUBMITTED, TaskStatus.APPROVED, TaskStatus.REJECTED]);
+                    } else {
+                        handleReview(true, 'PREV');
+                    }
+                }
+
+                // D: Next
+                if (key === 'd') {
+                    // If already reviewed, just move NEXT
+                    if (currentTask.status === TaskStatus.APPROVED || currentTask.status === TaskStatus.REJECTED) {
+                        navigateTask('NEXT', [TaskStatus.SUBMITTED, TaskStatus.APPROVED, TaskStatus.REJECTED]);
+                    } else {
+                        handleReview(true, 'NEXT');
+                    }
+                }
             }
         };
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [currentTask, handleSubmit, handleReview, currentUserRole, currentClasses]);
+    }, [currentTask, handleSubmit, handleReview, currentUserRole, currentClasses, navigateTask]);
 
     const currentFolderStats = useMemo(() => {
         if (!currentTask) return { completed: 0, total: 0 };
@@ -268,9 +296,9 @@ const App: React.FC = () => {
     }
 
     return (
-        <div className="min-h-screen bg-gray-950 text-gray-100 flex flex-col font-sans">
+        <div className="h-screen bg-gray-950 text-gray-100 flex flex-col font-sans overflow-hidden">
             {/* Navbar */}
-            <nav className="border-b border-gray-800 bg-gray-900 z-50 shadow-sm">
+            <nav className="border-b border-gray-800 bg-gray-900 z-50 shadow-sm flex-shrink-0">
                 <div className="w-full max-w-5xl mx-auto px-6 py-4 flex items-center justify-between">
                     <div className="flex items-center gap-4">
                         <div className="w-10 h-10 bg-blue-600 rounded-lg flex items-center justify-center font-bold text-xl shadow-lg">Y7</div>
