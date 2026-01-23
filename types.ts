@@ -21,6 +21,14 @@ export enum TaskStatus {
   REJECTED = 'REJECTED',
 }
 
+export const TaskStatusLabels: Record<TaskStatus, string> = {
+  [TaskStatus.TODO]: '대기',
+  [TaskStatus.IN_PROGRESS]: '작업중',
+  [TaskStatus.SUBMITTED]: '제출',
+  [TaskStatus.APPROVED]: '완료',
+  [TaskStatus.REJECTED]: '반려',
+};
+
 export interface BoundingBox {
   id: string;
   classId: number;

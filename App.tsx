@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { UserRole, Task, TaskStatus, YoloClass, User, AccountType } from './types';
+import { UserRole, Task, TaskStatus, TaskStatusLabels, YoloClass, User, AccountType } from './types';
 import { COLOR_PALETTE } from './constants';
 import * as Storage from './services/storage';
 import Dashboard from './components/Dashboard';
@@ -285,10 +285,11 @@ const App: React.FC = () => {
     }, [currentTask, handleSubmit, handleReview, currentUserRole, currentClasses, navigateTask]);
 
     const currentFolderStats = useMemo(() => {
-        if (!currentTask) return { completed: 0, total: 0 };
+        if (!currentTask) return { completed: 0, total: 0, approved: 0 };
         const folderTasks = tasks.filter(t => t.folder === currentTask.folder);
         const completed = folderTasks.filter(t => t.status === TaskStatus.SUBMITTED || t.status === TaskStatus.APPROVED).length;
-        return { completed, total: folderTasks.length };
+        const approved = folderTasks.filter(t => t.status === TaskStatus.APPROVED).length;
+        return { completed, total: folderTasks.length, approved };
     }, [currentTask, tasks]);
 
     if (!user) {
@@ -387,7 +388,7 @@ const App: React.FC = () => {
                                         <h2 className="font-bold text-lg text-white truncate" title={currentTask.name}>{currentTask.name}</h2>
                                         <div className="flex items-center gap-3 mt-3">
                                             <span className="text-xs font-bold text-gray-400 bg-gray-800 px-2.5 py-1 rounded border border-gray-700">
-                                                {currentTask.status}
+                                                {TaskStatusLabels[currentTask.status]}
                                             </span>
                                             <span className="text-xs text-gray-500 border-l border-gray-700 pl-3">
                                                 {currentTask.folder}
@@ -395,22 +396,40 @@ const App: React.FC = () => {
                                         </div>
 
                                         <div className="mt-6 bg-gray-800/50 p-3 rounded-lg border border-gray-700/50">
-                                            <div className="flex justify-between text-xs text-gray-400 mb-2 font-medium">
-                                                <span>Folder Progress</span>
-                                                <span>{currentFolderStats.completed} / {currentFolderStats.total}</span>
-                                            </div>
-                                            <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
-                                                <div
-                                                    className="bg-blue-500 h-full transition-all duration-300"
-                                                    style={{ width: `${(currentFolderStats.completed / Math.max(currentFolderStats.total, 1)) * 100}%` }}
-                                                />
-                                            </div>
+                                            {currentUserRole === UserRole.REVIEWER ? (
+                                                <>
+                                                    <div className="flex justify-between text-xs text-gray-400 mb-2 font-medium">
+                                                        <span>Review Progress</span>
+                                                        <span>{currentFolderStats.approved} / {currentFolderStats.completed - currentFolderStats.approved}</span>
+                                                    </div>
+                                                    <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
+                                                        <div
+                                                            className="bg-purple-600 h-full transition-all duration-300"
+                                                            style={{ width: `${currentFolderStats.completed > 0 ? (currentFolderStats.approved / currentFolderStats.completed) * 100 : 0}%` }}
+                                                        />
+                                                    </div>
+                                                    <div className="mt-1 text-[10px] text-right text-gray-500">Approved / Pending</div>
+                                                </>
+                                            ) : (
+                                                <>
+                                                    <div className="flex justify-between text-xs text-gray-400 mb-2 font-medium">
+                                                        <span>Folder Progress</span>
+                                                        <span>{currentFolderStats.completed} / {currentFolderStats.total}</span>
+                                                    </div>
+                                                    <div className="w-full bg-gray-700 h-2 rounded-full overflow-hidden">
+                                                        <div
+                                                            className="bg-blue-500 h-full transition-all duration-300"
+                                                            style={{ width: `${(currentFolderStats.completed / Math.max(currentFolderStats.total, 1)) * 100}%` }}
+                                                        />
+                                                    </div>
+                                                </>
+                                            )}
                                         </div>
                                     </div>
 
                                     {/* Label Set Selector */}
                                     <div className="p-6 bg-gray-800/30 border-b border-gray-800">
-                                        <label className="text-xs text-gray-500 font-bold uppercase tracking-wider block mb-2">Label Set</label>
+                                        <label className="text-xs text-gray-500 font-bold uppercase tracking-wider block mb-2">라벨셋</label>
                                         <select
                                             value={selectedLabelFile}
                                             onChange={(e) => setSelectedLabelFile(e.target.value)}
@@ -468,23 +487,23 @@ const App: React.FC = () => {
                                                     onClick={() => handleReview(false)}
                                                     className="w-full py-3 bg-red-900/50 hover:bg-red-900 border border-red-800 text-red-100 font-bold rounded-lg transition-colors text-sm"
                                                 >
-                                                    Reject Task
+                                                    작업 반려
                                                 </button>
                                                 <div className="flex gap-3">
                                                     <button
                                                         onClick={() => handleReview(true, 'PREV')}
                                                         className="flex-1 py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-lg shadow-sm border border-gray-700 transition-all text-sm flex items-center justify-center gap-2"
-                                                        title="Approve & Prev (A)"
+                                                        title="이전 (A)"
                                                     >
                                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-                                                        Prev
+                                                        이전
                                                     </button>
                                                     <button
                                                         onClick={() => handleReview(true, 'NEXT')}
                                                         className="flex-[1.5] py-3 bg-green-600 hover:bg-green-500 text-white font-bold rounded-lg shadow transition-colors text-sm flex items-center justify-center gap-2"
-                                                        title="Approve & Next (D)"
+                                                        title="완료 & 다음 (D)"
                                                     >
-                                                        <span>Approve & Next</span>
+                                                        <span>완료 & 다음</span>
                                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
                                                     </button>
                                                 </div>

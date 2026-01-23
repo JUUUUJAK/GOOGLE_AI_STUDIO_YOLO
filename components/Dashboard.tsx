@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { Task, TaskStatus, UserRole, FolderMetadata, AccountType } from '../types';
+import { Task, TaskStatus, TaskStatusLabels, UserRole, FolderMetadata, AccountType } from '../types';
 import * as Storage from '../services/storage';
 
 interface DashboardProps {
@@ -21,7 +21,12 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         total: tasks.length,
         completed: tasks.filter(t => t.status === TaskStatus.SUBMITTED || t.status === TaskStatus.APPROVED).length,
         totalAnnotations: tasks.reduce((acc, t) => acc + t.annotations.length, 0),
-        totalTime: logs.reduce((acc, l) => acc + (l.durationSeconds || 0), 0)
+        totalTime: logs.reduce((acc, l) => {
+            const logTime = new Date(l.timestamp).getTime();
+            const startOfDay = new Date();
+            startOfDay.setHours(0, 0, 0, 0);
+            return logTime >= startOfDay.getTime() ? acc + (l.durationSeconds || 0) : acc;
+        }, 0)
     };
 
     const visibleTasks = useMemo(() => {
@@ -209,12 +214,12 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                     </div>
                     <div className="w-px bg-gray-800 h-10 self-center"></div>
                     <div>
-                        <p className="text-gray-500 text-xs font-bold uppercase tracking-wider mb-1">Total Objects</p>
-                        <p className="text-2xl font-bold text-blue-500">{globalStats.totalAnnotations}</p>
+                        <p className="text-gray-500 text-xs font-bold uppercase tracking-wider mb-1">Total Tasks</p>
+                        <p className="text-2xl font-bold text-blue-500">{globalStats.total}</p>
                     </div>
                     <div className="w-px bg-gray-800 h-10 self-center"></div>
                     <div>
-                        <p className="text-gray-500 text-xs font-bold uppercase tracking-wider mb-1">Total Time</p>
+                        <p className="text-gray-500 text-xs font-bold uppercase tracking-wider mb-1">Today's Time</p>
                         <p className="text-2xl font-bold text-emerald-500">{formatTime(globalStats.totalTime)}</p>
                     </div>
                 </div>
@@ -296,18 +301,18 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                         <div className="flex flex-col h-full">
                             <div className="px-6 py-4 border-b border-gray-800 bg-gray-800/30 flex items-center justify-between">
                                 <div className="flex items-center gap-2">
-                                    <h2 className="text-lg font-bold text-white">Project Assignments</h2>
-                                    <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/50">Admin View</span>
+                                    <h2 className="text-lg font-bold text-white">프로젝트 할당 및 현황</h2>
+                                    <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/50">관리자용</span>
                                 </div>
                             </div>
                             <div className="flex-1 overflow-y-auto p-6">
                                 <table className="w-full text-left border-collapse">
                                     <thead>
                                         <tr className="text-gray-500 text-xs font-bold uppercase tracking-wider border-b border-gray-800">
-                                            <th className="pb-3 pl-2">Folder Name</th>
-                                            <th className="pb-3">Progress</th>
-                                            <th className="pb-3 text-center">Stats</th>
-                                            <th className="pb-3 w-64">Assigned To</th>
+                                            <th className="pb-3 pl-2">폴더명</th>
+                                            <th className="pb-3">진행률</th>
+                                            <th className="pb-3 text-center">통계</th>
+                                            <th className="pb-3 w-64">담당 작업자</th>
                                         </tr>
                                     </thead>
                                     <tbody className="divide-y divide-gray-800 text-sm">
@@ -322,10 +327,11 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                     <td className="py-4 pr-6 align-middle">
                                                         <div className="w-full max-w-xs">
                                                             <div className="flex justify-between text-xs mb-1.5">
-                                                                <span className="text-gray-400 font-medium">{percent}% Complete</span>
+                                                                <span className="text-gray-400 font-medium">검수 현황</span>
+                                                                <span className="text-gray-500">{folder.approved} / {folder.completed - folder.approved}</span>
                                                             </div>
                                                             <div className="w-full h-1.5 bg-gray-800 rounded-full overflow-hidden">
-                                                                <div className={`h-full rounded-full ${percent === 100 ? 'bg-green-500' : 'bg-blue-600'}`} style={{ width: `${percent}%` }}></div>
+                                                                <div className="bg-purple-500 h-full" style={{ width: `${folder.completed > 0 ? (folder.approved / folder.completed) * 100 : 0}%` }}></div>
                                                             </div>
                                                         </div>
                                                     </td>
@@ -436,7 +442,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                     className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-blue-900/20"
                                                 >
                                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                                                    Continue Work
+                                                    작업 이어하기
                                                 </button>
                                                 <button
                                                     onClick={() => handleAssignWorker(selectedFolder, username)}
@@ -504,33 +510,71 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                         className="bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-blue-900/20"
                                     >
                                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                                        Continue Work
+                                        작업 이어하기
                                     </button>
+
+                                    {role === UserRole.REVIEWER && (
+                                        <button
+                                            onClick={() => {
+                                                const folderTasks = tasks.filter(t => t.folder === selectedFolder);
+                                                folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+
+                                                const firstPending = folderTasks.find(t =>
+                                                    t.status !== TaskStatus.APPROVED &&
+                                                    t.status !== TaskStatus.REJECTED
+                                                );
+
+                                                if (firstPending) {
+                                                    onSelectTask(firstPending.id);
+                                                } else {
+                                                    alert("No pending review tasks found in this folder!");
+                                                }
+                                            }}
+                                            className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-purple-900/20"
+                                        >
+                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                            Pending Review
+                                        </button>
+                                    )}
                                 </div>
 
                                 {/* Stats Row */}
                                 {activeFolderStats && activeFolderDetails && (
                                     <div className="p-6 border-b border-gray-800 grid grid-cols-4 gap-4">
-                                        <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
-                                            <span className="text-xs text-gray-500 font-bold uppercase">Tasks</span>
-                                            <div className="flex items-baseline gap-1 mt-1">
-                                                <span className="text-xl font-bold text-white">{activeFolderStats.completed}</span>
-                                                <span className="text-xs text-gray-500">/ {activeFolderStats.count}</span>
+                                        {role === UserRole.REVIEWER ? (
+                                            <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
+                                                <span className="text-xs text-gray-400 font-bold uppercase tracking-wider">검수 현황</span>
+                                                <div className="flex items-baseline gap-1 mt-1">
+                                                    <span className="text-xl font-bold text-white">{activeFolderStats.approved}</span>
+                                                    <span className="text-xs text-gray-500">/ {activeFolderStats.completed - activeFolderStats.approved}</span>
+                                                </div>
+                                                <div className="text-[10px] text-gray-500 mt-0.5 font-medium">완료 / 대기</div>
+                                                <div className="w-full bg-gray-700 h-1 mt-2 rounded-full overflow-hidden">
+                                                    <div className="bg-purple-500 h-full" style={{ width: `${activeFolderStats.completed > 0 ? (activeFolderStats.approved / activeFolderStats.completed) * 100 : 0}%` }}></div>
+                                                </div>
                                             </div>
-                                            <div className="w-full bg-gray-700 h-1 mt-2 rounded-full overflow-hidden">
-                                                <div className="bg-blue-500 h-full" style={{ width: `${(activeFolderStats.completed / activeFolderStats.count) * 100}%` }}></div>
+                                        ) : (
+                                            <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
+                                                <span className="text-xs text-gray-500 font-bold uppercase">태스크</span>
+                                                <div className="flex items-baseline gap-1 mt-1">
+                                                    <span className="text-xl font-bold text-white">{activeFolderStats.completed}</span>
+                                                    <span className="text-xs text-gray-500">/ {activeFolderStats.count}</span>
+                                                </div>
+                                                <div className="w-full bg-gray-700 h-1 mt-2 rounded-full overflow-hidden">
+                                                    <div className="bg-blue-500 h-full" style={{ width: `${(activeFolderStats.completed / activeFolderStats.count) * 100}%` }}></div>
+                                                </div>
                                             </div>
-                                        </div>
+                                        )}
                                         <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
-                                            <span className="text-xs text-gray-500 font-bold uppercase">Approved</span>
+                                            <span className="text-xs text-gray-500 font-bold uppercase">완료</span>
                                             <div className="mt-1 text-xl font-bold text-green-400">{activeFolderStats.approved}</div>
                                         </div>
                                         <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
-                                            <span className="text-xs text-gray-500 font-bold uppercase">Rejected</span>
+                                            <span className="text-xs text-gray-500 font-bold uppercase">반려</span>
                                             <div className="mt-1 text-xl font-bold text-red-400">{activeFolderStats.rejected}</div>
                                         </div>
                                         <div className="bg-gray-800/50 rounded-xl p-3 border border-gray-800">
-                                            <span className="text-xs text-gray-500 font-bold uppercase">User Modified</span>
+                                            <span className="text-xs text-gray-500 font-bold uppercase">수정된 이미지</span>
                                             <div className="mt-1 text-xl font-bold text-purple-400">{activeFolderDetails.modifiedCount}</div>
                                         </div>
                                     </div>
@@ -571,7 +615,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                         ${task.status === TaskStatus.APPROVED ? 'bg-green-900/30 text-green-300 border border-green-800/50' : ''}
                                                         ${task.status === TaskStatus.REJECTED ? 'bg-red-900/30 text-red-300 border border-red-800/50' : ''}
                                                     `}>
-                                                                    {task.status}
+                                                                    {TaskStatusLabels[task.status]}
                                                                 </span>
                                                                 <span className="text-xs text-gray-600">Updated {new Date(task.lastUpdated).toLocaleDateString()}</span>
                                                             </div>
