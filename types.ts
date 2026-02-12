@@ -78,6 +78,7 @@ export interface WorkLog {
     totalBoxCount: number;
     manualBoxCount: number; // Count of boxes where isAutoLabel is false/undefined
   };
+  synced?: boolean; // True if confirmed saved to server
 }
 
 export interface DatasetStats {
@@ -86,4 +87,33 @@ export interface DatasetStats {
   rejectedTasks: number;
   avgTimePerTask: number;
   annotationsPerClass: Record<string, number>;
+}
+
+export type TaskIssueType = 'REVIEW_REQUEST' | 'DELETE_REQUEST';
+export type TaskIssueStatus = 'OPEN' | 'IN_REVIEW' | 'DELETE' | 'RESOLVED';
+export type TaskIssueReasonCode = 'BLUR' | 'CORRUPT' | 'WRONG_CLASS' | 'DUPLICATE' | 'OTHER';
+
+export interface TaskIssue {
+  id: string;
+  taskId: string;
+  folder: string;
+  imageUrl: string;
+  type: TaskIssueType;
+  reasonCode: TaskIssueReasonCode;
+  status: TaskIssueStatus;
+  createdBy: string;
+  createdAt: number;
+  resolvedBy?: string | null;
+  resolvedAt?: number | null;
+  resolutionNote?: string | null;
+}
+
+export interface VacationRecord {
+  id: string;
+  userId: string;
+  startDate: string; // YYYY-MM-DD
+  endDate: string; // YYYY-MM-DD
+  days: number; // supports 0.5 for half-day
+  note?: string;
+  createdAt: number;
 }

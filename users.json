@@ -1,0 +1,37 @@
+[
+  {
+    "username": "admin",
+    "password": "admin",
+    "accountType": "ADMIN"
+  },
+  {
+    "username": "김승희",
+    "password": "1234",
+    "accountType": "WORKER"
+  },
+  {
+    "username": "김문철",
+    "password": "1234",
+    "accountType": "WORKER"
+  },
+  {
+    "username": "이재연",
+    "password": "1234",
+    "accountType": "WORKER"
+  },
+  {
+    "username": "이시안",
+    "password": "1234",
+    "accountType": "WORKER"
+  },
+  {
+    "username": "심아영",
+    "password": "1234",
+    "accountType": "WORKER"
+  },
+  {
+    "username": "심규홍",
+    "password": "1234",
+    "accountType": "WORKER"
+  }
+]

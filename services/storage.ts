@@ -1,8 +1,19 @@
-import { Task, TaskStatus, WorkLog, UserRole, BoundingBox } from '../types';
+import { Task, TaskStatus, WorkLog, UserRole, BoundingBox, TaskIssue, TaskIssueReasonCode, TaskIssueStatus, TaskIssueType, VacationRecord } from '../types';
 import JSZip from 'jszip';
+import localforage from 'localforage';
 
 const TASKS_KEY = 'yolo_tasks';
 const LOGS_KEY = 'yolo_logs';
+const FOLDER_META_KEY = 'yolo_folder_meta';
+const INITIAL_TASK_FETCH_LIMIT = 5000;
+const TASK_PERSIST_DEBOUNCE_MS = 250;
+const LOG_PULL_MIN_INTERVAL_MS = 15000;
+
+// Configure localforage
+localforage.config({
+  name: 'IntellivixStudio',
+  storeName: 'app_data'
+});
 
 // --- YOLO Format Helper Functions ---
 
@@ -32,7 +43,7 @@ export const parseYoloTxt = (content: string): BoundingBox[] => {
         y,
         w,
         h,
-        isAutoLabel: false
+        isAutoLabel: true
       } as BoundingBox;
     })
     .filter((box): box is BoundingBox => box !== null);
@@ -48,66 +59,382 @@ export const generateYoloTxt = (annotations: BoundingBox[]): string => {
 
 // --- Storage Logic ---
 
-// In-memory cache for tasks to avoid constant re-fetching of list
+// In-memory cache
+let cachedFolders: any[] = [];
 let cachedTasks: Task[] = [];
+let cachedLogs: WorkLog[] = [];
+let cachedFolderMeta: Record<string, any> = {};
 let isInitialized = false;
+let pendingTaskPersistMap = new Map<string, any>();
+let taskPersistTimer: ReturnType<typeof setTimeout> | null = null;
+let lastCommittedTaskSignature = new Map<string, string>();
+let lastLogPullAt = 0;
 
-// 1. Initialize: Fetch file list from server
+const normalizeServerTask = (serverTask: any, existing?: any): Task => {
+  if (existing) {
+    const useServer = serverTask.status !== 'TODO' || (serverTask.lastUpdated || 0) > (existing.lastUpdated || 0);
+    if (useServer) {
+      return {
+        ...serverTask,
+        isModified: serverTask.isModified === 1 || serverTask.isModified === true,
+        annotations: existing.annotations && (existing.lastUpdated || 0) > (serverTask.lastUpdated || 0)
+          ? existing.annotations
+          : (serverTask.annotations || [])
+      } as Task;
+    }
+    return {
+      ...serverTask,
+      status: existing.status,
+      isModified: existing.isModified === 1 || existing.isModified === true,
+      annotations: existing.annotations || serverTask.annotations || [],
+      reviewerNotes: existing.reviewerNotes,
+      assignedWorker: existing.assignedWorker || serverTask.assignedWorker,
+      lastUpdated: existing.lastUpdated
+    } as Task;
+  }
+
+  return {
+    ...serverTask,
+    isModified: serverTask.isModified === 1 || serverTask.isModified === true,
+    annotations: serverTask.annotations || []
+  } as Task;
+};
+
+const toStorableTask = (task: Task) => {
+  const { annotations, ...taskWithoutAnnotations } = task;
+  return taskWithoutAnnotations;
+};
+
+const flushPendingTaskPersist = async () => {
+  if (pendingTaskPersistMap.size === 0) return;
+
+  const pendingUpdates = pendingTaskPersistMap;
+  pendingTaskPersistMap = new Map();
+
+  try {
+    const storedTasks = await localforage.getItem<any[]>(TASKS_KEY) || [];
+    const storedMap = new Map(storedTasks.map(t => [t.id, t]));
+    pendingUpdates.forEach((value, key) => storedMap.set(key, value));
+    await localforage.setItem(TASKS_KEY, Array.from(storedMap.values()));
+  } catch (error) {
+    console.error("Failed to persist local tasks:", error);
+  }
+};
+
+const queueTaskPersist = (task: Task): void => {
+  pendingTaskPersistMap.set(task.id, toStorableTask(task));
+  if (taskPersistTimer) clearTimeout(taskPersistTimer);
+  taskPersistTimer = setTimeout(async () => {
+    taskPersistTimer = null;
+    await flushPendingTaskPersist();
+  }, TASK_PERSIST_DEBOUNCE_MS);
+};
+
+const persistCachedTasks = async () => {
+  await localforage.setItem(TASKS_KEY, cachedTasks.map(toStorableTask));
+};
+
+const getTaskCommitSignature = (task: Task): string => {
+  return JSON.stringify({
+    id: task.id,
+    status: task.status,
+    isModified: task.isModified === true,
+    assignedWorker: task.assignedWorker || '',
+    reviewerNotes: task.reviewerNotes || '',
+    lastUpdated: task.lastUpdated || 0,
+    txtPath: task.txtPath || ''
+  });
+};
+
+const markTaskAsCommitted = (task: Task) => {
+  lastCommittedTaskSignature.set(task.id, getTaskCommitSignature(task));
+};
+
+const refreshCommittedTaskSignatures = () => {
+  lastCommittedTaskSignature = new Map(cachedTasks.map(task => [task.id, getTaskCommitSignature(task)]));
+};
+
+// Helper to migrate from localStorage to localforage
+const migrateFromLocalStorage = async () => {
+  const tasks = localStorage.getItem(TASKS_KEY);
+  const logs = localStorage.getItem(LOGS_KEY);
+  const meta = localStorage.getItem(FOLDER_META_KEY);
+
+  if (tasks) await localforage.setItem(TASKS_KEY, JSON.parse(tasks));
+  if (logs) await localforage.setItem(LOGS_KEY, JSON.parse(logs));
+  if (meta) await localforage.setItem(FOLDER_META_KEY, JSON.parse(meta));
+
+  if (tasks || logs || meta) {
+    console.log("Migration from localStorage to IndexedDB complete.");
+    // We don't clear immediately to be safe, but we could.
+    // localStorage.clear(); 
+  }
+};
+
+// 1. Initialize: Fetch first page of data from server
 export const initStorage = async () => {
   try {
-    const res = await fetch('/api/datasets');
+    // Initial fetch: first page only (additional pages can be loaded on demand)
+    const res = await fetch(`/api/datasets?limit=${INITIAL_TASK_FETCH_LIMIT}&offset=0`);
     if (!res.ok) throw new Error('Failed to fetch datasets');
     const files = await res.json();
 
-    // Merge with any local storage overrides (e.g. status) if needed, 
-    // but for now, we prioritize file system truth for existence.
-    // We can still use localStorage for 'status' management if we want to track 'DONE' state 
-    // separate from file existence, but here we will try to be simple.
+    // Try to get from localforage first
+    let storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
 
-    const stored = localStorage.getItem(TASKS_KEY);
-    const existingTasks: Task[] = stored ? JSON.parse(stored) : [];
+    // If empty, try migration
+    if (!storedTasks) {
+      await migrateFromLocalStorage();
+      storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
+    }
 
-    cachedTasks = files.map((f: any) => {
-      const existing = existingTasks.find(t => t.name === f.name && t.folder === f.folder);
+    const existingTasks: any[] = storedTasks || [];
+    cachedLogs = await localforage.getItem<WorkLog[]>(LOGS_KEY) || [];
+    cachedFolderMeta = await localforage.getItem<Record<string, any>>(FOLDER_META_KEY) || {};
 
-      // If we have a txtPath, it means a file potentially exists.
-      // We don't read the content yet (lazy load).
-
-      return {
-        id: existing?.id || Math.random().toString(36).substr(2, 9),
-        imageUrl: f.imageUrl,
-        name: f.name,
-        folder: f.folder,
-        txtPath: f.txtPath, // Path to save to/read from
-        // If existing status is something meaningful, keep it. 
-        // Else, if persistence file exists, it's Draft/In Progress.
-        // Server-side metadata takes precedence for persistence
-        status: f.status || existing?.status || (f.txtPath ? TaskStatus.IN_PROGRESS : TaskStatus.TODO),
-        annotations: existing?.annotations || [], // Will be loaded on demand
-        lastUpdated: f.lastUpdated || existing?.lastUpdated || Date.now(),
-        assignedWorker: f.assignedWorker || existing?.assignedWorker,
-        reviewerNotes: f.reviewerNotes || existing?.reviewerNotes,
-        isModified: f.isModified || existing?.isModified
-      };
+    // Keep previously cached items, then merge first page for fast startup.
+    const taskMap = new Map(existingTasks.map(t => [t.id, { ...t, annotations: t.annotations || [] }]));
+    files.forEach((f: any) => {
+      const existing = taskMap.get(f.id);
+      taskMap.set(f.id, normalizeServerTask(f, existing));
     });
+    cachedTasks = Array.from(taskMap.values()) as Task[];
+    await persistCachedTasks();
+    refreshCommittedTaskSignatures();
+
+    // Sync Logs
+    await syncLogs();
 
     isInitialized = true;
-
-    // Sync back to local storage for metadata that isn't in files (like status, assignedWorker)
-    localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
-
   } catch (e) {
     console.error("Storage Init Failed:", e);
   }
 };
 
+/**
+ * Sync Logs: Push local -> Server, then Pull Server -> Local
+ */
+// --- Log Sync: Optimized ---
+let isSyncingLogs = false;
+
+export const syncLogs = async (pullUpdates: boolean = true) => {
+  if (isSyncingLogs) return;
+  isSyncingLogs = true;
+
+  try {
+    let localLogs = await localforage.getItem<WorkLog[]>(LOGS_KEY) || [];
+
+    // Ensure cached logs are populated from storage if empty
+    if (cachedLogs.length === 0 && localLogs.length > 0) {
+      cachedLogs = localLogs;
+    }
+
+    // 1. Push UNSYNCED logs to server
+    // We treat logs without 'synced' property as UNSYNCED (safe default for migration)
+    const unsyncedLogs = localLogs.filter(l => !l.synced);
+
+    if (unsyncedLogs.length > 0) {
+      try {
+        const res = await fetch('/api/logs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(unsyncedLogs)
+        });
+
+        if (res.ok) {
+          // Mark as synced locally
+          const syncedIds = new Set(unsyncedLogs.map(l => l.id));
+          localLogs = localLogs.map(l => syncedIds.has(l.id) ? { ...l, synced: true } : l);
+
+          cachedLogs = localLogs; // Update memory
+          await localforage.setItem(LOGS_KEY, localLogs); // Update storage
+        }
+      } catch (e) {
+        console.error("Failed to push unsynced logs:", e);
+      }
+    }
+
+    const shouldPull = pullUpdates && (Date.now() - lastLogPullAt >= LOG_PULL_MIN_INTERVAL_MS);
+    if (shouldPull) {
+      // 2. Fetch NEW logs from server (Differential Sync)
+      const maxTimestamp = localLogs.length > 0 ? Math.max(...localLogs.map(l => l.timestamp)) : 0;
+
+      const res = await fetch(`/api/logs?since=${maxTimestamp}`);
+      if (res.ok) {
+        const newLogs = await res.json();
+        if (newLogs.length > 0) {
+          const existingIds = new Set(localLogs.map(l => l.id));
+          const uniqueNewLogs = newLogs.filter((l: WorkLog) => !existingIds.has(l.id));
+
+          if (uniqueNewLogs.length > 0) {
+            const finalNewLogs = uniqueNewLogs.map((l: WorkLog) => ({ ...l, synced: true }));
+            cachedLogs = [...localLogs, ...finalNewLogs].sort((a, b) => a.timestamp - b.timestamp);
+            await localforage.setItem(LOGS_KEY, cachedLogs);
+          }
+        }
+        lastLogPullAt = Date.now();
+      }
+    }
+  } finally {
+    isSyncingLogs = false;
+  }
+};
+
+/**
+ * Fetch Daily Statistics from Server (Aggregated)
+ */
+export const getDailyStats = async (date: Date) => {
+  try {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    const res = await fetch(`/api/analytics/daily?date=${dateStr}`);
+    if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        const responseText = await res.text();
+        throw new Error(`Expected JSON response but got "${contentType || 'unknown'}": ${responseText.slice(0, 120)}`);
+      }
+      return await res.json();
+    }
+  } catch (e) {
+    console.error("Failed to fetch daily stats:", e);
+  }
+  return [];
+};
+
+const formatDateToYmd = (date: Date): string => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const getRangeStats = async (startDate: Date, endDate: Date) => {
+  const startStr = formatDateToYmd(startDate);
+  const endStr = formatDateToYmd(endDate);
+
+  const res = await fetch(`/api/analytics/range?start=${startStr}&end=${endStr}`);
+  if (!res.ok) throw new Error('Failed to fetch range analytics');
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const responseText = await res.text();
+    throw new Error(`Expected JSON response but got "${contentType || 'unknown'}": ${responseText.slice(0, 120)}`);
+  }
+
+  return await res.json();
+};
+
+/**
+ * Fetch Weekly Statistics (Aggregates 7 calls to daily stats)
+ */
+export const getWeeklyStats = async (startDate: Date) => {
+  try {
+    const weekStart = new Date(startDate);
+    weekStart.setHours(0, 0, 0, 0);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
+    weekEnd.setHours(23, 59, 59, 999);
+
+    return await getRangeStats(weekStart, weekEnd);
+  } catch (e) {
+    console.error("Failed to fetch weekly stats:", e);
+    return [];
+  }
+};
+
+/**
+ * Fetch Monthly Statistics (Aggregates calls to daily stats)
+ */
+export const getMonthlyStats = async (year: number, month: number) => {
+  try {
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0); // Last day of month
+    startDate.setHours(0, 0, 0, 0);
+    endDate.setHours(23, 59, 59, 999);
+    return await getRangeStats(startDate, endDate);
+
+  } catch (e) {
+    console.error("Failed to fetch monthly stats:", e);
+    return [];
+  }
+};
+
+/**
+ * Fetch Overall Project Summary from Server
+ */
+export const getProjectSummary = async () => {
+  try {
+    const res = await fetch('/api/analytics/summary');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    console.error("Failed to fetch project summary:", e);
+  }
+  return null;
+};
+
+/**
+ * Loads more tasks from the server (Pagination)
+ */
+export const loadMoreTasks = async (offset: number, limit: number = 5000) => {
+  try {
+    const res = await fetch(`/api/datasets?limit=${limit}&offset=${offset}`);
+    if (!res.ok) throw new Error('Failed to fetch more datasets');
+    const files = await res.json();
+
+    const existingIds = new Set(cachedTasks.map(t => t.id));
+    const newTasks = files.filter((f: any) => !existingIds.has(f.id)).map((f: any) => normalizeServerTask(f));
+
+    cachedTasks = [...cachedTasks, ...newTasks];
+    await persistCachedTasks();
+    newTasks.forEach(task => markTaskAsCommitted(task as Task));
+    return newTasks;
+  } catch (e) {
+    console.error("Load More Failed:", e);
+    return [];
+  }
+};
+
+export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT) => {
+  try {
+    const baseMap = new Map(cachedTasks.map(t => [t.id, t]));
+    const seenIds = new Set<string>();
+    let offset = 0;
+
+    while (true) {
+      const res = await fetch(`/api/datasets?limit=${limit}&offset=${offset}`);
+      if (!res.ok) throw new Error('Failed to fetch datasets');
+      const batch = await res.json();
+      if (!Array.isArray(batch) || batch.length === 0) break;
+
+      batch.forEach((f: any) => {
+        seenIds.add(f.id);
+        const existing = baseMap.get(f.id);
+        baseMap.set(f.id, normalizeServerTask(f, existing));
+      });
+
+      offset += batch.length;
+      if (batch.length < limit) break;
+    }
+
+    // Full sync path: remove tasks that no longer exist on server.
+    const merged = Array.from(baseMap.values()).filter((task: Task) => seenIds.has(task.id));
+    cachedTasks = merged;
+    await persistCachedTasks();
+    refreshCommittedTaskSignatures();
+    return cachedTasks.length;
+  } catch (e) {
+    console.error("Full task sync failed:", e);
+    return cachedTasks.length;
+  }
+};
 
 export const getTasks = (): Task[] => {
-  if (!isInitialized) {
-    // Return local storage backup if init hasn't finished (shouldn't happen often)
-    const data = localStorage.getItem(TASKS_KEY);
-    return data ? JSON.parse(data) : [];
-  }
   return cachedTasks;
 };
 
@@ -115,20 +442,14 @@ export const getTaskById = async (id: string): Promise<Task | undefined> => {
   const task = cachedTasks.find(t => t.id === id);
   if (!task) return undefined;
 
-  // Lazy Load Annotations from File if needed
+  // If annotations are still empty, try to load from labels
   if ((!task.annotations || task.annotations.length === 0) && task.txtPath) {
     try {
-      // Construct path to potential txt file if we knew it, 
-      // For now, we rely on the scanned 'txtPath' property.
-
-      if (task.txtPath) {
-        const res = await fetch(`/api/label?path=${encodeURIComponent(task.txtPath)}`);
-        const text = await res.text();
-        if (text) {
-          task.annotations = parseYoloTxt(text);
-          // Update cache
-          updateTaskInCache(task);
-        }
+      const res = await fetch(`/api/label?path=${encodeURIComponent(task.txtPath)}`);
+      const text = await res.text();
+      if (text) {
+        task.annotations = parseYoloTxt(text);
+        await updateTaskInCache(task);
       }
     } catch (e) {
       console.error("Failed to load labels for task", task.id, e);
@@ -137,111 +458,154 @@ export const getTaskById = async (id: string): Promise<Task | undefined> => {
   return task;
 };
 
-const updateTaskInCache = (task: Task) => {
+const updateTaskInCache = async (task: Task) => {
   const index = cachedTasks.findIndex(t => t.id === task.id);
   if (index !== -1) {
     cachedTasks[index] = task;
-    localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
+    queueTaskPersist(task);
   }
 }
 
-export const updateTask = async (taskId: string, updates: Partial<Task>, userId: string, role: UserRole): Promise<Task> => {
+/**
+ * Updates task in memory and IndexedDB only.
+ * Sets isDirty flag to true for manual modifications.
+ */
+export const updateTaskLocally = async (taskId: string, updates: Partial<Task>): Promise<Task> => {
   const task = cachedTasks.find(t => t.id === taskId);
   if (!task) throw new Error('Task not found');
 
-  const updatedTask = { ...task, ...updates, lastUpdated: Date.now() };
+  const updatedTask = {
+    ...task,
+    ...updates,
+    isModified: updates.annotations ? true : (updates.isModified ?? task.isModified),
+    lastUpdated: Date.now()
+  };
 
-  // 1. Update In-Memory & LocalStorage (for fast UI)
-  updateTaskInCache(updatedTask);
-
-  // 2. Persist to Disk if annotations changed or status submitted
-  if (updates.annotations || updates.status === TaskStatus.SUBMITTED) {
-    if (!updatedTask.txtPath) {
-      // We need to determine the save path if it wasn't scanned initially.
-      // It should be adjacent to the image.
-      // Since we don't have the absolute path easily for new files, 
-      // we can rely on the server to handle this if we send the image path?
-      // OR: We know the structure is datasets/[folder]/[image].
-      // The API list gave us 'txtPath' if it existed.
-      // If it didn't exist, we must construct it.
-
-      // Hack: Construct relative txt path based on image url
-      // imageUrl: /datasets/folder/image.jpg
-      // expected txt: datasets/folder/image.txt
-      // The imageUrl in vite starts with /, so remove it
-
-      let relativeTxtPath = updatedTask.imageUrl.startsWith('/') ? updatedTask.imageUrl.substring(1) : updatedTask.imageUrl;
-      relativeTxtPath = relativeTxtPath.substring(0, relativeTxtPath.lastIndexOf('.')) + '.txt';
-      updatedTask.txtPath = relativeTxtPath;
-    }
-
-    const content = generateYoloTxt(updatedTask.annotations);
-
-    try {
-      await fetch('/api/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path: updatedTask.txtPath,
-          content: content
-        })
-      });
-    } catch (e) {
-      console.error("Failed to save to disk", e);
-      alert("Failed to save to disk! Check console.");
-    }
-  }
-
-
-  // 3. Persist Metadata (status, isModified, assignedWorker, reviewerNotes)
-  // We save this to _metadata.json via /api/metadata
-  if (updates.status || updates.isModified !== undefined || updates.assignedWorker !== undefined || updates.reviewerNotes !== undefined) {
-    try {
-      // Construct key relative to datasets root: folder/filename
-      const folderPart = updatedTask.folder === 'Unsorted' ? '' : updatedTask.folder;
-      const key = folderPart ? `${folderPart}/${updatedTask.name}` : updatedTask.name;
-
-      await fetch('/api/metadata', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key,
-          updates: {
-            status: updatedTask.status,
-            isModified: updatedTask.isModified,
-            assignedWorker: updatedTask.assignedWorker,
-            reviewerNotes: updatedTask.reviewerNotes,
-            lastUpdated: updatedTask.lastUpdated
-          }
-        })
-      });
-    } catch (e) {
-      console.error("Failed to save metadata", e);
-    }
-  }
-
+  await updateTaskInCache(updatedTask);
   return updatedTask;
 };
 
-export const assignFolderToWorker = (folderName: string, workerName: string | undefined) => {
+/**
+ * Syncs a specific task's state to the server (Physical Disk + DB)
+ */
+export const syncTaskToServer = async (taskId: string): Promise<void> => {
+  const task = cachedTasks.find(t => t.id === taskId);
+  if (!task) return;
+
+  const commitSignature = getTaskCommitSignature(task);
+  const previouslyCommitted = lastCommittedTaskSignature.get(task.id);
+  if (previouslyCommitted && previouslyCommitted === commitSignature) {
+    return;
+  }
+
+  try {
+    const key = task.imageUrl.startsWith('/datasets/')
+      ? task.imageUrl.substring('/datasets/'.length)
+      : (task.folder === 'Unsorted' ? task.name : `${task.folder}/${task.name}`);
+    const shouldPersistLabel = task.isModified || task.status === TaskStatus.SUBMITTED;
+    const labelPayload = shouldPersistLabel
+      ? (() => {
+        if (!task.txtPath) {
+          let relativeTxtPath = task.imageUrl.startsWith('/') ? task.imageUrl.substring(1) : task.imageUrl;
+          relativeTxtPath = relativeTxtPath.substring(0, relativeTxtPath.lastIndexOf('.')) + '.txt';
+          task.txtPath = relativeTxtPath;
+        }
+        return {
+          path: task.txtPath,
+          content: generateYoloTxt(task.annotations || [])
+        };
+      })()
+      : null;
+
+    const res = await fetch('/api/task-commit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: labelPayload,
+        metadata: {
+          id: task.id,
+          key,
+          updates: {
+            status: task.status,
+            isModified: task.isModified ? 1 : 0,
+            assignedWorker: task.assignedWorker,
+            reviewerNotes: task.reviewerNotes,
+            lastUpdated: task.lastUpdated
+          }
+        }
+      })
+    });
+    if (!res.ok) throw new Error('Failed task commit');
+    markTaskAsCommitted(task);
+  } catch (e) {
+    console.error("Failed to sync task commit", e);
+  }
+};
+
+/**
+ * Legacy updateTask (kept for compatibility, but now uses the new logic internally)
+ * For features that still need immediate sync (like submitting)
+ */
+export const updateTask = async (taskId: string, updates: Partial<Task>, userId: string, role: UserRole): Promise<Task> => {
+  const updated = await updateTaskLocally(taskId, updates);
+  await syncTaskToServer(taskId);
+  return updated;
+};
+
+export const assignFolderToWorker = async (folderName: string, workerName: string | undefined) => {
+  const timestamp = Date.now();
+  // Update In-Memory Cache
   cachedTasks = cachedTasks.map(t => {
     if (t.folder === folderName) {
-      return { ...t, assignedWorker: workerName, lastUpdated: Date.now() };
+      return { ...t, assignedWorker: workerName, lastUpdated: timestamp };
     }
     return t;
   });
-  localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
+
+  // Update IndexedDB WITHOUT annotations
+  const storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
+  if (storedTasks) {
+    const updatedTasks = storedTasks.map(t => {
+      if (t.folder === folderName) {
+        return { ...t, assignedWorker: workerName, lastUpdated: timestamp };
+      }
+      return t;
+    });
+    await localforage.setItem(TASKS_KEY, updatedTasks);
+  }
+
+  // 2. Persist to Server (Physical Move)
+  try {
+    await fetch('/api/assign-worker', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folderName,
+        workerName: workerName || 'Unassigned'
+      })
+    });
+
+    await fetch('/api/folder-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folder: folderName,
+        updates: { assignedWorker: workerName, lastUpdated: timestamp }
+      })
+    });
+  } catch (e) {
+    console.error("Failed to sync physical folder assignment", e);
+  }
 };
 
-export const logAction = (
+export const logAction = async (
   taskId: string,
   userId: string,
   role: UserRole,
   action: WorkLog['action'],
-  durationSeconds: number = 0
+  durationSeconds: number = 0,
+  isModifiedOverride?: boolean
 ) => {
-  const logs: WorkLog[] = JSON.parse(localStorage.getItem(LOGS_KEY) || '[]');
-
   const task = cachedTasks.find(t => t.id === taskId);
   let stats = undefined;
   if (task && (action === 'SUBMIT' || action === 'APPROVE' || action === 'SAVE')) {
@@ -254,42 +618,207 @@ export const logAction = (
   const newLog: WorkLog = {
     id: Math.random().toString(36).substr(2, 9),
     taskId,
-    userId,
+    userId: userId.trim(),
     role,
     folder: task?.folder || 'Unknown',
     action,
     timestamp: Date.now(),
     durationSeconds,
-    isModified: task?.isModified,
+    isModified: isModifiedOverride !== undefined ? isModifiedOverride : task?.isModified,
     stats
   };
-  logs.push(newLog);
-  localStorage.setItem(LOGS_KEY, JSON.stringify(logs));
+
+  cachedLogs.push(newLog);
+  await localforage.setItem(LOGS_KEY, cachedLogs);
+
+  // Push unsynced logs immediately, but avoid frequent pull requests while navigating.
+  syncLogs(false);
 };
 
 export const getLogs = (): WorkLog[] => {
-  return JSON.parse(localStorage.getItem(LOGS_KEY) || '[]');
+  return cachedLogs;
 };
 
 export const getFolderMetadata = (folderName: string): any => {
-  const allMeta = JSON.parse(localStorage.getItem('yolo_folder_meta') || '{}');
-  return allMeta[folderName] || { tags: [], memo: '' };
+  const meta = cachedFolderMeta[folderName] || {};
+  return {
+    tags: [],
+    memo: '',
+    ...meta
+  };
 };
 
-export const saveFolderMetadata = (folderName: string, meta: any) => {
-  const allMeta = JSON.parse(localStorage.getItem('yolo_folder_meta') || '{}');
-  allMeta[folderName] = meta;
-  localStorage.setItem('yolo_folder_meta', JSON.stringify(allMeta));
+export const saveFolderMetadata = async (folderName: string, meta: any) => {
+  cachedFolderMeta[folderName] = meta;
+  await localforage.setItem(FOLDER_META_KEY, cachedFolderMeta);
+
+  // Sync to Server
+  try {
+    await fetch('/api/folder-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folder: folderName,
+        updates: meta
+      })
+    });
+  } catch (e) {
+    console.error("Failed to sync folder metadata to server", e);
+  }
+};
+
+export const convertFolderToWebp = async (folderName: string, limit?: number, offset?: number) => {
+  try {
+    const res = await fetch('/api/convert-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folderName, limit, offset })
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.error("Batch conversion trigger failed", e);
+    return null;
+  }
+};
+
+export const getAllFolderMetadata = (): Record<string, any> => {
+  return cachedFolderMeta;
+};
+
+export const createTaskIssue = async (payload: {
+  taskId: string;
+  type: TaskIssueType;
+  reasonCode: TaskIssueReasonCode;
+  createdBy: string;
+}) => {
+  try {
+    const task = cachedTasks.find(t => t.id === payload.taskId);
+    if (!task) throw new Error('Task not found');
+
+    const res = await fetch('/api/issues', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        taskId: payload.taskId,
+        folder: task.folder,
+        imageUrl: task.imageUrl,
+        type: payload.type,
+        reasonCode: payload.reasonCode,
+        createdBy: payload.createdBy
+      })
+    });
+    if (!res.ok) throw new Error('Failed to create issue');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to create task issue:", e);
+    throw e;
+  }
+};
+
+export const getOpenIssueCount = async (): Promise<number> => {
+  try {
+    const res = await fetch('/api/issues/count');
+    if (!res.ok) throw new Error('Failed to fetch open issue count');
+    const data = await res.json();
+    return Number(data?.openCount || 0);
+  } catch (e) {
+    console.error("Failed to fetch open issue count:", e);
+    return 0;
+  }
+};
+
+export const getTaskIssues = async (status?: TaskIssueStatus): Promise<TaskIssue[]> => {
+  try {
+    const query = status ? `?status=${encodeURIComponent(status)}` : '';
+    const res = await fetch(`/api/issues${query}`);
+    if (!res.ok) throw new Error('Failed to fetch issues');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch task issues:", e);
+    return [];
+  }
+};
+
+export const updateTaskIssueStatus = async (
+  id: string,
+  status: TaskIssueStatus,
+  resolvedBy: string,
+  resolutionNote: string = ''
+) => {
+  try {
+    const res = await fetch('/api/issues/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, status, resolvedBy, resolutionNote })
+    });
+    if (!res.ok) throw new Error('Failed to update issue status');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to update task issue status:", e);
+    throw e;
+  }
+};
+
+export const getVacations = async (startDate: string, endDate: string): Promise<VacationRecord[]> => {
+  try {
+    const query = `?start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`;
+    const res = await fetch(`/api/vacations${query}`);
+    if (!res.ok) throw new Error('Failed to fetch vacations');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch vacations:", e);
+    return [];
+  }
+};
+
+export const createVacation = async (payload: {
+  userId: string;
+  startDate: string;
+  endDate: string;
+  days: number;
+  note?: string;
+}) => {
+  try {
+    const res = await fetch('/api/vacations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to create vacation');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to create vacation:", e);
+    throw e;
+  }
+};
+
+export const deleteVacation = async (id: string) => {
+  try {
+    const res = await fetch(`/api/vacations?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Failed to delete vacation');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to delete vacation:", e);
+    throw e;
+  }
+};
+
+export const getScheduleBoard = async (startDate: string, endDate: string): Promise<Record<string, Record<string, string[]>>> => {
+  try {
+    const query = `?start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`;
+    const res = await fetch(`/api/schedule/board${query}`);
+    if (!res.ok) throw new Error('Failed to fetch schedule board');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch schedule board:", e);
+    return {};
+  }
 };
 
 export const downloadFullDataset = async () => {
   const zip = new JSZip();
   const tasks = getTasks();
-
-  // 1. Add Annotations (.txt) organized by folder
-  // Note: Since we are now saving to disk, downloading zip might just serve the files.
-  // But for convenience of "Export", we still zip them up from memory/cache or fetch them.
-  // Here we use the latest memory state (which should match disk).
 
   tasks.forEach(task => {
     if (task.annotations.length > 0) {

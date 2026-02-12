@@ -22,37 +22,44 @@ const History: React.FC<HistoryProps> = ({ currentUser, accountType }) => {
   const historyData = useMemo(() => {
     const statsMap = new Map<string, FolderStats>();
 
-    // Filter logs: Only consider 'SUBMIT' actions for counting completed worker tasks.
-    // 'APPROVE' could be used for reviewer stats, but let's focus on worker productivity.
-    const relevantLogs = logs.filter(log => log.action === 'SUBMIT');
-
-    relevantLogs.forEach(log => {
+    logs.forEach(log => {
       // If Admin, show all. If Worker, show only their own.
       if (accountType === AccountType.WORKER && log.userId !== currentUser) return;
 
       const key = `${log.folder}-${log.userId}`;
-      const current = statsMap.get(key) || {
-        folderName: log.folder,
-        workerName: log.userId,
-        taskCount: 0,
-        manualObjects: 0,
-        totalTime: 0,
-        lastActive: 0
-      };
+      if (!statsMap.has(key)) {
+        statsMap.set(key, {
+          folderName: log.folder,
+          workerName: log.userId,
+          taskCount: 0,
+          manualObjects: 0,
+          totalTime: 0,
+          lastActive: 0,
+          _submittedTasks: new Set<string>(),
+          _modifiedTasks: new Set<string>()
+        } as any);
+      }
+      const current = statsMap.get(key) as any;
 
-      current.taskCount += 1;
+      if (log.action === 'SUBMIT') {
+        current._submittedTasks.add(log.taskId);
+      }
+
       // Count as modified if isModified flag is true.
       // Backward compatibility: If isModified is undefined, assume modified if manualBoxCount > 0
       if (log.isModified || (log.isModified === undefined && (log.stats?.manualBoxCount || 0) > 0)) {
-        current.manualObjects += 1;
+        current._modifiedTasks.add(log.taskId);
       }
+
       current.totalTime += (log.durationSeconds || 0);
       current.lastActive = Math.max(current.lastActive, log.timestamp);
-
-      statsMap.set(key, current);
     });
 
-    return Array.from(statsMap.values()).sort((a, b) => b.lastActive - a.lastActive);
+    return Array.from(statsMap.values()).map((stat: any) => ({
+      ...stat,
+      taskCount: stat._submittedTasks.size,
+      manualObjects: stat._modifiedTasks.size
+    })).sort((a, b) => b.lastActive - a.lastActive);
   }, [logs, currentUser, accountType]);
 
   const formatTime = (seconds: number) => {

@@ -9,18 +9,35 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setError('');
+    if (isLoggingIn) return;
 
-    // Mock Authentication Logic
-    if (username === 'admin' && password === 'admin') {
-      onLogin({ username: 'Admin User', accountType: AccountType.ADMIN });
-    } else if (username.startsWith('worker') && password === 'worker') {
-      onLogin({ username: username, accountType: AccountType.WORKER });
-    } else {
-      setError('Invalid credentials.');
+    setError('');
+    setIsLoggingIn(true);
+
+    try {
+      const res = await fetch('/api/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ username, password }),
+      });
+
+      if (res.ok) {
+        const user = await res.json();
+        onLogin(user);
+      } else {
+        const data = await res.json();
+        setError(data.error || 'Invalid credentials.');
+      }
+    } catch (err) {
+      setError('Server connection failed.');
+    } finally {
+      setIsLoggingIn(false);
     }
   };
 
@@ -31,7 +48,7 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
           <div className="w-16 h-16 bg-blue-600 rounded-xl mx-auto flex items-center justify-center font-bold text-2xl text-white shadow-lg mb-4">
             Y7
           </div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">YOLOv7 Data Studio</h1>
+          <h1 className="text-2xl font-bold text-white tracking-tight">Intellivix Data Studio</h1>
           <p className="text-gray-400 text-sm mt-2">Sign in to continue annotation</p>
         </div>
 
@@ -49,7 +66,8 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600"
+              disabled={isLoggingIn}
+              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600 disabled:opacity-50"
               placeholder="Enter your username"
             />
           </div>
@@ -60,17 +78,31 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600"
+              disabled={isLoggingIn}
+              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600 disabled:opacity-50"
               placeholder="Enter your password"
             />
           </div>
 
           <button
             type="submit"
-            className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-lg shadow-lg transition-transform active:scale-[0.98] flex items-center justify-center gap-2"
+            disabled={isLoggingIn}
+            className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-lg shadow-lg transition-transform active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
           >
-            Sign In
-            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
+            {isLoggingIn ? (
+              <>
+                <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                </svg>
+                <span>Signing in...</span>
+              </>
+            ) : (
+              <>
+                Sign In
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
+              </>
+            )}
           </button>
         </form>
 
