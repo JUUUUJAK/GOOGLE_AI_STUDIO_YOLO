@@ -1,8 +1,191 @@
-import { Task, TaskStatus, WorkLog, UserRole, BoundingBox } from '../types';
+import { Task, TaskStatus, WorkLog, UserRole, BoundingBox, TaskIssue, TaskIssueReasonCode, TaskIssueStatus, TaskIssueType, VacationRecord } from '../types';
 import JSZip from 'jszip';
+import localforage from 'localforage';
 
-const TASKS_KEY = 'yolo_tasks';
+export interface ProjectDefinition {
+  id: string;
+  name: string;
+  targetTotal: number;
+  workflowSourceType: 'native-yolo' | 'vlm-review';
+  vlmSourceFile?: string;
+  visibleToWorkers?: boolean;
+  status?: 'ACTIVE' | 'ARCHIVED';
+  archivedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectOverviewRow extends ProjectDefinition {
+  allocated: number;
+  completed: number;
+  folderCount: number;
+  progress: number;
+}
+
+export interface ProjectOverviewPayload {
+  projects: ProjectOverviewRow[];
+  projectMap: Record<string, { projectId: string; updatedAt: number }>;
+  unassigned: { folderCount: number; allocated: number; completed: number };
+  folders: Array<{
+    folder: string;
+    taskCount: number;
+    completedCount: number;
+    lastUpdated: number;
+    assignedWorker: string;
+    projectId: string;
+    nativeTaskCount?: number;
+    vlmTaskCount?: number;
+  }>;
+}
+
+export interface ProjectDetailPayload {
+  project: {
+    id: string;
+    name: string;
+    targetTotal: number;
+    workflowSourceType: 'native-yolo' | 'vlm-review';
+    vlmSourceFile?: string;
+    visibleToWorkers?: boolean;
+    status?: 'ACTIVE' | 'ARCHIVED';
+    allocated: number;
+    completed: number;
+    progress: number;
+    folderCount: number;
+  };
+  workers: Array<{
+    userId: string;
+    allocated: number;
+    completed: number;
+    progress: number;
+    submissions?: number;
+    totalTimeSeconds?: number;
+    workTimeHours?: number;
+    workingDays?: number;
+    vacationDays?: number;
+    foldersWorked?: string[];
+    lastTimestamp?: number;
+    isDummy?: boolean;
+  }>;
+  folders: Array<{
+    folder: string;
+    taskCount: number;
+    completedCount: number;
+    submittedCount?: number;
+    approvedCount?: number;
+    rejectedCount?: number;
+    lastUpdated: number;
+    assignedWorker: string;
+  }>;
+  trends: Array<{
+    date: string;
+    submissions: number;
+    workTimeSeconds: number;
+    workTimeHours: number;
+    dummySubmissions?: number;
+    dummyWorkTimeSeconds?: number;
+    dummyWorkTimeHours?: number;
+  }>;
+  isArchived?: boolean;
+  archivedAt?: number;
+}
+
+export interface PluginDescriptor {
+  sourceType: 'native-yolo' | 'vlm-review';
+  label: string;
+  supportsWorkflow: boolean;
+  supportsMigration: boolean;
+}
+
+export interface VlmMigrationDryRunResult {
+  total: number;
+  limit: number;
+  offset: number;
+  sampleCount: number;
+  sample: Array<{
+    taskId: string;
+    sourceFile: string;
+    sourceRefId: string;
+    image: string | null;
+    mappedFolder: string;
+    mappedStatus: string;
+    assignedWorker: string | null;
+    completedAt: number;
+    validatedAt: number;
+  }>;
+}
+
+export interface VlmImportJsonFileInfo {
+  fileName: string;
+  relativePath: string;
+  size: number;
+  modifiedAt: number;
+  totalRows: number;
+  parseError?: string;
+  alreadyImportedCount?: number;
+}
+
+export interface VlmJsonImportResult {
+  success: boolean;
+  commit: boolean;
+  total: number;
+  assignedCount: number;
+  unassignedCount: number;
+  missingImages: number;
+  sourceFiles: string[];
+  skippedAlreadyAssigned?: number;
+  assignedPreview: Array<{
+    taskId: string;
+    sourceRefId: string;
+    assignedWorker: string | null;
+    imageExists: boolean;
+  }>;
+}
+
+export interface VlmExportJsonFileInfo {
+  sourceFile: string;
+  totalTasks: number;
+  submittedTasks: number;
+  lastUpdated: number;
+}
+
+export interface VlmExportJsonResult {
+  success: boolean;
+  onlySubmitted: boolean;
+  savedFiles: Array<{
+    sourceFile: string;
+    outputPath: string;
+    count: number;
+  }>;
+}
+
 const LOGS_KEY = 'yolo_logs';
+const FOLDER_META_KEY = 'yolo_folder_meta';
+const INITIAL_TASK_FETCH_LIMIT = 5000;
+const LOG_PULL_MIN_INTERVAL_MS = 15000;
+
+let _workerScope: string | null = null;
+
+export const setWorkerScope = (worker: string | null) => {
+  _workerScope = worker;
+};
+
+const buildDatasetsUrl = (limit: number, offset: number, lastUpdated?: number, lastId?: string): string => {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (lastUpdated != null && lastUpdated !== -1 && lastId) {
+    params.set('lastUpdated', String(lastUpdated));
+    params.set('lastId', lastId);
+  } else {
+    params.set('offset', String(offset));
+  }
+  if (_workerScope) params.set('worker', _workerScope);
+  return `/api/datasets?${params.toString()}`;
+};
+
+// Configure localforage
+localforage.config({
+  name: 'IntellivixStudio',
+  storeName: 'app_data'
+});
 
 // --- YOLO Format Helper Functions ---
 
@@ -32,7 +215,7 @@ export const parseYoloTxt = (content: string): BoundingBox[] => {
         y,
         w,
         h,
-        isAutoLabel: false
+        isAutoLabel: true
       } as BoundingBox;
     })
     .filter((box): box is BoundingBox => box !== null);
@@ -48,87 +231,405 @@ export const generateYoloTxt = (annotations: BoundingBox[]): string => {
 
 // --- Storage Logic ---
 
-// In-memory cache for tasks to avoid constant re-fetching of list
+// In-memory cache
+let cachedFolders: any[] = [];
 let cachedTasks: Task[] = [];
+let cachedLogs: WorkLog[] = [];
+let cachedFolderMeta: Record<string, any> = {};
 let isInitialized = false;
+let lastCommittedTaskSignature = new Map<string, string>();
+let lastLogPullAt = 0;
 
-// 1. Initialize: Fetch file list from server
+const normalizeServerTask = (serverTask: any, existing?: any): Task => {
+  if (existing) {
+    const useServer = serverTask.status !== 'TODO' || (serverTask.lastUpdated || 0) > (existing.lastUpdated || 0);
+    if (useServer) {
+      return {
+        ...serverTask,
+        isModified: serverTask.isModified === 1 || serverTask.isModified === true,
+        annotations: existing.annotations && (existing.lastUpdated || 0) > (serverTask.lastUpdated || 0)
+          ? existing.annotations
+          : (serverTask.annotations || [])
+      } as Task;
+    }
+    return {
+      ...serverTask,
+      status: existing.status,
+      isModified: existing.isModified === 1 || existing.isModified === true,
+      annotations: existing.annotations || serverTask.annotations || [],
+      reviewerNotes: existing.reviewerNotes,
+      assignedWorker: existing.assignedWorker || serverTask.assignedWorker,
+      lastUpdated: existing.lastUpdated
+    } as Task;
+  }
+
+  return {
+    ...serverTask,
+    isModified: serverTask.isModified === 1 || serverTask.isModified === true,
+    annotations: serverTask.annotations || []
+  } as Task;
+};
+
+const queueTaskPersist = (_task: Task): void => {
+  // Intentionally no-op:
+  // task data must not be persisted to local storage.
+};
+
+const persistCachedTasks = async () => {
+  // Intentionally no-op:
+  // task list/state must be sourced from server only.
+};
+
+const getTaskCommitSignature = (task: Task): string => {
+  return JSON.stringify({
+    id: task.id,
+    status: task.status,
+    isModified: task.isModified === true,
+    assignedWorker: task.assignedWorker || '',
+    reviewerNotes: task.reviewerNotes || '',
+    lastUpdated: task.lastUpdated || 0,
+    txtPath: task.txtPath || ''
+  });
+};
+
+const markTaskAsCommitted = (task: Task) => {
+  lastCommittedTaskSignature.set(task.id, getTaskCommitSignature(task));
+};
+
+const refreshCommittedTaskSignatures = () => {
+  lastCommittedTaskSignature = new Map(cachedTasks.map(task => [task.id, getTaskCommitSignature(task)]));
+};
+
+// Helper to migrate from localStorage to localforage
+const migrateFromLocalStorage = async () => {
+  const logs = localStorage.getItem(LOGS_KEY);
+  const meta = localStorage.getItem(FOLDER_META_KEY);
+
+  if (logs) await localforage.setItem(LOGS_KEY, JSON.parse(logs));
+  if (meta) await localforage.setItem(FOLDER_META_KEY, JSON.parse(meta));
+
+  if (logs || meta) {
+    console.log("Migration from localStorage to IndexedDB complete.");
+    // We don't clear immediately to be safe, but we could.
+    // localStorage.clear(); 
+  }
+};
+
+// 1. Initialize: Fetch first page of data from server
 export const initStorage = async () => {
   try {
-    const res = await fetch('/api/datasets');
-    if (!res.ok) throw new Error('Failed to fetch datasets');
-    const files = await res.json();
+    await migrateFromLocalStorage();
+    cachedLogs = await localforage.getItem<WorkLog[]>(LOGS_KEY) || [];
+    cachedFolderMeta = await localforage.getItem<Record<string, any>>(FOLDER_META_KEY) || {};
 
-    // Merge with any local storage overrides (e.g. status) if needed, 
-    // but for now, we prioritize file system truth for existence.
-    // We can still use localStorage for 'status' management if we want to track 'DONE' state 
-    // separate from file existence, but here we will try to be simple.
-
-    const stored = localStorage.getItem(TASKS_KEY);
-    const existingTasks: Task[] = stored ? JSON.parse(stored) : [];
-
-    cachedTasks = files.map((f: any) => {
-      const existing = existingTasks.find(t => t.name === f.name && t.folder === f.folder);
-
-      // If we have a txtPath, it means a file potentially exists.
-      // We don't read the content yet (lazy load).
-
-      return {
-        id: existing?.id || Math.random().toString(36).substr(2, 9),
-        imageUrl: f.imageUrl,
-        name: f.name,
-        folder: f.folder,
-        txtPath: f.txtPath, // Path to save to/read from
-        // If existing status is something meaningful, keep it. 
-        // Else, if persistence file exists, it's Draft/In Progress.
-        // Server-side metadata takes precedence for persistence
-        status: f.status || existing?.status || (f.txtPath ? TaskStatus.IN_PROGRESS : TaskStatus.TODO),
-        annotations: existing?.annotations || [], // Will be loaded on demand
-        lastUpdated: f.lastUpdated || existing?.lastUpdated || Date.now(),
-        assignedWorker: f.assignedWorker || existing?.assignedWorker,
-        reviewerNotes: f.reviewerNotes || existing?.reviewerNotes,
-        isModified: f.isModified || existing?.isModified
-      };
-    });
+    // Initial sync
+    await syncTasksDelta();
 
     isInitialized = true;
-
-    // Sync back to local storage for metadata that isn't in files (like status, assignedWorker)
-    localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
-
   } catch (e) {
     console.error("Storage Init Failed:", e);
   }
 };
 
+/**
+ * Sync Logs: Push local -> Server, then Pull Server -> Local
+ */
+// --- Log Sync: Optimized ---
+let isSyncingLogs = false;
+
+export const syncLogs = async (pullUpdates: boolean = true) => {
+  if (isSyncingLogs) return;
+  isSyncingLogs = true;
+
+  try {
+    let localLogs = await localforage.getItem<WorkLog[]>(LOGS_KEY) || [];
+
+    // Ensure cached logs are populated from storage if empty
+    if (cachedLogs.length === 0 && localLogs.length > 0) {
+      cachedLogs = localLogs;
+    }
+
+    // 1. Push UNSYNCED logs to server
+    // We treat logs without 'synced' property as UNSYNCED (safe default for migration)
+    const unsyncedLogs = localLogs.filter(l => !l.synced);
+
+    if (unsyncedLogs.length > 0) {
+      try {
+        const res = await fetch('/api/logs', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(unsyncedLogs)
+        });
+
+        if (res.ok) {
+          // Mark as synced locally
+          const syncedIds = new Set(unsyncedLogs.map(l => l.id));
+          localLogs = localLogs.map(l => syncedIds.has(l.id) ? { ...l, synced: true } : l);
+
+          cachedLogs = localLogs; // Update memory
+          await localforage.setItem(LOGS_KEY, localLogs); // Update storage
+        }
+      } catch (e) {
+        console.error("Failed to push unsynced logs:", e);
+      }
+    }
+
+    const shouldPull = pullUpdates && (Date.now() - lastLogPullAt >= LOG_PULL_MIN_INTERVAL_MS);
+    if (shouldPull) {
+      // 2. Fetch NEW logs from server (Differential Sync)
+      const maxTimestamp = localLogs.length > 0 ? Math.max(...localLogs.map(l => l.timestamp)) : 0;
+
+      const res = await fetch(`/api/logs?since=${maxTimestamp}`);
+      if (res.ok) {
+        const newLogs = await res.json();
+        if (newLogs.length > 0) {
+          const existingIds = new Set(localLogs.map(l => l.id));
+          const uniqueNewLogs = newLogs.filter((l: WorkLog) => !existingIds.has(l.id));
+
+          if (uniqueNewLogs.length > 0) {
+            const finalNewLogs = uniqueNewLogs.map((l: WorkLog) => ({ ...l, synced: true }));
+            cachedLogs = [...localLogs, ...finalNewLogs].sort((a, b) => a.timestamp - b.timestamp);
+            await localforage.setItem(LOGS_KEY, cachedLogs);
+          }
+        }
+        lastLogPullAt = Date.now();
+      }
+    }
+  } finally {
+    isSyncingLogs = false;
+  }
+};
+
+/**
+ * Fetch Daily Statistics from Server (Aggregated)
+ */
+export const getDailyStats = async (date: Date) => {
+  try {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}`;
+
+    const res = await fetch(`/api/analytics/daily?date=${dateStr}`);
+    if (res.ok) {
+      const contentType = res.headers.get('content-type') || '';
+      if (!contentType.includes('application/json')) {
+        const responseText = await res.text();
+        throw new Error(`Expected JSON response but got "${contentType || 'unknown'}": ${responseText.slice(0, 120)}`);
+      }
+      return await res.json();
+    }
+  } catch (e) {
+    console.error("Failed to fetch daily stats:", e);
+  }
+  return [];
+};
+
+const formatDateToYmd = (date: Date): string => {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+};
+
+const getRangeStats = async (startDate: Date, endDate: Date) => {
+  const startStr = formatDateToYmd(startDate);
+  const endStr = formatDateToYmd(endDate);
+
+  const res = await fetch(`/api/analytics/range?start=${startStr}&end=${endStr}`);
+  if (!res.ok) throw new Error('Failed to fetch range analytics');
+
+  const contentType = res.headers.get('content-type') || '';
+  if (!contentType.includes('application/json')) {
+    const responseText = await res.text();
+    throw new Error(`Expected JSON response but got "${contentType || 'unknown'}": ${responseText.slice(0, 120)}`);
+  }
+
+  return await res.json();
+};
+
+/**
+ * Fetch Weekly Statistics (Aggregates 7 calls to daily stats)
+ */
+export const getWeeklyStats = async (startDate: Date) => {
+  try {
+    const weekStart = new Date(startDate);
+    weekStart.setHours(0, 0, 0, 0);
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
+    weekEnd.setHours(23, 59, 59, 999);
+
+    return await getRangeStats(weekStart, weekEnd);
+  } catch (e) {
+    console.error("Failed to fetch weekly stats:", e);
+    return [];
+  }
+};
+
+/**
+ * Fetch Monthly Statistics (Aggregates calls to daily stats)
+ */
+export const getMonthlyStats = async (year: number, month: number) => {
+  try {
+    const startDate = new Date(year, month - 1, 1);
+    const endDate = new Date(year, month, 0); // Last day of month
+    startDate.setHours(0, 0, 0, 0);
+    endDate.setHours(23, 59, 59, 999);
+    return await getRangeStats(startDate, endDate);
+
+  } catch (e) {
+    console.error("Failed to fetch monthly stats:", e);
+    return [];
+  }
+};
+
+/**
+ * Fetch Overall Project Summary from Server
+ */
+export const getProjectSummary = async () => {
+  try {
+    const res = await fetch('/api/analytics/summary');
+    if (res.ok) {
+      return await res.json();
+    }
+  } catch (e) {
+    console.error("Failed to fetch project summary:", e);
+  }
+  return null;
+};
+
+/**
+ * Loads more tasks from the server (Pagination)
+ */
+export const loadMoreTasks = async (offset: number, limit: number = 5000) => {
+  try {
+    let url = '';
+    if (cachedTasks.length > 0) {
+      const last = cachedTasks[cachedTasks.length - 1];
+      url = buildDatasetsUrl(limit, 0, last.lastUpdated, last.id);
+    } else {
+      url = buildDatasetsUrl(limit, offset);
+    }
+
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Failed to fetch more datasets');
+    const files = await res.json();
+
+    const existingIds = new Set(cachedTasks.map(t => t.id));
+    const newTasks = files.filter((f: any) => !existingIds.has(f.id)).map((f: any) => normalizeServerTask(f));
+
+    cachedTasks = [...cachedTasks, ...newTasks];
+    await persistCachedTasks();
+    newTasks.forEach(task => markTaskAsCommitted(task as Task));
+    return newTasks;
+  } catch (e) {
+    console.error("Load More Failed:", e);
+    return [];
+  }
+};
+
+export const syncTasksDelta = async () => {
+  try {
+    const maxTimestamp = cachedTasks.length > 0
+      ? Math.max(...cachedTasks.map(t => t.lastUpdated || 0))
+      : 0;
+
+    const params = new URLSearchParams({ since: String(maxTimestamp) });
+    if (_workerScope) params.set('worker', _workerScope);
+
+    // 1. Fetch Deltas
+    const res = await fetch(`/api/sync/delta?${params.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch delta sync');
+    const { updated, deleted } = await res.json();
+
+    const baseMap = new Map(cachedTasks.map(t => [t.id, t]));
+
+    // 2. Handle Deletions
+    if (deleted && deleted.length > 0) {
+      const deletedSet = new Set(deleted);
+      cachedTasks = cachedTasks.filter(t => !deletedSet.has(t.id));
+      deleted.forEach((id: string) => baseMap.delete(id));
+    }
+
+    // 3. Handle Updates/New Tasks
+    if (updated && updated.length > 0) {
+      updated.forEach((f: any) => {
+        const existing = baseMap.get(f.id);
+        baseMap.set(f.id, normalizeServerTask(f, existing));
+      });
+      cachedTasks = Array.from(baseMap.values())
+        .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+    }
+
+    // 4. Initial Load if empty (or for some reason we need a clean start)
+    if (cachedTasks.length === 0) {
+      let offset = 0;
+      while (true) {
+        const res = await fetch(buildDatasetsUrl(INITIAL_TASK_FETCH_LIMIT, offset));
+        if (!res.ok) break;
+        const batch = await res.json();
+        if (!batch || batch.length === 0) break;
+        batch.forEach((f: any) => {
+          if (!baseMap.has(f.id)) {
+            baseMap.set(f.id, normalizeServerTask(f));
+          }
+        });
+        offset += batch.length;
+        if (batch.length < INITIAL_TASK_FETCH_LIMIT) break;
+      }
+      cachedTasks = Array.from(baseMap.values())
+        .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+    }
+
+    await persistCachedTasks();
+    refreshCommittedTaskSignatures();
+    return cachedTasks.length;
+  } catch (e) {
+    console.error("Delta task sync failed:", e);
+    return cachedTasks.length;
+  }
+};
+
+export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT) => {
+  return await syncTasksDelta();
+};
 
 export const getTasks = (): Task[] => {
-  if (!isInitialized) {
-    // Return local storage backup if init hasn't finished (shouldn't happen often)
-    const data = localStorage.getItem(TASKS_KEY);
-    return data ? JSON.parse(data) : [];
-  }
   return cachedTasks;
 };
 
 export const getTaskById = async (id: string): Promise<Task | undefined> => {
-  const task = cachedTasks.find(t => t.id === id);
+  let task = cachedTasks.find(t => t.id === id);
   if (!task) return undefined;
 
-  // Lazy Load Annotations from File if needed
+  // List API omits sourceData; fetch full task when needed (e.g. VLM review)
+  if (task.sourceType === 'vlm-review' && task.sourceData == null) {
+    try {
+      const res = await fetch(`/api/task?id=${encodeURIComponent(id)}`);
+      if (res.ok) {
+        const full = await res.json();
+        task = {
+          ...task,
+          ...full,
+          annotations: task.annotations ?? full.annotations,
+          isModified: full.isModified === 1 || full.isModified === true
+        } as Task;
+        const idx = cachedTasks.findIndex(t => t.id === id);
+        if (idx !== -1) cachedTasks[idx] = task;
+      }
+    } catch (e) {
+      console.error("Failed to load full task", id, e);
+    }
+  }
+
+  // If annotations are still empty, try to load from labels
   if ((!task.annotations || task.annotations.length === 0) && task.txtPath) {
     try {
-      // Construct path to potential txt file if we knew it, 
-      // For now, we rely on the scanned 'txtPath' property.
-
-      if (task.txtPath) {
-        const res = await fetch(`/api/label?path=${encodeURIComponent(task.txtPath)}`);
-        const text = await res.text();
-        if (text) {
-          task.annotations = parseYoloTxt(text);
-          // Update cache
-          updateTaskInCache(task);
-        }
+      const res = await fetch(`/api/label?path=${encodeURIComponent(task.txtPath)}`);
+      const text = await res.text();
+      if (text) {
+        task.annotations = parseYoloTxt(text);
+        await updateTaskInCache(task);
       }
     } catch (e) {
       console.error("Failed to load labels for task", task.id, e);
@@ -137,112 +638,152 @@ export const getTaskById = async (id: string): Promise<Task | undefined> => {
   return task;
 };
 
-const updateTaskInCache = (task: Task) => {
+const updateTaskInCache = async (task: Task, persistLocally: boolean = false) => {
   const index = cachedTasks.findIndex(t => t.id === task.id);
   if (index !== -1) {
     cachedTasks[index] = task;
-    localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
+    if (persistLocally) {
+      queueTaskPersist(task);
+    }
   }
 }
 
-export const updateTask = async (taskId: string, updates: Partial<Task>, userId: string, role: UserRole): Promise<Task> => {
+/**
+ * Updates task in memory only.
+ * Sets isDirty flag to true for manual modifications.
+ */
+export const updateTaskLocally = async (taskId: string, updates: Partial<Task>): Promise<Task> => {
   const task = cachedTasks.find(t => t.id === taskId);
   if (!task) throw new Error('Task not found');
 
-  const updatedTask = { ...task, ...updates, lastUpdated: Date.now() };
+  const updatedTask = {
+    ...task,
+    ...updates,
+    isModified: updates.annotations ? true : (updates.isModified ?? task.isModified),
+    lastUpdated: Date.now()
+  };
 
-  // 1. Update In-Memory & LocalStorage (for fast UI)
-  updateTaskInCache(updatedTask);
-
-  // 2. Persist to Disk if annotations changed or status submitted
-  if (updates.annotations || updates.status === TaskStatus.SUBMITTED) {
-    if (!updatedTask.txtPath) {
-      // We need to determine the save path if it wasn't scanned initially.
-      // It should be adjacent to the image.
-      // Since we don't have the absolute path easily for new files, 
-      // we can rely on the server to handle this if we send the image path?
-      // OR: We know the structure is datasets/[folder]/[image].
-      // The API list gave us 'txtPath' if it existed.
-      // If it didn't exist, we must construct it.
-
-      // Hack: Construct relative txt path based on image url
-      // imageUrl: /datasets/folder/image.jpg
-      // expected txt: datasets/folder/image.txt
-      // The imageUrl in vite starts with /, so remove it
-
-      let relativeTxtPath = updatedTask.imageUrl.startsWith('/') ? updatedTask.imageUrl.substring(1) : updatedTask.imageUrl;
-      relativeTxtPath = relativeTxtPath.substring(0, relativeTxtPath.lastIndexOf('.')) + '.txt';
-      updatedTask.txtPath = relativeTxtPath;
-    }
-
-    const content = generateYoloTxt(updatedTask.annotations);
-
-    try {
-      await fetch('/api/save', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          path: updatedTask.txtPath,
-          content: content
-        })
-      });
-    } catch (e) {
-      console.error("Failed to save to disk", e);
-      alert("Failed to save to disk! Check console.");
-    }
-  }
-
-
-  // 3. Persist Metadata (status, isModified, assignedWorker, reviewerNotes)
-  // We save this to _metadata.json via /api/metadata
-  if (updates.status || updates.isModified !== undefined || updates.assignedWorker !== undefined || updates.reviewerNotes !== undefined) {
-    try {
-      // Construct key relative to datasets root: folder/filename
-      const folderPart = updatedTask.folder === 'Unsorted' ? '' : updatedTask.folder;
-      const key = folderPart ? `${folderPart}/${updatedTask.name}` : updatedTask.name;
-
-      await fetch('/api/metadata', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          key,
-          updates: {
-            status: updatedTask.status,
-            isModified: updatedTask.isModified,
-            assignedWorker: updatedTask.assignedWorker,
-            reviewerNotes: updatedTask.reviewerNotes,
-            lastUpdated: updatedTask.lastUpdated
-          }
-        })
-      });
-    } catch (e) {
-      console.error("Failed to save metadata", e);
-    }
-  }
-
+  await updateTaskInCache(updatedTask, false);
   return updatedTask;
 };
 
-export const assignFolderToWorker = (folderName: string, workerName: string | undefined) => {
+/**
+ * Syncs a specific task's state to the server (Physical Disk + DB)
+ */
+export const syncTaskToServer = async (taskId: string): Promise<void> => {
+  const task = cachedTasks.find(t => t.id === taskId);
+  if (!task) return;
+
+  const commitSignature = getTaskCommitSignature(task);
+  const previouslyCommitted = lastCommittedTaskSignature.get(task.id);
+  if (previouslyCommitted && previouslyCommitted === commitSignature) {
+    return;
+  }
+
+  try {
+    const key = task.imageUrl.startsWith('/datasets/')
+      ? task.imageUrl.substring('/datasets/'.length)
+      : (task.folder === 'Unsorted' ? task.name : `${task.folder}/${task.name}`);
+    const isVlmTask = task.sourceType === 'vlm-review';
+    const shouldPersistLabel = !isVlmTask && (task.isModified || task.status === TaskStatus.SUBMITTED);
+    const labelPayload = shouldPersistLabel
+      ? (() => {
+        if (!task.txtPath) {
+          let relativeTxtPath = task.imageUrl.startsWith('/') ? task.imageUrl.substring(1) : task.imageUrl;
+          relativeTxtPath = relativeTxtPath.substring(0, relativeTxtPath.lastIndexOf('.')) + '.txt';
+          task.txtPath = relativeTxtPath;
+        }
+        return {
+          path: task.txtPath,
+          content: generateYoloTxt(task.annotations || [])
+        };
+      })()
+      : null;
+
+    const res = await fetch('/api/task-commit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        label: labelPayload,
+        metadata: {
+          id: task.id,
+          key,
+          updates: {
+            status: task.status,
+            isModified: task.isModified ? 1 : 0,
+            assignedWorker: task.assignedWorker,
+            reviewerNotes: task.reviewerNotes,
+            sourceType: task.sourceType || 'native-yolo',
+            sourceRefId: task.sourceRefId,
+            sourceFile: task.sourceFile,
+            sourceData: task.sourceData,
+            lastUpdated: task.lastUpdated
+          }
+        }
+      })
+    });
+    if (!res.ok) throw new Error('Failed task commit');
+    markTaskAsCommitted(task);
+  } catch (e) {
+    console.error("Failed to sync task commit", e);
+    throw e;
+  }
+};
+
+/**
+ * Legacy updateTask (kept for compatibility, but now uses the new logic internally)
+ * For features that still need immediate sync (like submitting)
+ */
+export const updateTask = async (taskId: string, updates: Partial<Task>, userId: string, role: UserRole): Promise<Task> => {
+  const updated = await updateTaskLocally(taskId, updates);
+  await syncTaskToServer(taskId);
+  return updated;
+};
+
+export const assignFolderToWorker = async (folderName: string, workerName: string | undefined) => {
+  const timestamp = Date.now();
+  // Update In-Memory Cache
   cachedTasks = cachedTasks.map(t => {
     if (t.folder === folderName) {
-      return { ...t, assignedWorker: workerName, lastUpdated: Date.now() };
+      return { ...t, assignedWorker: workerName, lastUpdated: timestamp };
     }
     return t;
   });
-  localStorage.setItem(TASKS_KEY, JSON.stringify(cachedTasks));
+
+  // 2. Persist to Server (Physical Move)
+  try {
+    await fetch('/api/assign-worker', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folderName,
+        workerName: workerName || 'Unassigned'
+      })
+    });
+
+    await fetch('/api/folder-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folder: folderName,
+        updates: { assignedWorker: workerName, lastUpdated: timestamp }
+      })
+    });
+  } catch (e) {
+    console.error("Failed to sync physical folder assignment", e);
+  }
 };
 
-export const logAction = (
+export const logAction = async (
   taskId: string,
   userId: string,
   role: UserRole,
   action: WorkLog['action'],
-  durationSeconds: number = 0
+  durationSeconds: number = 0,
+  isModifiedOverride?: boolean
 ) => {
-  const logs: WorkLog[] = JSON.parse(localStorage.getItem(LOGS_KEY) || '[]');
-
   const task = cachedTasks.find(t => t.id === taskId);
+  const cappedDurationSeconds = Math.min(300, Math.max(0, Number(durationSeconds || 0)));
   let stats = undefined;
   if (task && (action === 'SUBMIT' || action === 'APPROVE' || action === 'SAVE')) {
     stats = {
@@ -251,45 +792,497 @@ export const logAction = (
     };
   }
 
+  const normalizedUserId = userId.trim();
+  const deterministicSubmitId = `submit:${taskId}:${normalizedUserId}`;
+  const logId = action === 'SUBMIT'
+    ? deterministicSubmitId
+    : Math.random().toString(36).substr(2, 9);
+
   const newLog: WorkLog = {
-    id: Math.random().toString(36).substr(2, 9),
+    id: logId,
     taskId,
-    userId,
+    userId: normalizedUserId,
     role,
     folder: task?.folder || 'Unknown',
     action,
     timestamp: Date.now(),
-    durationSeconds,
-    isModified: task?.isModified,
-    stats
+    durationSeconds: cappedDurationSeconds,
+    isModified: isModifiedOverride !== undefined ? isModifiedOverride : task?.isModified,
+    stats,
+    sourceType: task?.sourceType || 'native-yolo'
   };
-  logs.push(newLog);
-  localStorage.setItem(LOGS_KEY, JSON.stringify(logs));
+  if (action === 'SUBMIT') {
+    const existingIndex = cachedLogs.findIndex(l => l.id === logId);
+    if (existingIndex >= 0) {
+      const existing = cachedLogs[existingIndex];
+      cachedLogs[existingIndex] = {
+        ...existing,
+        ...newLog,
+        durationSeconds: cappedDurationSeconds
+      };
+    } else {
+      cachedLogs.push(newLog);
+    }
+  } else {
+    cachedLogs.push(newLog);
+  }
+  await localforage.setItem(LOGS_KEY, cachedLogs);
+
+  // Push unsynced logs immediately, but avoid frequent pull requests while navigating.
+  syncLogs(false);
 };
 
 export const getLogs = (): WorkLog[] => {
-  return JSON.parse(localStorage.getItem(LOGS_KEY) || '[]');
+  return cachedLogs;
 };
 
 export const getFolderMetadata = (folderName: string): any => {
-  const allMeta = JSON.parse(localStorage.getItem('yolo_folder_meta') || '{}');
-  return allMeta[folderName] || { tags: [], memo: '' };
+  const meta = cachedFolderMeta[folderName] || {};
+  return {
+    tags: [],
+    memo: '',
+    ...meta
+  };
 };
 
-export const saveFolderMetadata = (folderName: string, meta: any) => {
-  const allMeta = JSON.parse(localStorage.getItem('yolo_folder_meta') || '{}');
-  allMeta[folderName] = meta;
-  localStorage.setItem('yolo_folder_meta', JSON.stringify(allMeta));
+export const saveFolderMetadata = async (folderName: string, meta: any) => {
+  cachedFolderMeta[folderName] = meta;
+  await localforage.setItem(FOLDER_META_KEY, cachedFolderMeta);
+
+  // Sync to Server
+  try {
+    await fetch('/api/folder-metadata', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        folder: folderName,
+        updates: meta
+      })
+    });
+  } catch (e) {
+    console.error("Failed to sync folder metadata to server", e);
+  }
+};
+
+export const convertFolderToWebp = async (folderName: string, limit?: number, offset?: number) => {
+  try {
+    const res = await fetch('/api/convert-folder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folderName, limit, offset })
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    console.error("Batch conversion trigger failed", e);
+    return null;
+  }
+};
+
+export const getAllFolderMetadata = (): Record<string, any> => {
+  return cachedFolderMeta;
+};
+
+export const createTaskIssue = async (payload: {
+  taskId: string;
+  type: TaskIssueType;
+  reasonCode: TaskIssueReasonCode;
+  createdBy: string;
+}) => {
+  try {
+    const task = cachedTasks.find(t => t.id === payload.taskId);
+    if (!task) throw new Error('Task not found');
+
+    const res = await fetch('/api/issues', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        taskId: payload.taskId,
+        folder: task.folder,
+        imageUrl: task.imageUrl,
+        type: payload.type,
+        reasonCode: payload.reasonCode,
+        createdBy: payload.createdBy
+      })
+    });
+    if (!res.ok) throw new Error('Failed to create issue');
+    const data = await res.json();
+    // Locallly update the task status to ISSUE_PENDING to lock it immediately
+    await updateTaskLocally(payload.taskId, { status: TaskStatus.ISSUE_PENDING });
+    return data;
+  } catch (e) {
+    console.error("Failed to create task issue:", e);
+    throw e;
+  }
+};
+
+export const getOpenIssueCount = async (): Promise<number> => {
+  try {
+    const res = await fetch('/api/issues/count');
+    if (!res.ok) throw new Error('Failed to fetch open issue count');
+    const data = await res.json();
+    return Number(data?.openCount || 0);
+  } catch (e) {
+    console.error("Failed to fetch open issue count:", e);
+    return 0;
+  }
+};
+
+export const getTaskIssues = async (status?: TaskIssueStatus): Promise<TaskIssue[]> => {
+  try {
+    const query = status ? `?status=${encodeURIComponent(status)}` : '';
+    const res = await fetch(`/api/issues${query}`);
+    if (!res.ok) throw new Error('Failed to fetch issues');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch task issues:", e);
+    return [];
+  }
+};
+
+export const updateTaskIssueStatus = async (
+  id: string,
+  status: TaskIssueStatus,
+  resolvedBy: string,
+  resolutionNote: string = ''
+) => {
+  try {
+    const res = await fetch('/api/issues/resolve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, status, resolvedBy, resolutionNote })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to update issue status');
+    }
+    return data;
+  } catch (e) {
+    console.error("Failed to update task issue status:", e);
+    throw e;
+  }
+};
+
+export const getVacations = async (startDate: string, endDate: string): Promise<VacationRecord[]> => {
+  try {
+    const query = `?start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`;
+    const res = await fetch(`/api/vacations${query}`);
+    if (!res.ok) throw new Error('Failed to fetch vacations');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch vacations:", e);
+    return [];
+  }
+};
+
+export const createVacation = async (payload: {
+  userId: string;
+  startDate: string;
+  endDate: string;
+  days: number;
+  note?: string;
+}) => {
+  try {
+    const res = await fetch('/api/vacations', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to create vacation');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to create vacation:", e);
+    throw e;
+  }
+};
+
+export const deleteVacation = async (id: string) => {
+  try {
+    const res = await fetch(`/api/vacations?id=${encodeURIComponent(id)}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error('Failed to delete vacation');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to delete vacation:", e);
+    throw e;
+  }
+};
+
+export const getScheduleBoard = async (startDate: string, endDate: string): Promise<Record<string, Record<string, string[]>>> => {
+  try {
+    const query = `?start=${encodeURIComponent(startDate)}&end=${encodeURIComponent(endDate)}`;
+    const res = await fetch(`/api/schedule/board${query}`);
+    if (!res.ok) throw new Error('Failed to fetch schedule board');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch schedule board:", e);
+    return {};
+  }
+};
+
+export const getProjects = async (): Promise<ProjectDefinition[]> => {
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) throw new Error('Failed to fetch projects');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch projects:", e);
+    return [];
+  }
+};
+
+export const saveProject = async (payload: {
+  id?: string;
+  name: string;
+  targetTotal: number;
+  workflowSourceType?: 'native-yolo' | 'vlm-review';
+  vlmSourceFile?: string;
+  visibleToWorkers?: boolean;
+}) => {
+  try {
+    const res = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to save project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to save project:", e);
+    throw e;
+  }
+};
+
+export const archiveProject = async (payload: { projectId: string; snapshot?: ProjectDetailPayload | null }) => {
+  try {
+    const res = await fetch('/api/projects/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to archive project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to archive project:", e);
+    throw e;
+  }
+};
+
+export const restoreProject = async (payload: { projectId: string }) => {
+  try {
+    const res = await fetch('/api/projects/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to restore project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to restore project:", e);
+    throw e;
+  }
+};
+
+export const mapFolderToProject = async (folder: string, projectId: string | null) => {
+  try {
+    const res = await fetch('/api/projects/map', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder, projectId })
+    });
+    if (!res.ok) throw new Error('Failed to map folder to project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to map folder to project:", e);
+    throw e;
+  }
+};
+
+export const getProjectOverview = async (): Promise<ProjectOverviewPayload> => {
+  try {
+    const res = await fetch('/api/projects/overview');
+    if (!res.ok) throw new Error('Failed to fetch project overview');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch project overview:", e);
+    return {
+      projects: [],
+      projectMap: {},
+      unassigned: { folderCount: 0, allocated: 0, completed: 0 },
+      folders: []
+    };
+  }
+};
+
+export const getProjectDetail = async (projectId: string, days: number = 30): Promise<ProjectDetailPayload | null> => {
+  try {
+    const query = `?projectId=${encodeURIComponent(projectId)}&days=${encodeURIComponent(String(days))}`;
+    const res = await fetch(`/api/projects/detail${query}`);
+    if (!res.ok) throw new Error('Failed to fetch project detail');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch project detail:", e);
+    return null;
+  }
+};
+
+export const listPlugins = async (): Promise<PluginDescriptor[]> => {
+  try {
+    const res = await fetch('/api/plugins');
+    if (!res.ok) throw new Error('Failed to fetch plugins');
+    const payload = await res.json();
+    return Array.isArray(payload?.plugins) ? payload.plugins : [];
+  } catch (e) {
+    console.error("Failed to fetch plugins:", e);
+    return [];
+  }
+};
+
+export const getVlmMigrationDryRun = async (limit: number = 100, offset: number = 0): Promise<VlmMigrationDryRunResult | null> => {
+  try {
+    const query = `?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`;
+    const res = await fetch(`/api/plugins/vlm/dry-run${query}`);
+    if (!res.ok) throw new Error('Failed to run VLM dry-run');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to run VLM dry-run:", e);
+    return null;
+  }
+};
+
+export const migrateVlmData = async (payload?: { commit?: boolean; limit?: number; offset?: number }) => {
+  try {
+    const res = await fetch('/api/plugins/vlm/migrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || { commit: false, limit: 10000, offset: 0 })
+    });
+    if (!res.ok) throw new Error('Failed to migrate VLM data');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to migrate VLM data:", e);
+    throw e;
+  }
+};
+
+export const listVlmImportJsonFiles = async (): Promise<VlmImportJsonFileInfo[]> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/import-json/files');
+    if (!res.ok) throw new Error('Failed to fetch VLM import json files');
+    const payload = await res.json();
+    return Array.isArray(payload?.files) ? payload.files : [];
+  } catch (e) {
+    console.error('Failed to fetch VLM import json files:', e);
+    return [];
+  }
+};
+
+export const importVlmJsonData = async (payload: {
+  sourceFiles: string[];
+  commit?: boolean;
+  assignees?: string[];
+  assignCount?: number;
+  keepUnassigned?: boolean;
+  imagePathMappings?: Array<{ from: string; to: string }>;
+}): Promise<VlmJsonImportResult> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/import-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to import VLM json data';
+      throw new Error(msg);
+    }
+    return data;
+  } catch (e) {
+    console.error('Failed to import VLM json data:', e);
+    throw e;
+  }
+};
+
+export interface VlmAssignSourceFileInfo {
+  sourceFile: string;
+  total: number;
+  unassigned: number;
+}
+
+export const getVlmAssignSourceFiles = async (projectId: string): Promise<VlmAssignSourceFileInfo[]> => {
+  const res = await fetch(`/api/plugins/vlm/assign/source-files?projectId=${encodeURIComponent(projectId)}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return [];
+  return Array.isArray(data?.sourceFiles) ? data.sourceFiles : [];
+};
+
+export const assignVlmTasks = async (payload: {
+  workerName: string;
+  count: number;
+  projectId?: string;
+  sourceFiles?: string[];
+}): Promise<{ assigned: number }> => {
+  const res = await fetch('/api/plugins/vlm/assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to assign VLM tasks';
+    throw new Error(msg);
+  }
+  return data;
+};
+
+export const unassignVlmTasks = async (payload: {
+  workerName: string;
+  count: number;
+  projectId?: string;
+  sourceFiles?: string[];
+}): Promise<{ unassigned: number }> => {
+  const res = await fetch('/api/plugins/vlm/unassign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to unassign VLM tasks';
+    throw new Error(msg);
+  }
+  return data;
+};
+
+export const listVlmExportJsonFiles = async (): Promise<VlmExportJsonFileInfo[]> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/export-json/files');
+    if (!res.ok) throw new Error('Failed to fetch VLM export files');
+    const payload = await res.json();
+    return Array.isArray(payload?.files) ? payload.files : [];
+  } catch (e) {
+    console.error('Failed to fetch VLM export files:', e);
+    return [];
+  }
+};
+
+export const exportVlmJsonData = async (payload: { sourceFiles: string[]; onlySubmitted?: boolean; includeResult?: boolean }): Promise<VlmExportJsonResult> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/export-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to export VLM json data');
+    return await res.json();
+  } catch (e) {
+    console.error('Failed to export VLM json data:', e);
+    throw e;
+  }
 };
 
 export const downloadFullDataset = async () => {
   const zip = new JSZip();
   const tasks = getTasks();
-
-  // 1. Add Annotations (.txt) organized by folder
-  // Note: Since we are now saving to disk, downloading zip might just serve the files.
-  // But for convenience of "Export", we still zip them up from memory/cache or fetch them.
-  // Here we use the latest memory state (which should match disk).
 
   tasks.forEach(task => {
     if (task.annotations.length > 0) {

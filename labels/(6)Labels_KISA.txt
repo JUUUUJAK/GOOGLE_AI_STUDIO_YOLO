@@ -1,0 +1,6 @@
+person
+umbrella
+wheelchair
+guidedog
+turnstile
+Blind

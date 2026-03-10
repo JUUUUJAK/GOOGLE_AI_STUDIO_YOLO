@@ -19,6 +19,33 @@ export enum TaskStatus {
   SUBMITTED = 'SUBMITTED',
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
+  ISSUE_PENDING = 'ISSUE_PENDING',
+}
+
+export type PluginSourceType = 'native-yolo' | 'vlm-review';
+export type VlmTaskStatus = 'assigned' | 'worked' | 'validated';
+
+export interface PluginTaskAdapter {
+  sourceType: PluginSourceType;
+  toCommonStatus: (input: string | number) => TaskStatus;
+  toSourceStatus?: (status: TaskStatus) => string;
+}
+
+export interface PluginReviewAdapter {
+  sourceType: PluginSourceType;
+  canReview: (task: Task) => boolean;
+  normalizeReviewerNote: (note: string) => string;
+}
+
+export interface PluginReportAdapter {
+  sourceType: PluginSourceType;
+  includeInUnifiedReport: boolean;
+}
+
+export interface PluginContract {
+  task: PluginTaskAdapter;
+  review: PluginReviewAdapter;
+  report: PluginReportAdapter;
 }
 
 export const TaskStatusLabels: Record<TaskStatus, string> = {
@@ -27,6 +54,7 @@ export const TaskStatusLabels: Record<TaskStatus, string> = {
   [TaskStatus.SUBMITTED]: '제출',
   [TaskStatus.APPROVED]: '완료',
   [TaskStatus.REJECTED]: '반려',
+  [TaskStatus.ISSUE_PENDING]: '요청중',
 };
 
 export interface BoundingBox {
@@ -57,6 +85,10 @@ export interface Task {
   reviewerNotes?: string;
   lastUpdated: number;
   isModified?: boolean; // True if annotations have been modified by a user
+  sourceType?: PluginSourceType;
+  sourceRefId?: string;
+  sourceFile?: string;
+  sourceData?: string;
 }
 
 export interface FolderMetadata {
@@ -78,6 +110,8 @@ export interface WorkLog {
     totalBoxCount: number;
     manualBoxCount: number; // Count of boxes where isAutoLabel is false/undefined
   };
+  synced?: boolean; // True if confirmed saved to server
+  sourceType?: PluginSourceType;
 }
 
 export interface DatasetStats {
@@ -86,4 +120,33 @@ export interface DatasetStats {
   rejectedTasks: number;
   avgTimePerTask: number;
   annotationsPerClass: Record<string, number>;
+}
+
+export type TaskIssueType = 'REVIEW_REQUEST' | 'DELETE_REQUEST';
+export type TaskIssueStatus = 'OPEN' | 'IN_REVIEW' | 'DELETE' | 'RESOLVED';
+export type TaskIssueReasonCode = 'BLUR' | 'CORRUPT' | 'WRONG_CLASS' | 'DUPLICATE' | 'OTHER';
+
+export interface TaskIssue {
+  id: string;
+  taskId: string;
+  folder: string;
+  imageUrl: string;
+  type: TaskIssueType;
+  reasonCode: TaskIssueReasonCode;
+  status: TaskIssueStatus;
+  createdBy: string;
+  createdAt: number;
+  resolvedBy?: string | null;
+  resolvedAt?: number | null;
+  resolutionNote?: string | null;
+}
+
+export interface VacationRecord {
+  id: string;
+  userId: string;
+  startDate: string; // YYYY-MM-DD
+  endDate: string; // YYYY-MM-DD
+  days: number; // supports 0.5 for half-day
+  note?: string;
+  createdAt: number;
 }
