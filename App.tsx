@@ -4,7 +4,7 @@ import { COLOR_PALETTE } from './constants';
 import * as Storage from './services/storage';
 import Dashboard from './components/Dashboard';
 import AnnotationCanvas from './components/AnnotationCanvas';
-import History from './components/History';
+import VlmReviewPanel, { VlmDraftPayload } from './components/VlmReviewPanel';
 import Login from './components/Login';
 import { GuideViewer } from './components/GuideViewer';
 
@@ -36,7 +36,7 @@ const LoadingOverlay: React.FC<{ message: string }> = ({ message }) => (
     </div>
 );
 
-type View = 'DASHBOARD' | 'HISTORY';
+type View = 'DASHBOARD';
 
 const ISSUE_REASON_OPTIONS: Array<{ value: TaskIssueReasonCode; label: string }> = [
     { value: 'BLUR', label: '흐림' },
@@ -71,6 +71,8 @@ const App: React.FC = () => {
     const [availableLabelFiles, setAvailableLabelFiles] = useState<string[]>([]);
     const [currentClasses, setCurrentClasses] = useState<YoloClass[]>([]);
     const [selectedClass, setSelectedClass] = useState<YoloClass | null>(null);
+    const [undoSignal, setUndoSignal] = useState<number>(0);
+    const [redoSignal, setRedoSignal] = useState<number>(0);
 
     // Guide State
     const [showGuide, setShowGuide] = useState(false);
@@ -78,6 +80,7 @@ const App: React.FC = () => {
     const [guideList, setGuideList] = useState<{ title: string, filename: string }[]>([]);
     const [showGuidePicker, setShowGuidePicker] = useState(false);
     const guideDropdownRef = useRef<HTMLDivElement>(null);
+    const vlmDraftRef = useRef<VlmDraftPayload | null>(null);
 
     // Click outside to close guide dropdown
     useEffect(() => {
@@ -93,12 +96,7 @@ const App: React.FC = () => {
     // Load tasks on mount
     useEffect(() => {
         const init = async () => {
-            setIsDataLoading(true);
             try {
-                await Storage.initStorage();
-                refreshTasks();
-
-                // Load Label Files
                 const res = await fetch('/api/label-files');
                 if (res.ok) {
                     const files = await res.json();
@@ -109,9 +107,7 @@ const App: React.FC = () => {
                     }
                 }
             } catch (e) {
-                console.error("Initialization Failed", e);
-            } finally {
-                setIsDataLoading(false);
+                console.error("Label file load failed", e);
             }
         };
         init();
@@ -180,13 +176,24 @@ const App: React.FC = () => {
         };
     }, [user]);
 
-    const handleLogin = (authenticatedUser: User) => {
+    const handleLogin = async (authenticatedUser: User) => {
         setUser(authenticatedUser);
-        // Set default view based on account type
         if (authenticatedUser.accountType === AccountType.ADMIN) {
             setCurrentUserRole(UserRole.REVIEWER);
+            Storage.setWorkerScope(null);
         } else {
             setCurrentUserRole(UserRole.WORKER);
+            Storage.setWorkerScope(authenticatedUser.username);
+        }
+
+        setIsDataLoading(true);
+        try {
+            await Storage.initStorage();
+            refreshTasks();
+        } catch (e) {
+            console.error("Post-login init failed", e);
+        } finally {
+            setIsDataLoading(false);
         }
     };
 
@@ -195,6 +202,7 @@ const App: React.FC = () => {
         setCurrentTask(null);
         setCurrentUserRole(UserRole.WORKER);
         setCurrentView('DASHBOARD');
+        Storage.setWorkerScope(null);
     };
 
     const handleOpenIssues = () => {
@@ -219,16 +227,30 @@ const App: React.FC = () => {
         }
     };
 
+    const handleLightRefresh = async () => {
+        setIsDataLoading(true);
+        try {
+            // Lightweight refresh: reload from DB-backed API only (no filesystem scan).
+            await Storage.initStorage();
+            await Storage.syncAllTaskPages();
+            refreshTasks();
+        } finally {
+            setIsDataLoading(false);
+        }
+    };
+
     const handleTaskSelect = useCallback(async (taskId: string) => {
         if (!user) return;
         const task = await Storage.getTaskById(taskId);
         if (task) {
             setCurrentTask(task);
             setStartTime(Date.now());
-            if (currentUserRole === UserRole.WORKER && task.status === TaskStatus.TODO) {
-                await Storage.updateTask(taskId, { status: TaskStatus.IN_PROGRESS }, user.username, currentUserRole);
+            if (currentUserRole === UserRole.WORKER) {
                 Storage.logAction(taskId, user.username, currentUserRole, 'START');
-                refreshTasks();
+                if (task.status === TaskStatus.TODO) {
+                    await Storage.updateTask(taskId, { status: TaskStatus.IN_PROGRESS }, user.username, currentUserRole);
+                    refreshTasks();
+                }
             }
         }
     }, [currentUserRole, user]);
@@ -282,6 +304,28 @@ const App: React.FC = () => {
                 const count = await Storage.getOpenIssueCount();
                 setOpenIssueCount(count);
             }
+            // Update local tasks immediately after issue creation to reflect ISSUE_PENDING status
+            await refreshTasks();
+            
+            // Sync currentTask state to reflect the new ISSUE_PENDING status immediately
+            const updated = Storage.getTasks().find(t => t.id === currentTask.id);
+            if (updated) setCurrentTask(updated);
+
+            alert(issueRequestType === 'DELETE_REQUEST' ? '삭제 요청이 접수되었습니다.' : '확인 요청이 접수되었습니다.');
+            setIssueRequestType(null);
+
+            // Auto-move to NEXT if navigation is possible
+            const allTasks = Storage.getTasks();
+            const relevantTasks = allTasks.filter(t =>
+                currentUserRole === UserRole.REVIEWER
+                    ? (t.sourceType === 'vlm-review' ? t.assignedWorker === currentTask.assignedWorker : true)
+                    : t.assignedWorker === user.username
+            );
+            const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, 'NEXT', Object.values(TaskStatus));
+            if (targetTask) {
+                handleTaskSelect(targetTask.id);
+                setJumpIndex('');
+            }
         } catch (e: any) {
             const msg = e?.message || '';
             if (msg.includes('409')) {
@@ -334,7 +378,9 @@ const App: React.FC = () => {
 
         // Filter tasks to stay within the same assignment context
         const relevantTasks = allTasks.filter(t =>
-            currentUserRole === UserRole.REVIEWER || t.assignedWorker === user.username
+            currentUserRole === UserRole.REVIEWER
+                ? (t.sourceType === 'vlm-review' ? t.assignedWorker === currentTask.assignedWorker : true)
+                : t.assignedWorker === user.username
         );
 
         const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, direction, validStatuses);
@@ -365,7 +411,9 @@ const App: React.FC = () => {
         if (!currentTask || !user) return;
         const allTasks = Storage.getTasks();
         const relevantTasks = allTasks.filter(t =>
-            currentUserRole === UserRole.REVIEWER || t.assignedWorker === user.username
+            currentUserRole === UserRole.REVIEWER
+                ? (t.sourceType === 'vlm-review' ? t.assignedWorker === currentTask.assignedWorker : true)
+                : t.assignedWorker === user.username
         );
         const folderTasks = relevantTasks.filter(t => t.folder === currentTask.folder);
         folderTasks.sort((a, b) => a.name.localeCompare(b.name));
@@ -382,6 +430,21 @@ const App: React.FC = () => {
 
     const handleSubmit = useCallback(async (direction: 'NEXT' | 'PREV' = 'NEXT') => {
         if (!currentTask || !user) return;
+
+        if (currentTask.status === TaskStatus.ISSUE_PENDING) {
+            // Navigation-only move for locked tasks
+            const allTasks = Storage.getTasks();
+            const relevantTasks = allTasks.filter(t => t.assignedWorker === user.username);
+            const validStatuses = Object.values(TaskStatus);
+            const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, direction, validStatuses);
+            if (targetTask) {
+                handleTaskSelect(targetTask.id);
+                setJumpIndex('');
+            } else {
+                alert(direction === 'NEXT' ? "This is the last task." : "This is the first task.");
+            }
+            return;
+        }
 
         const duration = (Date.now() - startTime) / 1000;
         await Storage.updateTaskLocally(currentTask.id, { status: TaskStatus.SUBMITTED });
@@ -429,7 +492,10 @@ const App: React.FC = () => {
             return;
         }
 
-        const relevantTasks = allTasks; // Reviewers can see all work in the folder
+        // Reviewers can see all work in the folder, except for VLM where folders are shared across workers
+        const relevantTasks = allTasks.filter(t =>
+            t.sourceType === 'vlm-review' ? t.assignedWorker === currentTask.assignedWorker : true
+        );
         // Sequential Navigation for Reviewers: Include all statuses
         const validStatuses = Object.values(TaskStatus);
         const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, direction, validStatuses);
@@ -445,6 +511,96 @@ const App: React.FC = () => {
             }
         }
     }, [currentTask, startTime, currentUserRole, handleTaskSelect, handleCloseTask, user]);
+
+    const isVlmTask = currentTask?.sourceType === 'vlm-review';
+
+    const mergeVlmPayloadIntoSourceData = useCallback((task: Task, payload: VlmDraftPayload): string => {
+        let parsed: Record<string, unknown> = {};
+        try {
+            if (typeof task.sourceData === 'string' && task.sourceData) parsed = JSON.parse(task.sourceData);
+            else if (task.sourceData && typeof task.sourceData === 'object') parsed = task.sourceData as Record<string, unknown>;
+        } catch (_) { }
+        const rawResultData = (parsed.rawResultData as Record<string, unknown>) || {};
+        return JSON.stringify({
+            ...parsed,
+            ui: { reviewResult: payload.reviewResult, dueDate: payload.dueDate, editedGptResponse: payload.gptResponse },
+            rawResultData: { ...rawResultData, reviewResult: payload.reviewResult, editedAnswer: payload.gptResponse }
+        });
+    }, []);
+
+    const handleVlmSaveDraft = useCallback(async (payload: VlmDraftPayload) => {
+        if (!currentTask || !user) return;
+        const sourceData = mergeVlmPayloadIntoSourceData(currentTask, payload);
+        await Storage.updateTask(currentTask.id, { sourceData, reviewerNotes: payload.note, isModified: true }, user.username, currentUserRole);
+        const updated = Storage.getTasks().find(t => t.id === currentTask.id) || currentTask;
+        setCurrentTask({ ...updated, sourceData, reviewerNotes: payload.note });
+        setTasks(Storage.getTasks());
+    }, [currentTask, user, currentUserRole, mergeVlmPayloadIntoSourceData]);
+
+    const handleVlmSubmitCurrent = useCallback(async (payload: VlmDraftPayload) => {
+        if (!currentTask || !user) return;
+
+        if (currentTask.status === TaskStatus.ISSUE_PENDING) {
+            alert("이슈 처리 중인 태스크는 제출할 수 없습니다.");
+            return;
+        }
+
+        const duration = (Date.now() - startTime) / 1000;
+        const sourceData = mergeVlmPayloadIntoSourceData(currentTask, payload);
+        let newStatus = TaskStatus.SUBMITTED;
+        if (currentUserRole === UserRole.REVIEWER) {
+            newStatus = TaskStatus.APPROVED;
+        }
+        await Storage.updateTask(currentTask.id, { sourceData, reviewerNotes: payload.note, status: newStatus, isModified: true }, user.username, currentUserRole);
+        Storage.logAction(currentTask.id, user.username, currentUserRole, newStatus === TaskStatus.APPROVED ? 'APPROVE' : 'SUBMIT', duration, true);
+        const allTasks = Storage.getTasks();
+        setTasks(allTasks);
+        const updated = allTasks.find(t => t.id === currentTask.id);
+        if (updated) setCurrentTask(updated);
+    }, [currentTask, user, currentUserRole, startTime, mergeVlmPayloadIntoSourceData]);
+
+    const handleVlmSubmitMove = useCallback(async (payload: VlmDraftPayload, direction: 'NEXT' | 'PREV') => {
+        if (!currentTask || !user) return;
+
+        if (currentTask.status === TaskStatus.ISSUE_PENDING) {
+            // Navigation-only move for locked tasks
+            const allTasks = Storage.getTasks();
+            const relevantTasks = allTasks.filter(t =>
+                currentUserRole === UserRole.REVIEWER ? t.assignedWorker === currentTask.assignedWorker : t.assignedWorker === user.username
+            );
+            const validStatuses = Object.values(TaskStatus);
+            const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, direction, validStatuses);
+            if (targetTask) {
+                handleTaskSelect(targetTask.id);
+                setJumpIndex('');
+            } else {
+                alert(direction === 'NEXT' ? "This is the last task." : "This is the first task.");
+            }
+            return;
+        }
+
+        const duration = (Date.now() - startTime) / 1000;
+        const sourceData = mergeVlmPayloadIntoSourceData(currentTask, payload);
+        let newStatus = TaskStatus.SUBMITTED;
+        if (currentUserRole === UserRole.REVIEWER) {
+            newStatus = TaskStatus.APPROVED;
+        }
+        await Storage.updateTask(currentTask.id, { sourceData, reviewerNotes: payload.note, status: newStatus, isModified: true }, user.username, currentUserRole);
+        Storage.logAction(currentTask.id, user.username, currentUserRole, newStatus === TaskStatus.APPROVED ? 'APPROVE' : 'SUBMIT', duration, true);
+        const allTasks = Storage.getTasks();
+        setTasks(allTasks);
+        const relevantTasks = allTasks.filter(t =>
+            currentUserRole === UserRole.REVIEWER ? t.assignedWorker === currentTask.assignedWorker : t.assignedWorker === user.username
+        );
+        const validStatuses = Object.values(TaskStatus);
+        const targetTask = findNextTask(relevantTasks, currentTask.id, currentTask.folder, direction, validStatuses);
+        if (targetTask) {
+            handleTaskSelect(targetTask.id);
+            setJumpIndex('');
+        } else {
+            alert(direction === 'NEXT' ? "This is the last task in the folder." : "This is the first task in the folder.");
+        }
+    }, [currentTask, user, currentUserRole, startTime, handleTaskSelect, mergeVlmPayloadIntoSourceData]);
 
     // Keyboard Shortcuts for Main App
     useEffect(() => {
@@ -462,10 +618,36 @@ const App: React.FC = () => {
                 );
             }
 
+            // W / S: Active class 이전/다음
+            if (currentClasses.length > 0 && (key === 'w' || key === 's')) {
+                const idx = currentClasses.findIndex(c => c.id === selectedClass?.id);
+                if (key === 'w') {
+                    if (idx <= 0) setSelectedClass(currentClasses[currentClasses.length - 1]);
+                    else setSelectedClass(currentClasses[idx - 1]);
+                } else {
+                    if (idx < 0 || idx >= currentClasses.length - 1) setSelectedClass(currentClasses[0]);
+                    else setSelectedClass(currentClasses[idx + 1]);
+                }
+            }
+
             // 1-9 Class Select
             if (key >= '1' && key <= '9') {
                 const idx = parseInt(key) - 1;
                 if (idx < currentClasses.length) setSelectedClass(currentClasses[idx]);
+            }
+
+            if (isVlmTask) {
+                if (key === 'a' || key === 'd') {
+                    if (currentTask.status === TaskStatus.ISSUE_PENDING) return;
+                    const direction = key === 'a' ? 'PREV' : 'NEXT';
+                    if (vlmDraftRef.current) {
+                        handleVlmSubmitMove(vlmDraftRef.current, direction);
+                    } else {
+                        if (currentUserRole === UserRole.WORKER) handleSubmit(direction);
+                        else handleReview(true, direction);
+                    }
+                }
+                return;
             }
 
             if (currentUserRole === UserRole.WORKER) {
@@ -490,7 +672,7 @@ const App: React.FC = () => {
 
         window.addEventListener('keydown', handleKeyDown);
         return () => window.removeEventListener('keydown', handleKeyDown);
-    }, [currentTask, handleSubmit, handleReview, currentUserRole, currentClasses, navigateTask]);
+    }, [currentTask, handleSubmit, handleReview, handleVlmSubmitMove, isVlmTask, currentUserRole, currentClasses, selectedClass, navigateTask]);
 
     const currentFolderStats = useMemo(() => {
         if (!currentTask) return { completed: 0, total: 0, approved: 0 };
@@ -503,7 +685,9 @@ const App: React.FC = () => {
     const orderedCurrentFolderTasks = useMemo(() => {
         if (!currentTask || !user) return [];
         const relevantTasks = tasks.filter(t =>
-            currentUserRole === UserRole.REVIEWER || t.assignedWorker === user.username
+            currentUserRole === UserRole.REVIEWER
+                ? (t.sourceType === 'vlm-review' ? t.assignedWorker === currentTask.assignedWorker : true)
+                : t.assignedWorker === user.username
         );
         return relevantTasks
             .filter(t => t.folder === currentTask.folder)
@@ -537,16 +721,6 @@ const App: React.FC = () => {
                             >
                                 Dashboard
                             </button>
-                            {/* Show History only for Admin */}
-                            {user.accountType === AccountType.ADMIN && (
-                                <button
-                                    onClick={() => setCurrentView('HISTORY')}
-                                    className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${currentView === 'HISTORY' ? 'bg-slate-800 text-white shadow-inner' : 'text-slate-400 hover:text-white hover:bg-slate-800/50'}`}
-                                >
-                                    History
-                                </button>
-                            )}
-
                             <div className="relative" ref={guideDropdownRef}>
                                 <button
                                     onClick={async () => {
@@ -555,13 +729,9 @@ const App: React.FC = () => {
                                             return;
                                         }
 
-                                        if (guideList.length > 0) {
-                                            setShowGuidePicker(true);
-                                            return;
-                                        }
-
                                         try {
-                                            const res = await fetch('/guides/list.json');
+                                            // Always refetch guide list so newly added files appear without page reload.
+                                            const res = await fetch(`/guides/list.json?ts=${Date.now()}`, { cache: 'no-store' });
                                             if (res.ok) {
                                                 const guides = await res.json();
                                                 if (guides.length === 0) {
@@ -571,13 +741,22 @@ const App: React.FC = () => {
                                                     setShowGuidePicker(true);
                                                 }
                                             } else {
-                                                // Fallback if list.json fails
+                                                // Fallback: if we already have a list in memory, open it.
+                                                if (guideList.length > 0) {
+                                                    setShowGuidePicker(true);
+                                                } else {
+                                                    setCurrentPdfUrl('/guides/Worker_Guide_v1.pdf');
+                                                    setShowGuide(true);
+                                                }
+                                            }
+                                        } catch (e) {
+                                            // Network fallback: use in-memory list if available.
+                                            if (guideList.length > 0) {
+                                                setShowGuidePicker(true);
+                                            } else {
                                                 setCurrentPdfUrl('/guides/Worker_Guide_v1.pdf');
                                                 setShowGuide(true);
                                             }
-                                        } catch (e) {
-                                            setCurrentPdfUrl('/guides/Worker_Guide_v1.pdf');
-                                            setShowGuide(true);
                                         }
                                     }}
                                     className={`px-4 py-2 hover:text-white hover:bg-slate-800/50 rounded-lg text-sm font-medium transition-all flex items-center gap-2 ${showGuidePicker ? 'bg-slate-800 text-white' : 'text-slate-400'}`}
@@ -669,292 +848,345 @@ const App: React.FC = () => {
             </nav>
 
             <main className="flex-1 relative flex overflow-hidden">
-                {currentView === 'HISTORY' && !currentTask && user.accountType === AccountType.ADMIN ? (
-                    <History currentUser={user.username} accountType={user.accountType} />
-                ) : (
-                    <>
-                        {!currentTask ? (
-                            <Dashboard
-                                role={currentUserRole}
-                                accountType={user.accountType}
-                                tasks={tasks}
-                                onSelectTask={handleTaskSelect}
-                                onRefresh={refreshTasks}
-                                onSync={handleSync}
-                                username={user.username}
-                                openIssueRequestsSignal={openIssueRequestsSignal}
-                            />
-                        ) : (
-                            <div className="flex w-full h-full">
-                                {/* Sidebar (Tools) */}
-                                <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col z-20 shadow-2xl">
-                                    <div className="p-6 border-b border-slate-800">
-                                        <button
-                                            onClick={handleCloseTask}
-                                            className="text-slate-400 hover:text-white flex items-center gap-2 text-sm font-medium mb-4 transition-colors"
-                                        >
-                                            ← Back to Dashboard
-                                        </button>
-                                        <h2 className="font-bold text-lg text-white truncate" title={currentTask.name}>{currentTask.name}</h2>
-                                        <div className="flex items-center gap-3 mt-3">
-                                            <span className="text-xs font-bold text-slate-400 bg-slate-800 px-2.5 py-1 rounded border border-slate-700">
-                                                {TaskStatusLabels[currentTask.status]}
-                                            </span>
-                                            <span className="text-xs text-slate-500 border-l border-slate-700 pl-3">
-                                                {currentTask.folder}
-                                            </span>
-                                        </div>
-
-                                        <div className="mt-6 bg-slate-800/50 p-3 rounded-lg border border-slate-700/50">
-                                            {currentUserRole === UserRole.REVIEWER ? (
-                                                <>
-                                                    <div className="flex justify-between text-xs text-slate-400 mb-2 font-medium">
-                                                        <span>Review Progress</span>
-                                                        <span>{currentFolderStats.approved} / {currentFolderStats.completed - currentFolderStats.approved}</span>
-                                                    </div>
-                                                    <div className="w-full bg-slate-700 h-2 rounded-full overflow-hidden">
-                                                        <div
-                                                            className="bg-purple-600 h-full transition-all duration-300"
-                                                            style={{ width: `${currentFolderStats.completed > 0 ? (currentFolderStats.approved / currentFolderStats.completed) * 100 : 0}%` }}
-                                                        />
-                                                    </div>
-                                                    <div className="mt-1 text-[10px] text-right text-slate-500">Approved / Pending</div>
-                                                </>
-                                            ) : (
-                                                <>
-                                                    <div className="flex justify-between text-xs text-slate-400 mb-2 font-medium">
-                                                        <span>Folder Progress</span>
-                                                        <span>{currentFolderStats.completed} / {currentFolderStats.total}</span>
-                                                    </div>
-                                                    <div className="w-full bg-slate-700 h-2 rounded-full overflow-hidden">
-                                                        <div
-                                                            className="bg-sky-500 h-full transition-all duration-300"
-                                                            style={{ width: `${(currentFolderStats.completed / Math.max(currentFolderStats.total, 1)) * 100}%` }}
-                                                        />
-                                                    </div>
-                                                </>
-                                            )}
-                                        </div>
+                <>
+                    {!currentTask ? (
+                        <Dashboard
+                            role={currentUserRole}
+                            accountType={user.accountType}
+                            tasks={tasks}
+                            onSelectTask={handleTaskSelect}
+                            onRefresh={refreshTasks}
+                            onSync={handleSync}
+                            onLightRefresh={handleLightRefresh}
+                            username={user.username}
+                            openIssueRequestsSignal={openIssueRequestsSignal}
+                        />
+                    ) : (
+                        <div className="flex w-full h-full">
+                            {/* Sidebar (Tools) */}
+                            <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col z-20 shadow-2xl">
+                                <div className="p-6 border-b border-slate-800">
+                                    <button
+                                        onClick={handleCloseTask}
+                                        className="text-slate-400 hover:text-white flex items-center gap-2 text-sm font-medium mb-4 transition-colors"
+                                    >
+                                        ← Back to Dashboard
+                                    </button>
+                                    <h2 className="font-bold text-lg text-white truncate" title={currentTask.name}>{currentTask.name}</h2>
+                                    <div className="flex items-center gap-3 mt-3">
+                                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded border uppercase tracking-wider
+                                            ${currentTask.status === TaskStatus.TODO ? 'bg-slate-800 text-slate-400 border-slate-700' : ''}
+                                            ${currentTask.status === TaskStatus.IN_PROGRESS ? 'bg-sky-900/30 text-sky-300 border-sky-800/50' : ''}
+                                            ${currentTask.status === TaskStatus.SUBMITTED ? 'bg-amber-900/30 text-amber-300 border-amber-800/50' : ''}
+                                            ${currentTask.status === TaskStatus.APPROVED ? 'bg-lime-900/30 text-lime-300 border-lime-800/50' : ''}
+                                            ${currentTask.status === TaskStatus.REJECTED ? 'bg-rose-900/30 text-rose-300 border-rose-800/50' : ''}
+                                            ${currentTask.status === TaskStatus.ISSUE_PENDING ? 'bg-purple-900/30 text-purple-300 border-purple-800/50' : ''}
+                                        `}>
+                                            {TaskStatusLabels[currentTask.status] || currentTask.status}
+                                        </span>
+                                        <span className="text-xs text-slate-500 border-l border-slate-700 pl-3">
+                                            {currentTask.folder}
+                                        </span>
                                     </div>
 
-                                    {/* Label Set Selector */}
-                                    <div className="p-6 bg-slate-800/30 border-b border-slate-800">
-                                        <label className="text-xs text-slate-500 font-bold uppercase tracking-wider block mb-2">라벨셋</label>
-                                        <select
-                                            value={selectedLabelFile}
-                                            onChange={(e) => setSelectedLabelFile(e.target.value)}
-                                            className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-sm rounded-lg p-2.5 focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none shadow-sm"
-                                        >
-                                            {availableLabelFiles.map(fileName => (
-                                                <option key={fileName} value={fileName}>{fileName}</option>
-                                            ))}
-                                        </select>
-                                    </div>
-
-                                    <div className="flex-1 overflow-y-auto p-4 space-y-0.5">
-                                        <h3 className="px-2 text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Classes (1-9)</h3>
-                                        {currentClasses.map((cls, idx) => (
-                                            <div key={cls.id} className="group flex items-center gap-2">
-                                                <button
-                                                    onClick={() => setSelectedClass(cls)}
-                                                    className={`flex-1 flex items-center gap-3 px-3 py-1.5 rounded-md border transition-all ${selectedClass?.id === cls.id
-                                                        ? 'bg-slate-800 border-slate-600 shadow-md'
-                                                        : 'border-transparent hover:bg-slate-800/50'
-                                                        }`}
-                                                >
-                                                    <div className="relative group/color shrink-0">
-                                                        <span
-                                                            className="w-3.5 h-3.5 rounded-full block border border-white/20 shadow-sm cursor-pointer hover:scale-110 transition-transform"
-                                                            style={{ backgroundColor: customClassColors[cls.id] || cls.color }}
-                                                            onClick={(e) => {
-                                                                e.stopPropagation();
-                                                                const parent = (e.currentTarget as HTMLElement).parentElement;
-                                                                const picker = parent?.querySelector('input') as HTMLInputElement;
-                                                                picker?.click();
-                                                            }}
-                                                        ></span>
-                                                        <input
-                                                            type="color"
-                                                            className="absolute opacity-0 w-0 h-0 pointer-events-none"
-                                                            value={customClassColors[cls.id] || cls.color}
-                                                            onChange={(e) => setCustomClassColors(prev => ({ ...prev, [cls.id]: e.target.value }))}
-                                                        />
-                                                    </div>
-                                                    <span className={`text-sm font-medium truncate ${hiddenClassIds.includes(cls.id) ? 'text-slate-600 line-through' : 'text-slate-200'}`}>
-                                                        {cls.name}
-                                                    </span>
-                                                    <span className="ml-auto text-[10px] text-slate-600 font-mono">
-                                                        {idx + 1}
-                                                    </span>
-                                                </button>
-
-                                                <button
-                                                    onClick={() => {
-                                                        setHiddenClassIds(prev =>
-                                                            prev.includes(cls.id) ? prev.filter(id => id !== cls.id) : [...prev, cls.id]
-                                                        );
-                                                    }}
-                                                    className={`p-1.5 rounded-md transition-all ${hiddenClassIds.includes(cls.id) ? 'bg-red-900/40 text-red-400' : 'text-slate-500 hover:text-slate-200 hover:bg-slate-800'}`}
-                                                    title={hiddenClassIds.includes(cls.id) ? "Show Class" : "Hide Class"}
-                                                >
-                                                    {hiddenClassIds.includes(cls.id) ? (
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.542-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l18 18" /></svg>
-                                                    ) : (
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
-                                                    )}
-                                                </button>
-                                            </div>
-                                        ))}
-                                    </div>
-
-                                    <div className="p-6 border-t border-slate-800 space-y-3 bg-slate-900">
-                                        {currentUserRole === UserRole.WORKER ? (
-                                            <div className="space-y-3">
-                                                <div className="flex gap-3">
-                                                    <button
-                                                        onClick={() => handleSubmit('PREV')}
-                                                        className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg shadow-sm border border-slate-700 transition-all text-sm flex items-center justify-center gap-2"
-                                                        title="제출 & 이전 (A)"
-                                                    >
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-                                                        이전
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleSubmit('NEXT')}
-                                                        className="flex-[1.5] py-3 bg-lime-600 hover:bg-lime-500 text-white font-bold rounded-lg shadow-lg transition-transform active:scale-[0.98] text-sm flex items-center justify-center gap-2"
-                                                        title="제출 & 다음 (D)"
-                                                    >
-                                                        <span>제출 & 다음</span>
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-                                                    </button>
+                                    <div className="mt-6 bg-slate-800/50 p-3 rounded-lg border border-slate-700/50">
+                                        {currentUserRole === UserRole.REVIEWER ? (
+                                            <>
+                                                <div className="flex justify-between text-xs text-slate-400 mb-2 font-medium">
+                                                    <span>Review Progress</span>
+                                                    <span>{currentFolderStats.approved} / {currentFolderStats.completed - currentFolderStats.approved}</span>
                                                 </div>
-                                                <div className="grid grid-cols-2 gap-2">
-                                                    <button
-                                                        onClick={() => handleCreateIssue('REVIEW_REQUEST')}
-                                                        disabled={isIssueSubmitting}
-                                                        className="py-2 bg-blue-900/40 hover:bg-blue-900/60 border border-blue-800 text-blue-200 font-semibold rounded-lg text-xs transition-colors disabled:opacity-50"
-                                                    >
-                                                        확인 요청
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleCreateIssue('DELETE_REQUEST')}
-                                                        disabled={isIssueSubmitting}
-                                                        className="py-2 bg-red-900/40 hover:bg-red-900/60 border border-red-800 text-red-200 font-semibold rounded-lg text-xs transition-colors disabled:opacity-50"
-                                                    >
-                                                        삭제 요청
-                                                    </button>
+                                                <div className="w-full bg-slate-700 h-2 rounded-full overflow-hidden">
+                                                    <div
+                                                        className="bg-purple-600 h-full transition-all duration-300"
+                                                        style={{ width: `${currentFolderStats.completed > 0 ? (currentFolderStats.approved / currentFolderStats.completed) * 100 : 0}%` }}
+                                                    />
                                                 </div>
-                                            </div>
+                                                <div className="mt-1 text-[10px] text-right text-slate-500">Approved / Pending</div>
+                                            </>
                                         ) : (
-                                            <div className="space-y-3">
-                                                <button
-                                                    onClick={() => handleReview(false)}
-                                                    className="w-full py-3 bg-red-900/50 hover:bg-red-900 border border-red-800 text-red-100 font-bold rounded-lg transition-colors text-sm"
-                                                >
-                                                    작업 반려
-                                                </button>
-                                                <div className="flex gap-3">
-                                                    <button
-                                                        onClick={() => handleReview(true, 'PREV')}
-                                                        className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg shadow-sm border border-slate-700 transition-all text-sm flex items-center justify-center gap-2"
-                                                        title="이전 (A)"
-                                                    >
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
-                                                        이전
-                                                    </button>
-                                                    <button
-                                                        onClick={() => handleReview(true, 'NEXT')}
-                                                        className="flex-[1.5] py-3 bg-lime-600 hover:bg-lime-500 text-white font-bold rounded-lg shadow transition-colors text-sm flex items-center justify-center gap-2"
-                                                        title="완료 & 다음 (D)"
-                                                    >
-                                                        <span>완료 & 다음</span>
-                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
-                                                    </button>
+                                            <>
+                                                <div className="flex justify-between text-xs text-slate-400 mb-2 font-medium">
+                                                    <span>Folder Progress</span>
+                                                    <span>{currentFolderStats.completed} / {currentFolderStats.total}</span>
                                                 </div>
-                                            </div>
+                                                <div className="w-full bg-slate-700 h-2 rounded-full overflow-hidden">
+                                                    <div
+                                                        className="bg-sky-500 h-full transition-all duration-300"
+                                                        style={{ width: `${(currentFolderStats.completed / Math.max(currentFolderStats.total, 1)) * 100}%` }}
+                                                    />
+                                                </div>
+                                            </>
                                         )}
                                     </div>
-                                </aside>
+                                </div>
 
-                                {/* Canvas Area with Separate Status Bars */}
-                                <div className="flex-1 flex flex-col bg-slate-950 relative overflow-hidden">
-                                    {/* Top Bar: Current Status & Class */}
-                                    <div className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 z-30 shadow-md flex-shrink-0">
-                                        <div className="flex items-center gap-4">
-                                            <span className="text-slate-400 text-sm font-medium">Active Class:</span>
-                                            <div className="flex items-center gap-2 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
-                                                <span className="w-4 h-4 rounded-full" style={{ backgroundColor: selectedClass?.color || '#fff' }}></span>
-                                                <span className="text-white font-bold text-base">{selectedClass?.name || 'None'}</span>
+                                {!isVlmTask && (
+                                    <>
+                                        {/* Label Set Selector */}
+                                        <div className="p-6 bg-slate-800/30 border-b border-slate-800">
+                                            <label className="text-xs text-slate-500 font-bold uppercase tracking-wider block mb-2">라벨셋</label>
+                                            <select
+                                                value={selectedLabelFile}
+                                                onChange={(e) => setSelectedLabelFile(e.target.value)}
+                                                className="w-full bg-slate-900 border border-slate-700 text-slate-200 text-sm rounded-lg p-2.5 focus:ring-1 focus:ring-sky-500 focus:border-sky-500 outline-none shadow-sm"
+                                            >
+                                                {availableLabelFiles.map(fileName => (
+                                                    <option key={fileName} value={fileName}>{fileName}</option>
+                                                ))}
+                                            </select>
+                                        </div>
+
+                                        <div className="flex-1 overflow-y-auto p-4 space-y-0.5">
+                                            <h3 className="px-2 text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">Classes (1-9)</h3>
+                                            {currentClasses.map((cls, idx) => (
+                                                <div key={cls.id} className="group flex items-center gap-2">
+                                                    <button
+                                                        onClick={() => setSelectedClass(cls)}
+                                                        className={`flex-1 flex items-center gap-3 px-3 py-1.5 rounded-md border transition-all ${selectedClass?.id === cls.id
+                                                            ? 'bg-slate-800 border-slate-600 shadow-md'
+                                                            : 'border-transparent hover:bg-slate-800/50'
+                                                            }`}
+                                                    >
+                                                        <div className="relative group/color shrink-0">
+                                                            <span
+                                                                className="w-3.5 h-3.5 rounded-full block border border-white/20 shadow-sm cursor-pointer hover:scale-110 transition-transform"
+                                                                style={{ backgroundColor: customClassColors[cls.id] || cls.color }}
+                                                                onClick={(e) => {
+                                                                    e.stopPropagation();
+                                                                    const parent = (e.currentTarget as HTMLElement).parentElement;
+                                                                    const picker = parent?.querySelector('input') as HTMLInputElement;
+                                                                    picker?.click();
+                                                                }}
+                                                            ></span>
+                                                            <input
+                                                                type="color"
+                                                                className="absolute opacity-0 w-0 h-0 pointer-events-none"
+                                                                value={customClassColors[cls.id] || cls.color}
+                                                                onChange={(e) => setCustomClassColors(prev => ({ ...prev, [cls.id]: e.target.value }))}
+                                                            />
+                                                        </div>
+                                                        <span className={`text-sm font-medium truncate ${hiddenClassIds.includes(cls.id) ? 'text-slate-600 line-through' : 'text-slate-200'}`}>
+                                                            {cls.name}
+                                                        </span>
+                                                        <span className="ml-auto text-[10px] text-slate-600 font-mono">
+                                                            {idx + 1}
+                                                        </span>
+                                                    </button>
+
+                                                    <button
+                                                        onClick={() => {
+                                                            setHiddenClassIds(prev =>
+                                                                prev.includes(cls.id) ? prev.filter(id => id !== cls.id) : [...prev, cls.id]
+                                                            );
+                                                        }}
+                                                        className={`p-1.5 rounded-md transition-all ${hiddenClassIds.includes(cls.id) ? 'bg-red-900/40 text-red-400' : 'text-slate-500 hover:text-slate-200 hover:bg-slate-800'}`}
+                                                        title={hiddenClassIds.includes(cls.id) ? "Show Class" : "Hide Class"}
+                                                    >
+                                                        {hiddenClassIds.includes(cls.id) ? (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.875 18.825A10.05 10.05 0 0112 19c-4.478 0-8.268-2.943-9.542-7a9.97 9.97 0 011.563-3.029m5.858.908a3 3 0 114.243 4.243M9.878 9.878l4.242 4.242M9.88 9.88l-3.29-3.29m7.532 7.532l3.29 3.29M3 3l18 18" /></svg>
+                                                        ) : (
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
+                                                        )}
+                                                    </button>
+                                                </div>
+                                            ))}
+                                        </div>
+
+                                        <div className="p-6 border-t border-slate-800 space-y-3 bg-slate-900">
+                                            {currentUserRole === UserRole.WORKER ? (
+                                                <div className="space-y-3">
+                                                    <div className="flex gap-3">
+                                                        <button
+                                                            onClick={() => handleSubmit('PREV')}
+                                                            className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg shadow-sm border border-slate-700 transition-all text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                                                            title="제출 & 이전 (A)"
+                                                        >
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+                                                            이전
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleSubmit('NEXT')}
+                                                            className="flex-[1.5] py-3 bg-lime-600 hover:bg-lime-500 text-white font-bold rounded-lg shadow-lg transition-transform active:scale-[0.98] text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                                                            title="제출 & 다음 (D)"
+                                                        >
+                                                            <span>{currentTask.status === TaskStatus.ISSUE_PENDING ? '다음' : '제출 & 다음'}</span>
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                                                        </button>
+                                                    </div>
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <button
+                                                            onClick={() => handleCreateIssue('REVIEW_REQUEST')}
+                                                            disabled={isIssueSubmitting}
+                                                            className="py-2 bg-blue-900/40 hover:bg-blue-900/60 border border-blue-800 text-blue-200 font-semibold rounded-lg text-xs transition-colors disabled:opacity-50"
+                                                        >
+                                                            확인 요청
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleCreateIssue('DELETE_REQUEST')}
+                                                            disabled={isIssueSubmitting}
+                                                            className="py-2 bg-red-900/40 hover:bg-red-900/60 border border-red-800 text-red-200 font-semibold rounded-lg text-xs transition-colors disabled:opacity-50"
+                                                        >
+                                                            삭제 요청
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            ) : (
+                                                <div className="space-y-3">
+                                                    <button
+                                                        onClick={() => handleReview(false)}
+                                                        className="w-full py-3 bg-red-900/50 hover:bg-red-900 border border-red-800 text-red-100 font-bold rounded-lg transition-colors text-sm"
+                                                    >
+                                                        작업 반려
+                                                    </button>
+                                                    <div className="flex gap-3">
+                                                        <button
+                                                            onClick={() => handleReview(true, 'PREV')}
+                                                            className="flex-1 py-3 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium rounded-lg shadow-sm border border-slate-700 transition-all text-sm flex items-center justify-center gap-2"
+                                                            title="이전 (A)"
+                                                        >
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
+                                                            이전
+                                                        </button>
+                                                        <button
+                                                            onClick={() => handleReview(true, 'NEXT')}
+                                                            className="flex-[1.5] py-3 bg-lime-600 hover:bg-lime-500 text-white font-bold rounded-lg shadow transition-colors text-sm flex items-center justify-center gap-2"
+                                                            title="완료 & 다음 (D)"
+                                                        >
+                                                            <span>완료 & 다음</span>
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
+                                                        </button>
+                                                    </div>
+                                                </div>
+                                            )}
+                                        </div>
+                                    </>
+                                )}
+
+                            </aside>
+
+                            {/* Canvas Area with Separate Status Bars */}
+                            <div className="flex-1 flex flex-col bg-slate-950 relative overflow-hidden">
+                                {!isVlmTask && (
+                                    <>
+                                        {/* Top Bar: Current Status & Class (YOLO only) */}
+                                        <div className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 z-30 shadow-md flex-shrink-0">
+                                            <div className="flex items-center gap-4">
+                                                <span className="text-slate-400 text-sm font-medium">Active Class:</span>
+                                                <div className="flex items-center gap-2 bg-slate-800 px-3 py-1.5 rounded-lg border border-slate-700">
+                                                    <span className="w-4 h-4 rounded-full" style={{ backgroundColor: selectedClass?.color || '#fff' }}></span>
+                                                    <span className="text-white font-bold text-base">{selectedClass?.name || 'None'}</span>
+                                                </div>
+                                                <div className="flex items-center gap-1.5">
+                                                    <button
+                                                        onClick={() => setUndoSignal((prev) => prev + 1)}
+                                                        className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
+                                                        title="Undo (Ctrl+Z)"
+                                                    >
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 14L4 9m0 0l5-5M4 9h10a6 6 0 010 12h-2" />
+                                                        </svg>
+                                                    </button>
+                                                    <button
+                                                        onClick={() => setRedoSignal((prev) => prev + 1)}
+                                                        className="p-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200"
+                                                        title="Redo (Ctrl+Y / Ctrl+Shift+Z)"
+                                                    >
+                                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 14l5-5m0 0l-5-5m5 5H10a6 6 0 000 12h2" />
+                                                        </svg>
+                                                    </button>
+                                                </div>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <span className={`w-2.5 h-2.5 rounded-full ${currentUserRole === UserRole.WORKER ? 'bg-lime-500 animate-pulse' : 'bg-slate-500'}`}></span>
+                                                <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
+                                                    {currentUserRole === UserRole.WORKER ? "Edit Mode" : "View Mode"}
+                                                </span>
                                             </div>
                                         </div>
-                                        <div className="flex items-center gap-2">
-                                            <span className={`w-2.5 h-2.5 rounded-full ${currentUserRole === UserRole.WORKER ? 'bg-lime-500 animate-pulse' : 'bg-slate-500'}`}></span>
-                                            <span className="text-xs font-bold uppercase tracking-wider text-slate-400">
-                                                {currentUserRole === UserRole.WORKER ? "Edit Mode" : "View Mode"}
-                                            </span>
-                                        </div>
-                                    </div>
 
-                                    {/* Main Canvas Area */}
-                                    <div className="flex-1 relative overflow-hidden bg-black">
-                                        <AnnotationCanvas
-                                            imageUrl={currentTask.imageUrl}
-                                            annotations={currentTask.annotations}
-                                            currentClass={selectedClass || { id: -1, name: 'None', color: '#000' }}
-                                            classes={currentClasses}
-                                            readOnly={false}
-                                            onUpdateAnnotations={handleUpdateAnnotations}
-                                            hiddenClassIds={hiddenClassIds}
-                                            customClassColors={customClassColors}
+                                        {/* Main Canvas Area (YOLO) */}
+                                        <div className="flex-1 relative overflow-hidden bg-black">
+                                            <AnnotationCanvas
+                                                imageUrl={currentTask.imageUrl}
+                                                annotations={currentTask.annotations}
+                                                currentClass={selectedClass || { id: -1, name: 'None', color: '#000' }}
+                                                classes={currentClasses}
+                                                readOnly={false}
+                                                onUpdateAnnotations={handleUpdateAnnotations}
+                                                hiddenClassIds={hiddenClassIds}
+                                                customClassColors={customClassColors}
+                                                undoSignal={undoSignal}
+                                                redoSignal={redoSignal}
+                                            />
+                                        </div>
+                                    </>
+                                )}
+
+                                {isVlmTask && (
+                                    <div className="flex-1 relative overflow-hidden bg-slate-950">
+                                        <VlmReviewPanel
+                                            task={currentTask}
+                                            readOnly={currentUserRole === UserRole.REVIEWER ? false : (currentTask.status === TaskStatus.SUBMITTED || currentTask.status === TaskStatus.APPROVED)}
+                                            workerName={currentTask.assignedWorker || user?.username}
+                                            remainingCount={Math.max(0, (orderedCurrentFolderTasks?.length ?? 0) - (currentFolderTaskIndex ?? 0) - 1)}
+                                            onRefreshTask={async () => { setTasks(Storage.getTasks()); const t = Storage.getTasks().find(x => x.id === currentTask.id); if (t) setCurrentTask(t); }}
+                                            onSaveDraft={handleVlmSaveDraft}
+                                            onSubmitCurrent={handleVlmSubmitCurrent}
+                                            onSubmitAndNext={(payload) => handleVlmSubmitMove(payload, 'NEXT')}
+                                            onDraftChange={(payload) => { vlmDraftRef.current = payload; }}
                                         />
                                     </div>
+                                )}
 
-                                    {/* Bottom Navigation Control */}
-                                    <div className="h-24 bg-slate-900 border-t border-slate-800 flex items-center px-8 gap-10 z-30 shadow-lg flex-shrink-0">
-                                        <div className="flex items-center gap-4 min-w-[200px]">
-                                            <span className="text-slate-400 text-sm font-bold uppercase tracking-wider">Jump To</span>
-                                            <div className="relative">
-                                                <input
-                                                    type="number"
-                                                    value={jumpIndex}
-                                                    placeholder={(Math.max(currentFolderTaskIndex, 0) + 1).toString()}
-                                                    onChange={(e) => setJumpIndex(e.target.value)}
-                                                    onKeyDown={(e) => {
-                                                        if (e.key === 'Enter') {
-                                                            handleJumpToIndex(parseInt(jumpIndex));
-                                                        }
-                                                    }}
-                                                    className="w-28 bg-slate-950 border border-slate-700 rounded-lg py-2 px-3 text-xl font-bold text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all"
-                                                />
-                                            </div>
-                                        </div>
-
-                                        <div className="flex-1 flex items-center gap-6">
+                                {/* Bottom Navigation Control */}
+                                <div className="h-24 bg-slate-900 border-t border-slate-800 flex items-center px-8 gap-10 z-30 shadow-lg flex-shrink-0">
+                                    <div className="flex items-center gap-4 min-w-[200px]">
+                                        <span className="text-slate-400 text-sm font-bold uppercase tracking-wider">Jump To</span>
+                                        <div className="relative">
                                             <input
-                                                type="range"
-                                                min="1"
-                                                max={Math.max(orderedCurrentFolderTasks.length, 1)}
-                                                value={Math.max(currentFolderTaskIndex, 0) + 1}
-                                                onChange={(e) => handleJumpToIndex(parseInt(e.target.value))}
-                                                className="flex-1 h-3 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                                type="number"
+                                                value={jumpIndex}
+                                                placeholder={(Math.max(currentFolderTaskIndex, 0) + 1).toString()}
+                                                onChange={(e) => setJumpIndex(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    if (e.key === 'Enter') {
+                                                        handleJumpToIndex(parseInt(jumpIndex));
+                                                    }
+                                                }}
+                                                disabled={false} // Allow jumping even if locked
+                                                className="w-28 bg-slate-950 border border-slate-700 rounded-lg py-2 px-3 text-xl font-bold text-white focus:ring-2 focus:ring-blue-500 outline-none transition-all disabled:opacity-30"
                                             />
-                                            <div className="text-2xl font-mono text-slate-300 bg-slate-800 px-6 py-2 rounded-xl border border-slate-700 shadow-inner">
-                                                <span className="text-white font-black">{Math.max(currentFolderTaskIndex, 0) + 1}</span>
-                                                <span className="text-slate-500 mx-2">/</span>
-                                                <span className="text-slate-400">{orderedCurrentFolderTasks.length}</span>
-                                            </div>
                                         </div>
+                                    </div>
 
-                                        <div className="flex items-center gap-3 text-sm text-slate-500 font-semibold italic">
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                                            Press Enter to jump
+                                    <div className="flex-1 flex items-center gap-6">
+                                        <input
+                                            type="range"
+                                            min="1"
+                                            max={Math.max(orderedCurrentFolderTasks.length, 1)}
+                                            value={Math.max(currentFolderTaskIndex, 0) + 1}
+                                            disabled={false} // Allow interaction even if locked
+                                            onChange={(e) => handleJumpToIndex(parseInt(e.target.value))}
+                                            className="flex-1 h-3 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                                        />
+                                        <div className="text-2xl font-mono text-slate-300 bg-slate-800 px-6 py-2 rounded-xl border border-slate-700 shadow-inner">
+                                            <span className="text-white font-black">{Math.max(currentFolderTaskIndex, 0) + 1}</span>
+                                            <span className="text-slate-500 mx-2">/</span>
+                                            <span className="text-slate-400">{orderedCurrentFolderTasks.length}</span>
                                         </div>
+                                    </div>
+
+                                    <div className="flex items-center gap-3 text-sm text-slate-500 font-semibold italic">
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                        Press Enter to jump
                                     </div>
                                 </div>
                             </div>
-                        )}
-                    </>
-                )}
+                        </div>
+                    )}
+                </>
             </main>
 
 

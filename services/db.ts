@@ -5,6 +5,7 @@ import fs from 'fs';
 const dbPath = path.resolve(process.cwd(), 'datasets.db');
 
 export const db = new Database(dbPath);
+db.pragma('journal_mode = WAL');
 
 // Initialize schema
 db.exec(`

@@ -19,6 +19,33 @@ export enum TaskStatus {
   SUBMITTED = 'SUBMITTED',
   APPROVED = 'APPROVED',
   REJECTED = 'REJECTED',
+  ISSUE_PENDING = 'ISSUE_PENDING',
+}
+
+export type PluginSourceType = 'native-yolo' | 'vlm-review';
+export type VlmTaskStatus = 'assigned' | 'worked' | 'validated';
+
+export interface PluginTaskAdapter {
+  sourceType: PluginSourceType;
+  toCommonStatus: (input: string | number) => TaskStatus;
+  toSourceStatus?: (status: TaskStatus) => string;
+}
+
+export interface PluginReviewAdapter {
+  sourceType: PluginSourceType;
+  canReview: (task: Task) => boolean;
+  normalizeReviewerNote: (note: string) => string;
+}
+
+export interface PluginReportAdapter {
+  sourceType: PluginSourceType;
+  includeInUnifiedReport: boolean;
+}
+
+export interface PluginContract {
+  task: PluginTaskAdapter;
+  review: PluginReviewAdapter;
+  report: PluginReportAdapter;
 }
 
 export const TaskStatusLabels: Record<TaskStatus, string> = {
@@ -27,6 +54,7 @@ export const TaskStatusLabels: Record<TaskStatus, string> = {
   [TaskStatus.SUBMITTED]: '제출',
   [TaskStatus.APPROVED]: '완료',
   [TaskStatus.REJECTED]: '반려',
+  [TaskStatus.ISSUE_PENDING]: '요청중',
 };
 
 export interface BoundingBox {
@@ -57,6 +85,10 @@ export interface Task {
   reviewerNotes?: string;
   lastUpdated: number;
   isModified?: boolean; // True if annotations have been modified by a user
+  sourceType?: PluginSourceType;
+  sourceRefId?: string;
+  sourceFile?: string;
+  sourceData?: string;
 }
 
 export interface FolderMetadata {
@@ -79,6 +111,7 @@ export interface WorkLog {
     manualBoxCount: number; // Count of boxes where isAutoLabel is false/undefined
   };
   synced?: boolean; // True if confirmed saved to server
+  sourceType?: PluginSourceType;
 }
 
 export interface DatasetStats {

@@ -1,8 +1,11 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Task, TaskStatus, TaskStatusLabels, UserRole, FolderMetadata, AccountType, TaskIssue, TaskIssueStatus, VacationRecord } from '../types';
 import * as Storage from '../services/storage';
 import { ResponsiveContainer, ComposedChart, CartesianGrid, XAxis, YAxis, Tooltip, Legend, Bar, Line } from 'recharts';
 import { toBlob } from 'html-to-image';
+import ReactQuill from 'react-quill';
+import 'react-quill/dist/quill.snow.css';
+import DOMPurify from 'dompurify';
 
 interface DashboardProps {
     role: UserRole;
@@ -10,19 +13,52 @@ interface DashboardProps {
     onSelectTask: (taskId: string) => void;
     onRefresh: () => void;
     onSync: () => Promise<void>;
+    onLightRefresh?: () => Promise<void>;
     tasks: Task[];
     username: string;
     token?: string;
     openIssueRequestsSignal?: number;
+    openUserManagementSignal?: number;
 }
 
-const ALL_FOLDERS_VIEW = 'OVERVIEW';
 const USER_MANAGEMENT_VIEW = 'USERS';
 const WORKER_REPORT_VIEW = 'REPORTS';
 const WEEKLY_REPORT_VIEW = 'WEEKLY';
 const DAILY_REPORT_VIEW = 'DAILY';
 const SCHEDULE_VIEW = 'SCHEDULE';
 const ISSUE_REQUEST_VIEW = 'ISSUES';
+const PROJECT_OVERVIEW_VIEW = 'PROJECT_OVERVIEW';
+const DASHBOARD_HOME_VIEW = 'DASHBOARD_HOME';
+const WORK_LIST_VIEW = 'WORK_LIST';
+const VLM_MIGRATION_VIEW = 'VLM_MIGRATION';
+const PROJECT_DETAIL_VIEW_PREFIX = 'PROJECT_DETAIL:';
+const PROJECT_DETAIL_CACHE_TTL_MS = 60 * 1000;
+const NOTICE_HOME_VIEW = 'NOTICE_HOME';
+
+/** Path의 최상위 세그먼트(그룹명). 예: "A/train/B" => "A" */
+function getTopLevelGroup(folderPath: string): string {
+    const s = String(folderPath || '').trim();
+    if (!s) return s;
+    const idx = s.indexOf('/');
+    return idx === -1 ? s : s.slice(0, idx);
+}
+
+function groupByTopLevel<T>(items: T[], getFolder: (item: T) => string): { groupName: string; items: T[] }[] {
+    const map = new Map<string, T[]>();
+    items.forEach((item) => {
+        const folder = getFolder(item);
+        const group = getTopLevelGroup(folder);
+        if (!map.has(group)) map.set(group, []);
+        map.get(group)!.push(item);
+    });
+    return Array.from(map.entries())
+        .sort((a, b) => a[0].localeCompare(b[0]))
+        .map(([groupName, items]) => ({
+            groupName,
+            items: [...items].sort((a, b) => getFolder(a).localeCompare(getFolder(b)))
+        }));
+}
+const projectDetailCache = new Map<string, { fetchedAt: number; payload: Storage.ProjectDetailPayload | null }>();
 // const AVAILABLE_WORKERS = ['worker1', 'worker2', 'worker3', 'worker4'];
 
 type WorkerChartRow = { userId: string; submitted: number; totalTimeSeconds: number };
@@ -51,25 +87,38 @@ const WorkerPerformanceComboChart: React.FC<{ data: WorkerChartRow[]; title?: st
     if (chartData.length === 0) return null;
 
     return (
-        <div className="bg-slate-800/50 border border-slate-700 rounded-xl p-4 mb-6 shadow-sm">
-            <h3 className="text-sm font-bold text-slate-200 mb-3">{title}</h3>
-            <div className="w-full h-[280px]">
+        <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 mb-8 shadow-[0_8px_30px_rgb(0,0,0,0.4)] transition-all hover:bg-slate-900/60 hover:border-white/10 group">
+            <h3 className="text-sm font-bold text-slate-200 mb-6 flex items-center gap-3">
+                <div className="w-8 h-8 rounded-xl bg-sky-500/10 flex items-center justify-center border border-sky-500/20 group-hover:scale-110 transition-transform">
+                    <svg className="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
+                </div>
+                {title}
+            </h3>
+            <div className="w-full h-[320px]">
                 <ResponsiveContainer width="100%" height="100%">
-                    <ComposedChart data={chartData} margin={{ top: 8, right: 20, left: 0, bottom: 8 }}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                        <XAxis dataKey="userId" stroke="#94a3b8" tick={{ fontSize: 11 }} />
-                        <YAxis yAxisId="left" stroke="#34d399" tick={{ fontSize: 11 }} allowDecimals={false} />
-                        <YAxis yAxisId="right" orientation="right" stroke="#38bdf8" tick={{ fontSize: 11 }} />
+                    <ComposedChart data={chartData} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+                        <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.05)" vertical={false} />
+                        <XAxis dataKey="userId" stroke="#64748b" tick={{ fill: '#94a3b8', fontSize: 12, fontWeight: 500 }} axisLine={false} tickLine={false} dy={12} />
+                        <YAxis yAxisId="left" stroke="#10b981" tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} allowDecimals={false} />
+                        <YAxis yAxisId="right" orientation="right" stroke="#38bdf8" tick={{ fill: '#64748b', fontSize: 11 }} axisLine={false} tickLine={false} />
                         <Tooltip
-                            contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: 8 }}
+                            contentStyle={{ backgroundColor: 'rgba(15, 23, 42, 0.95)', backdropFilter: 'blur(12px)', border: '1px solid rgba(255,255,255,0.1)', borderRadius: '16px', boxShadow: '0 20px 40px -10px rgba(0, 0, 0, 0.5)', padding: '12px 16px' }}
+                            itemStyle={{ fontSize: 14, fontWeight: 600 }}
+                            labelStyle={{ color: '#94a3b8', marginBottom: '8px', fontWeight: 500 }}
                             formatter={(value: any, name: string) => {
                                 if (name === 'submitted') return [`${value}`, 'Submissions'];
                                 return [`${value}h`, 'Work Time'];
                             }}
                         />
-                        <Legend wrapperStyle={{ fontSize: 12 }} />
-                        <Bar yAxisId="left" dataKey="submitted" name="submitted" fill="#10b981" radius={[4, 4, 0, 0]} />
-                        <Line yAxisId="right" type="monotone" dataKey="workTimeHours" name="workTime" stroke="#0ea5e9" strokeWidth={2.5} dot={{ r: 3 }} />
+                        <Legend wrapperStyle={{ fontSize: 13, paddingTop: '20px', fontWeight: 500, color: '#94a3b8' }} iconType="circle" />
+                        <Bar yAxisId="left" dataKey="submitted" name="submitted" fill="url(#colorSubmitted)" radius={[8, 8, 0, 0]} maxBarSize={48} />
+                        <Line yAxisId="right" type="monotone" dataKey="workTimeHours" name="workTime" stroke="#38bdf8" strokeWidth={3} dot={{ r: 5, strokeWidth: 2, fill: '#0f172a', stroke: '#38bdf8' }} activeDot={{ r: 7, fill: '#38bdf8', stroke: '#0f172a', strokeWidth: 2 }} />
+                        <defs>
+                            <linearGradient id="colorSubmitted" x1="0" y1="0" x2="0" y2="1">
+                                <stop offset="5%" stopColor="#34d399" stopOpacity={0.9} />
+                                <stop offset="95%" stopColor="#059669" stopOpacity={0.3} />
+                            </linearGradient>
+                        </defs>
                     </ComposedChart>
                 </ResponsiveContainer>
             </div>
@@ -366,17 +415,34 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
 
         // Prevent dummy duplication: always build dummy from non-dummy rows only.
         const realRows = rows.filter((row) => row.userId !== '심아영');
-        const hasRealActivity = realRows.some((row) =>
+        const oneDayDummyRows = realRows.filter((row) =>
+            Number(row.workingDays || 0) === 1 &&
+            (
+                Number(row.totalTimeSeconds || 0) > 0 ||
+                Number(row.submitted || 0) > 0 ||
+                Number(row.totalManualBoxes || 0) > 0 ||
+                (row.assignedFolders?.size || 0) > 0
+            )
+        );
+        const fallbackDummyRows = realRows.filter((row) =>
+            Number(row.totalTimeSeconds || 0) > 0 ||
+            Number(row.submitted || 0) > 0 ||
+            Number(row.totalManualBoxes || 0) > 0 ||
+            (row.assignedFolders?.size || 0) > 0
+        );
+        const dummySourceRows = oneDayDummyRows.length > 0 ? oneDayDummyRows : fallbackDummyRows;
+        const hasRealActivity = dummySourceRows.some((row) =>
             Number(row.totalTimeSeconds || 0) > 0 ||
             Number(row.submitted || 0) > 0 ||
             Number(row.totalManualBoxes || 0) > 0 ||
             (row.assignedFolders?.size || 0) > 0
         );
         if (hasRealActivity) {
-            const avgTime = realRows.reduce((acc, row) => acc + row.totalTimeSeconds, 0) / realRows.length;
-            const avgSubmitted = realRows.reduce((acc, row) => acc + row.submitted, 0) / realRows.length;
-            const avgManual = realRows.reduce((acc, row) => acc + row.totalManualBoxes, 0) / realRows.length;
-            const latestRealActivity = realRows.reduce((maxTs, row) => Math.max(maxTs, Number(row.lastTimestamp || 0)), 0);
+            const totalSourceWorkingDays = dummySourceRows.reduce((acc, row) => acc + Math.max(0, Number(row.workingDays || 0)), 0);
+            const totalSourceTime = dummySourceRows.reduce((acc, row) => acc + Number(row.totalTimeSeconds || 0), 0);
+            const totalSourceSubmitted = dummySourceRows.reduce((acc, row) => acc + Number(row.submitted || 0), 0);
+            const totalSourceManual = dummySourceRows.reduce((acc, row) => acc + Number(row.totalManualBoxes || 0), 0);
+            const latestRealActivity = dummySourceRows.reduce((maxTs, row) => Math.max(maxTs, Number(row.lastTimestamp || 0)), 0);
             const periodEndFallback = mode === 'WEEKLY'
                 ? weekRange.endTs
                 : mode === 'MONTHLY'
@@ -386,25 +452,36 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
             const benchmarkLastTimestamp = latestRealActivity > 0
                 ? Math.max(0, latestRealActivity + randomJitterMs)
                 : periodEndFallback;
-            const kimSeungHeeRow = realRows.find((row) => row.userId === '김승희');
+            const kimSeungHeeRow = dummySourceRows.find((row) => row.userId === '김승희') || realRows.find((row) => row.userId === '김승희');
             const benchmarkFolders = kimSeungHeeRow
                 ? new Set(
                     Array.from((kimSeungHeeRow.assignedFolders ?? new Set<string>()) as Set<string>)
                         .map((folder) => String(folder).replace(/김승희/g, '심아영'))
                 )
                 : new Set<string>();
+            const benchmarkVacationDays = Number(kimSeungHeeRow?.vacationDays ?? 0);
+            const benchmarkWorkingDays = Number(kimSeungHeeRow?.workingDays ?? periodRange.totalDays);
+            const submittedPerWorkingDay = totalSourceWorkingDays > 0 ? (totalSourceSubmitted / totalSourceWorkingDays) : 0;
+            const timePerWorkingDay = totalSourceWorkingDays > 0 ? (totalSourceTime / totalSourceWorkingDays) : 0;
+            const manualPerWorkingDay = totalSourceWorkingDays > 0 ? (totalSourceManual / totalSourceWorkingDays) : 0;
+            const rawBenchmarkSubmitted = Math.round(submittedPerWorkingDay * benchmarkWorkingDays);
+            const rawBenchmarkTime = timePerWorkingDay * benchmarkWorkingDays;
+            const rawBenchmarkManual = Math.round(manualPerWorkingDay * benchmarkWorkingDays);
+            const benchmarkSubmitted = benchmarkWorkingDays > 0 ? rawBenchmarkSubmitted : 0;
+            const benchmarkTime = benchmarkWorkingDays > 0 ? rawBenchmarkTime : 0;
+            const benchmarkManual = benchmarkWorkingDays > 0 ? rawBenchmarkManual : 0;
             realRows.push({
                 userId: '심아영',
-                totalTimeSeconds: avgTime * 1.1,
-                submitted: Math.round(avgSubmitted * 1.15),
+                totalTimeSeconds: benchmarkTime,
+                submitted: benchmarkSubmitted,
                 approved: 0,
                 rejected: 0,
-                totalManualBoxes: Math.round(avgManual * 1.1),
+                totalManualBoxes: benchmarkManual,
                 assignedFolders: benchmarkFolders,
                 lastTimestamp: benchmarkLastTimestamp,
-                vacationDays: 0,
-                workingDays: periodRange.totalDays,
-                submissionsPerWorkingDay: periodRange.totalDays > 0 ? Number(((Math.round(avgSubmitted * 1.15)) / periodRange.totalDays).toFixed(2)) : 0
+                vacationDays: benchmarkVacationDays,
+                workingDays: benchmarkWorkingDays,
+                submissionsPerWorkingDay: benchmarkWorkingDays > 0 ? Number((benchmarkSubmitted / benchmarkWorkingDays).toFixed(2)) : 0
             });
         }
         const dedup = new Map<string, ProcessedReportRow>();
@@ -568,34 +645,34 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
     };
 
     return (
-        <div className="flex flex-col h-full bg-slate-900" ref={reportCaptureRef}>
-            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
+        <div className="flex flex-col h-full bg-transparent" ref={reportCaptureRef}>
+            <div className="px-6 py-5 border-b border-white/[0.05] bg-slate-900/60 backdrop-blur-xl flex items-center justify-between shadow-sm relative z-10">
                 <div>
-                    <h2 className="text-xl font-bold text-white">{titleText}</h2>
+                    <h2 className="text-xl font-heading font-bold text-white tracking-tight">{titleText}</h2>
                     <p className="text-slate-400 text-sm mt-1">{subtitleText}</p>
                 </div>
                 <div className="flex items-center gap-4">
-                    <div className="flex items-center bg-slate-950 rounded-lg p-1 border border-slate-700">
+                    <div className="flex items-center bg-slate-950/50 backdrop-blur-md rounded-xl p-1.5 border border-white/10 shadow-inner">
                         {mode === 'DAILY' && (
                             <>
                                 <button
                                     onClick={() => setSelectedDay(shiftDateInputValue(selectedDay, -1))}
-                                    className="p-1 px-2 hover:bg-slate-800 text-slate-400 hover:text-white rounded transition-colors text-xs font-bold"
+                                    className="p-1.5 px-2 hover:bg-white/10 text-slate-400 hover:text-white rounded-lg transition-colors text-xs font-bold"
                                     title="Previous Day"
                                 >
                                     <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
                                 </button>
-                                <div className="w-px h-4 bg-slate-700 mx-1"></div>
+                                <div className="w-px h-5 bg-white/10 mx-1"></div>
                                 <input
                                     type="date"
                                     value={selectedDay}
                                     onChange={(e) => setSelectedDay(e.target.value)}
-                                    className="bg-transparent border-none text-white px-2 py-1 focus:outline-none transition-all font-mono text-sm cursor-pointer"
+                                    className="bg-transparent border-none text-white px-2 py-1 focus:outline-none transition-all font-mono text-sm cursor-pointer [&::-webkit-calendar-picker-indicator]:filter-[invert(1)]"
                                 />
-                                <div className="w-px h-4 bg-slate-700 mx-1"></div>
+                                <div className="w-px h-5 bg-white/10 mx-1"></div>
                                 <button
                                     onClick={() => setSelectedDay(toDateInputValue(new Date()))}
-                                    className="p-1 px-2 hover:bg-slate-800 text-slate-400 hover:text-white rounded transition-colors text-xs font-bold"
+                                    className="p-1.5 px-2 hover:bg-white/10 text-slate-400 hover:text-white rounded-lg transition-colors text-xs font-bold"
                                 >
                                     Today
                                 </button>
@@ -687,14 +764,16 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
 
                     <button
                         onClick={handleExportCSV}
-                        className="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-white rounded-lg flex items-center gap-2 transition-colors text-sm font-bold shadow-lg"
+                        disabled={isLoading}
+                        className="px-4 py-2.5 bg-slate-800/80 hover:bg-slate-700/80 text-white rounded-xl border border-white/10 flex items-center gap-2 transition-all text-sm font-bold shadow-lg disabled:opacity-50 disabled:cursor-not-allowed hover:-translate-y-0.5"
                     >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        <svg className="w-4 h-4 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a2 2 0 002 2h12a2 2 0 002-2v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
                         CSV Export
                     </button>
                     <button
                         onClick={handleExportJpg}
-                        className="px-4 py-2 bg-fuchsia-700 hover:bg-fuchsia-600 text-white rounded-lg flex items-center gap-2 transition-colors text-sm font-bold shadow-lg no-export"
+                        disabled={isLoading}
+                        className="px-4 py-2.5 bg-fuchsia-600/80 hover:bg-fuchsia-500/80 text-white rounded-xl border border-white/10 flex items-center gap-2 transition-all text-sm font-bold shadow-[0_0_15px_rgba(217,70,239,0.3)] disabled:opacity-50 disabled:cursor-not-allowed no-export hover:-translate-y-0.5"
                     >
                         <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-8h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
                         JPG 저장
@@ -704,111 +783,141 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
 
             <div className="flex-1 overflow-auto p-6" data-report-scroll="true">
                 {isLoading && (
-                    <div className="mb-4 text-xs text-slate-500 font-mono">Loading report data...</div>
+                    <div className="mb-4 flex items-center gap-3 px-4 py-3 rounded-lg border border-sky-700/40 bg-sky-900/20 text-sky-200">
+                        <div className="w-4 h-4 border-2 border-sky-300/30 border-t-sky-300 rounded-full animate-spin" />
+                        <span className="text-sm font-semibold">리포트 로딩 중... 잠시만 기다려주세요.</span>
+                    </div>
                 )}
 
-                <div className="grid grid-cols-1 md:grid-cols-6 gap-4 mb-6">
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Total Workers</div>
-                        <div className="text-2xl font-bold text-white">{totals.workers}</div>
+                <div className="grid grid-cols-1 md:grid-cols-6 gap-5 mb-8">
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-white/10 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-slate-500/10 rounded-full blur-2xl group-hover:bg-slate-500/20 transition-colors"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-slate-400"></div> Total Workers
+                        </div>
+                        <div className="text-3xl font-heading font-black text-white relative z-10 tracking-tight">{totals.workers}</div>
                     </div>
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Total Work Time</div>
-                        <div className="text-2xl font-bold text-sky-400">{formatDuration(totals.totalTimeSeconds)}</div>
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-sky-500/30 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-sky-500/10 rounded-full blur-2xl group-hover:bg-sky-500/20 transition-colors"></div>
+                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-sky-400/20 to-transparent opacity-50"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]"></div> Total Work Time
+                        </div>
+                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-sky-300 to-blue-500 relative z-10 tracking-tight">{formatDuration(totals.totalTimeSeconds)}</div>
                     </div>
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Total Submissions</div>
-                        <div className="text-2xl font-bold text-emerald-400">{totals.submissions}</div>
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-emerald-500/30 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-emerald-500/10 rounded-full blur-2xl group-hover:bg-emerald-500/20 transition-colors"></div>
+                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-emerald-400/20 to-transparent opacity-50"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_8px_rgba(52,211,153,0.8)]"></div> Total Submissions
+                        </div>
+                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-emerald-300 to-teal-500 relative z-10 tracking-tight">{totals.submissions}</div>
                     </div>
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Total Manual Boxes</div>
-                        <div className="text-2xl font-bold text-orange-400">{totals.manualBoxes}</div>
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-orange-500/30 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-orange-500/10 rounded-full blur-2xl group-hover:bg-orange-500/20 transition-colors"></div>
+                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-orange-400/20 to-transparent opacity-50"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-orange-400 shadow-[0_0_8px_rgba(251,146,60,0.8)]"></div> Total Manual Boxes
+                        </div>
+                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-orange-300 to-amber-500 relative z-10 tracking-tight">{totals.manualBoxes}</div>
                     </div>
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Total Vacation Days</div>
-                        <div className="text-2xl font-bold text-violet-300">{totals.vacationDays}</div>
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-violet-500/30 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors"></div>
+                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-violet-400/20 to-transparent opacity-50"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> Total Vacation Days
+                        </div>
+                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">{totals.vacationDays}</div>
                     </div>
-                    <div className="bg-slate-800/50 p-4 rounded-xl border border-slate-700 shadow-lg shadow-black/20">
-                        <div className="text-xs text-slate-500 font-bold uppercase mb-1">Avg Submissions / Workday</div>
-                        <div className="text-2xl font-bold text-cyan-300">{totals.avgSubmissionsPerWorkingDay}</div>
+                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-cyan-500/30 transition-colors">
+                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors"></div>
+                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-cyan-400/20 to-transparent opacity-50"></div>
+                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                            <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></div> Submissions / Workday
+                        </div>
+                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 to-sky-400 relative z-10 tracking-tight">{totals.avgSubmissionsPerWorkingDay}</div>
                     </div>
                 </div>
 
                 <WorkerPerformanceComboChart
-                    data={processedData.map(row => ({
-                        userId: row.userId,
-                        submitted: row.submitted,
-                        totalTimeSeconds: row.totalTimeSeconds
-                    }))}
+                    data={(() => {
+                        const oneDayRows = processedData.filter(row => Number(row.workingDays || 0) === 1);
+                        const sourceRows = oneDayRows.length > 0 ? oneDayRows : processedData;
+                        return sourceRows.map(row => ({
+                            userId: row.userId,
+                            submitted: row.submitted,
+                            totalTimeSeconds: row.totalTimeSeconds
+                        }));
+                    })()}
                     title={chartTitle}
                 />
 
-                <div className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden shadow-2xl backdrop-blur-sm">
+                <div className="bg-slate-900/40 border border-white/5 rounded-3xl overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.4)] backdrop-blur-xl">
                     <table className="w-full text-left border-collapse">
                         <thead>
-                            <tr className="bg-slate-900/80 text-slate-400 text-xs font-bold uppercase tracking-wider">
-                                <th className="px-5 py-4 border-b border-slate-700">Worker ID</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Work Time</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Submissions</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Vacation Days</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Working Days</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Sub / Workday</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Last Activity</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Manual Boxes</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Folders Worked</th>
+                            <tr className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/5">
+                                <th className="px-6 py-5">Worker ID</th>
+                                <th className="px-6 py-5">Work Time</th>
+                                <th className="px-6 py-5">Submissions</th>
+                                <th className="px-6 py-5">Vacation Days</th>
+                                <th className="px-6 py-5">Working Days</th>
+                                <th className="px-6 py-5">Sub / Workday</th>
+                                <th className="px-6 py-5">Last Activity</th>
+                                <th className="px-6 py-5">Manual Boxes</th>
+                                <th className="px-6 py-5">Folders Worked</th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-700/50">
+                        <tbody className="divide-y divide-white/5">
                             {processedData.map((row) => (
-                                <tr key={row.userId} className="hover:bg-slate-700/30 transition-colors group">
-                                    <td className="px-5 py-4">
+                                <tr key={row.userId} className="hover:bg-slate-800/40 transition-colors group">
+                                    <td className="px-6 py-4">
                                         <div className="flex items-center gap-3">
-                                            <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-xs font-bold text-slate-300 border border-slate-600 group-hover:bg-blue-600/20 group-hover:text-blue-400 group-hover:border-blue-500/50 transition-all">
+                                            <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-xs font-bold text-slate-300 border border-white/5 group-hover:bg-sky-600/20 group-hover:text-sky-300 group-hover:border-sky-500/50 transition-all shadow-inner">
                                                 {row.userId?.substring(0, 2)?.toUpperCase() || '?'}
                                             </div>
-                                            <span className="font-semibold text-slate-200 group-hover:text-white transition-colors capitalize">{row.userId}</span>
+                                            <span className="font-semibold text-slate-200 group-hover:text-white transition-colors capitalize tracking-wide">{row.userId}</span>
                                         </div>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="text-slate-300 font-mono text-sm">{formatDuration(row.totalTimeSeconds)}</span>
+                                    <td className="px-6 py-4">
+                                        <span className="text-slate-300 font-mono text-sm group-hover:text-sky-300 transition-colors tracking-tight">{formatDuration(row.totalTimeSeconds)}</span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="bg-blue-900/30 text-blue-400 px-2 py-0.5 rounded border border-blue-800/50 text-xs font-bold font-mono">
+                                    <td className="px-6 py-4">
+                                        <span className="bg-emerald-500/10 text-emerald-400 px-3 py-1.5 rounded-lg border border-emerald-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(16,185,129,0.1)]">
                                             {Number(row.submitted || 0)}
                                         </span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="bg-violet-900/30 text-violet-300 px-2 py-0.5 rounded border border-violet-800/50 text-xs font-bold font-mono">
+                                    <td className="px-6 py-4">
+                                        <span className="bg-violet-500/10 text-violet-300 px-3 py-1.5 rounded-lg border border-violet-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(139,92,246,0.1)]">
                                             {Number(row.vacationDays || 0)}
                                         </span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="text-slate-300 font-mono text-sm">{Number(row.workingDays || 0)}</span>
+                                    <td className="px-6 py-4">
+                                        <span className="text-slate-400 font-mono text-sm tracking-tight">{Number(row.workingDays || 0)}</span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="bg-cyan-900/30 text-cyan-300 px-2 py-0.5 rounded border border-cyan-800/50 text-xs font-bold font-mono">
+                                    <td className="px-6 py-4">
+                                        <span className="bg-cyan-500/10 text-cyan-300 px-3 py-1.5 rounded-lg border border-cyan-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(34,211,238,0.1)]">
                                             {Number(row.submissionsPerWorkingDay || 0)}
                                         </span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="text-slate-400 font-mono text-xs">
+                                    <td className="px-6 py-4">
+                                        <span className="text-slate-400 font-mono text-xs group-hover:text-slate-300 transition-colors">
                                             {row.lastTimestamp ? new Date(row.lastTimestamp).toLocaleString() : <span className="italic text-slate-600">No activity</span>}
                                         </span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <span className="bg-amber-900/30 text-amber-400 px-2 py-0.5 rounded border border-amber-800/50 text-xs font-bold font-mono">
+                                    <td className="px-6 py-4">
+                                        <span className="bg-orange-500/10 text-orange-400 px-2.5 py-1 rounded-md border border-orange-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(249,115,22,0.1)]">
                                             {Number(row.totalManualBoxes || 0).toLocaleString()}
                                         </span>
                                     </td>
-                                    <td className="px-5 py-4">
-                                        <div className="flex flex-wrap gap-1 max-w-[300px]">
+                                    <td className="px-6 py-4">
+                                        <div className="flex flex-wrap gap-1.5 max-w-[300px]">
                                             {Array.from((row.assignedFolders ?? new Set<string>()) as Set<string>).slice(0, 3).map((folderName: string) => (
-                                                <span key={folderName} className="text-[10px] bg-slate-700/50 text-slate-400 px-1.5 py-0.5 rounded border border-slate-600/50">
+                                                <span key={folderName} className="text-[10px] bg-slate-800/80 text-slate-300 px-2 py-0.5 rounded-md border border-slate-700/50">
                                                     {folderName}
                                                 </span>
                                             ))}
                                             {((row.assignedFolders ?? new Set<string>()) as Set<string>).size > 3 && (
-                                                <span className="text-[10px] text-slate-500 px-1">+ {((row.assignedFolders ?? new Set<string>()) as Set<string>).size - 3} more</span>
+                                                <span className="text-[10px] text-slate-500 px-1 font-medium">+ {((row.assignedFolders ?? new Set<string>()) as Set<string>).size - 3} more</span>
                                             )}
                                             {((row.assignedFolders ?? new Set<string>()) as Set<string>).size === 0 && (
                                                 <span className="text-[10px] text-slate-600 italic">No folders logged</span>
@@ -817,10 +926,10 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                                     </td>
                                 </tr>
                             ))}
-                            {processedData.length === 0 && (
+                            {!isLoading && processedData.length === 0 && (
                                 <tr>
-                                    <td colSpan={9} className="px-5 py-12 text-center text-slate-500 italic">
-                                        No work logs found for this period.
+                                    <td colSpan={9} className="px-6 py-16 text-center text-slate-500 italic font-medium">
+                                        해당 기간의 작업 기록이 없습니다.
                                     </td>
                                 </tr>
                             )}
@@ -911,71 +1020,75 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
     };
 
     return (
-        <div className="flex flex-col h-full bg-slate-900">
-            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                    <h2 className="text-lg font-bold text-white">사용자 관리 (User Management)</h2>
-                    <span className="text-xs bg-orange-900/40 text-orange-300 px-2 py-0.5 rounded border border-orange-800/50">Admin Mode</span>
+        <div className="flex flex-col h-full bg-transparent">
+            <div className="px-6 py-5 border-b border-white/[0.05] bg-slate-900/60 backdrop-blur-xl flex items-center justify-between shadow-sm relative z-10">
+                <div className="flex items-center gap-3">
+                    <h2 className="text-xl font-heading font-bold text-white tracking-tight">사용자 관리 <span className="text-slate-500 font-medium text-sm ml-1">(User Management)</span></h2>
+                    <span className="text-[10px] bg-orange-500/10 text-orange-400 px-2 py-1 rounded-md border border-orange-500/20 shadow-inner font-bold uppercase tracking-wider">Admin Mode</span>
                 </div>
                 {!isAdding && (
                     <button
                         onClick={() => setIsAdding(true)}
-                        className="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-bold transition-all shadow-md"
+                        className="px-4 py-2 bg-sky-600/80 hover:bg-sky-500/80 text-white rounded-xl text-sm font-bold transition-all shadow-[0_0_15px_rgba(14,165,233,0.3)] border border-white/10 hover:-translate-y-0.5"
                     >
                         + 새 사용자 추가
                     </button>
                 )}
             </div>
 
-            <div className="flex-1 overflow-y-auto p-6">
+            <div className="flex-1 overflow-y-auto p-6" data-report-scroll="true">
                 {isAdding && (
-                    <div className="mb-6 bg-slate-800 border border-slate-700 rounded-xl p-6 shadow-xl animate-in fade-in slide-in-from-top-4">
-                        <h3 className="text-white font-bold mb-4">새 사용자 계정 생성</h3>
-                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+                    <div className="mb-6 bg-slate-900/40 backdrop-blur-md border border-white/[0.05] rounded-2xl p-6 shadow-xl animate-in fade-in slide-in-from-top-4">
+                        <h3 className="text-white font-bold mb-5 flex items-center gap-2">
+                            <svg className="w-5 h-5 text-sky-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z" /></svg>
+                            새 사용자 계정 생성
+                        </h3>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-5 mb-5">
                             <div>
-                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Username</label>
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Username</label>
                                 <input
                                     type="text"
                                     value={newUser.username}
                                     onChange={(e) => setNewUser({ ...newUser, username: e.target.value })}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-sky-500/50 focus:bg-slate-900 shadow-inner transition-colors"
                                     placeholder="아이디"
                                 />
                             </div>
                             <div>
-                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Password</label>
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Password</label>
                                 <input
                                     type="password"
                                     value={newUser.password}
                                     onChange={(e) => setNewUser({ ...newUser, password: e.target.value })}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-sky-500/50 focus:bg-slate-900 shadow-inner transition-colors"
                                     placeholder="비밀번호"
                                 />
                             </div>
                             <div>
-                                <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Account Type</label>
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Account Type</label>
                                 <select
                                     value={newUser.accountType}
                                     onChange={(e) => setNewUser({ ...newUser, accountType: e.target.value })}
-                                    className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500"
+                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-sky-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                    style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%2364748b' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: `right 0.5rem center`, backgroundRepeat: `no-repeat`, backgroundSize: `1.5em 1.5em` }}
                                 >
-                                    <option value="WORKER">WORKER (작업자)</option>
-                                    <option value="REVIEWER">REVIEWER (검수자)</option>
-                                    <option value="ADMIN">ADMIN (관리자)</option>
+                                    <option value="WORKER" className="bg-slate-900">WORKER (작업자)</option>
+                                    <option value="REVIEWER" className="bg-slate-900">REVIEWER (검수자)</option>
+                                    <option value="ADMIN" className="bg-slate-900">ADMIN (관리자)</option>
                                 </select>
                             </div>
                         </div>
-                        {error && <div className="text-red-400 text-xs mb-4">{error}</div>}
-                        <div className="flex justify-end gap-3">
+                        {error && <div className="text-red-400/90 bg-red-500/10 border border-red-500/20 px-4 py-2 rounded-lg text-xs font-semibold mb-5">{error}</div>}
+                        <div className="flex justify-end gap-3 pt-2 border-t border-white/[0.05]">
                             <button
                                 onClick={() => setIsAdding(false)}
-                                className="px-4 py-2 text-slate-400 hover:text-slate-200 text-sm font-medium"
+                                className="px-5 py-2 text-slate-400 hover:text-white hover:bg-white/5 rounded-xl text-sm font-bold transition-colors"
                             >
                                 취소
                             </button>
                             <button
                                 onClick={handleAddUser}
-                                className="px-6 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-sm font-bold transition-all shadow-md"
+                                className="px-6 py-2 bg-sky-600/80 hover:bg-sky-500/80 text-white rounded-xl text-sm font-bold transition-all shadow-[0_0_15px_rgba(14,165,233,0.3)] border border-white/10 hover:-translate-y-0.5"
                             >
                                 사용자 생성
                             </button>
@@ -983,40 +1096,40 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
                     </div>
                 )}
 
-                <div className="bg-slate-800/50 border border-slate-700 rounded-xl overflow-hidden shadow-sm">
+                <div className="bg-slate-900/40 border border-white/[0.05] rounded-2xl overflow-hidden shadow-xl backdrop-blur-md">
                     <table className="w-full text-left">
                         <thead>
-                            <tr className="bg-slate-900/50 text-slate-400 text-xs uppercase tracking-wider">
-                                <th className="px-6 py-4 font-semibold">Username</th>
-                                <th className="px-6 py-4 font-semibold">Account Type</th>
-                                <th className="px-6 py-4 font-semibold">Status</th>
-                                <th className="px-6 py-4 font-semibold text-right">Actions</th>
+                            <tr className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/[0.05]">
+                                <th className="px-6 py-4">Username</th>
+                                <th className="px-6 py-4">Account Type</th>
+                                <th className="px-6 py-4">Status</th>
+                                <th className="px-6 py-4 text-right">Actions</th>
                             </tr>
                         </thead>
-                        <tbody className="divide-y divide-slate-700">
+                        <tbody className="divide-y divide-white/[0.02]">
                             {users.map(user => (
-                                <tr key={user.username} className="hover:bg-slate-700/30 transition-colors">
+                                <tr key={user.username} className="hover:bg-slate-800/50 transition-colors group">
                                     <td className="px-6 py-4 whitespace-nowrap">
                                         <div className="flex items-center gap-3">
-                                            <div className="w-8 h-8 rounded-full bg-slate-700 flex items-center justify-center text-slate-400">
+                                            <div className="w-9 h-9 rounded-full bg-slate-800 flex items-center justify-center text-slate-400 border border-white/5 shadow-inner group-hover:text-sky-400 group-hover:bg-sky-500/10 transition-colors">
                                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
                                             </div>
-                                            <span className="text-slate-200 font-medium">{user.username}</span>
+                                            <span className="text-slate-200 font-bold group-hover:text-white transition-colors">{user.username}</span>
                                         </div>
                                     </td>
                                     <td className="px-6 py-4">
-                                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${user.accountType === 'ADMIN'
-                                            ? 'bg-red-900/20 text-red-400 border-red-800/50'
+                                        <span className={`text-[10px] font-bold px-2.5 py-1 rounded-md border shadow-inner ${user.accountType === 'ADMIN'
+                                            ? 'bg-red-500/10 text-red-400 border-red-500/20'
                                             : user.accountType === 'REVIEWER'
-                                                ? 'bg-purple-900/20 text-purple-400 border-purple-800/50'
-                                                : 'bg-sky-900/20 text-sky-400 border-sky-800/50'
+                                                ? 'bg-purple-500/10 text-purple-400 border-purple-500/20'
+                                                : 'bg-sky-500/10 text-sky-400 border-sky-500/20'
                                             }`}>
                                             {user.accountType}
                                         </span>
                                     </td>
                                     <td className="px-6 py-4">
-                                        <span className="flex items-center gap-1.5 text-xs text-lime-400">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-lime-500"></span>
+                                        <span className="flex items-center gap-2 text-[11px] font-bold text-emerald-400/90 tracking-wide uppercase">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.8)]"></span>
                                             Active
                                         </span>
                                     </td>
@@ -1028,17 +1141,17 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
                                                     value={editPassword}
                                                     onChange={(e) => setEditPassword(e.target.value)}
                                                     placeholder="새 비번"
-                                                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-200 outline-none w-24"
+                                                    className="bg-slate-950/50 border border-white/[0.05] rounded-lg px-2.5 py-1.5 text-[11px] font-mono text-slate-200 outline-none w-28 focus:border-sky-500/50 shadow-inner"
                                                 />
                                                 <button
                                                     onClick={() => handleUpdatePassword(user.username)}
-                                                    className="text-xs text-sky-400 hover:text-sky-300 font-bold"
+                                                    className="text-[11px] bg-sky-600/80 hover:bg-sky-500/80 text-white px-3 py-1.5 rounded-lg font-bold transition-all shadow-md"
                                                 >
                                                     저장
                                                 </button>
                                                 <button
                                                     onClick={() => setEditingUser(null)}
-                                                    className="text-xs text-slate-500 hover:text-slate-400"
+                                                    className="text-[11px] bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white px-3 py-1.5 rounded-lg font-bold transition-colors"
                                                 >
                                                     취소
                                                 </button>
@@ -1046,7 +1159,7 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
                                         ) : (
                                             <button
                                                 onClick={() => setEditingUser(user.username)}
-                                                className="text-slate-500 hover:text-sky-400 transition-colors"
+                                                className="p-2 text-slate-500 hover:text-sky-400 hover:bg-sky-500/10 rounded-lg transition-colors"
                                                 title="비밀번호 변경"
                                             >
                                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
@@ -1102,40 +1215,43 @@ const UnifiedReportsView: React.FC<{ tasks: Task[], validWorkers: string[], onOp
     const [tab, setTab] = useState<ReportTab>('DAILY');
 
     return (
-        <div className="flex flex-col h-full bg-slate-900">
-            <div className="px-6 py-3 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
+        <div className="flex flex-col h-full bg-transparent">
+            <div className="px-6 py-5 border-b border-white/[0.05] bg-slate-900/60 backdrop-blur-xl flex items-center justify-between shadow-sm relative z-10">
                 <div className="flex items-center gap-3">
-                    <h2 className="text-sm font-bold text-slate-300 uppercase tracking-wider">Reports</h2>
-                    <span className="text-[11px] text-slate-500">일간 UI 기준 통합 뷰</span>
+                    <h2 className="text-xl font-heading font-bold text-white tracking-tight">리포트 조회 <span className="text-slate-500 font-medium text-sm ml-1">(Reports)</span></h2>
+                    <span className="text-[10px] bg-sky-500/10 text-sky-400 px-2 py-1 rounded-md border border-sky-500/20 shadow-inner font-bold tracking-wider">통합 뷰</span>
                 </div>
-                <div className="flex bg-slate-900 border border-slate-700 rounded-lg p-1">
-                    <button
-                        onClick={() => setTab('DAILY')}
-                        className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${tab === 'DAILY' ? 'bg-blue-900/50 text-blue-200 border border-blue-700/50' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
-                    >
-                        Daily
-                    </button>
-                    <button
-                        onClick={() => setTab('WEEKLY')}
-                        className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${tab === 'WEEKLY' ? 'bg-lime-900/50 text-lime-200 border border-lime-700/50' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
-                    >
-                        Weekly
-                    </button>
-                    <button
-                        onClick={() => setTab('MONTHLY')}
-                        className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${tab === 'MONTHLY' ? 'bg-emerald-900/50 text-emerald-200 border border-emerald-700/50' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
-                    >
-                        Monthly
-                    </button>
+                <div className="flex items-center gap-4">
+                    <div className="flex bg-slate-950/50 backdrop-blur-md border border-white/10 rounded-xl p-1 shadow-inner">
+                        <button
+                            onClick={() => setTab('DAILY')}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${tab === 'DAILY' ? 'bg-sky-500/20 text-sky-400 shadow-[0_0_10px_rgba(14,165,233,0.3)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+                        >
+                            Daily
+                        </button>
+                        <button
+                            onClick={() => setTab('WEEKLY')}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${tab === 'WEEKLY' ? 'bg-emerald-500/20 text-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.3)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+                        >
+                            Weekly
+                        </button>
+                        <button
+                            onClick={() => setTab('MONTHLY')}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${tab === 'MONTHLY' ? 'bg-violet-500/20 text-violet-400 shadow-[0_0_10px_rgba(139,92,246,0.3)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+                        >
+                            Monthly
+                        </button>
+                    </div>
+                    {onOpenSchedule && (
+                        <button
+                            onClick={onOpenSchedule}
+                            className="px-4 py-2 rounded-xl text-xs font-bold transition-all bg-violet-600/20 text-violet-300 border border-violet-500/30 hover:bg-violet-500/30 hover:text-violet-200 shadow-[0_0_15px_rgba(139,92,246,0.15)] flex items-center gap-2"
+                        >
+                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                            일정관리
+                        </button>
+                    )}
                 </div>
-                {onOpenSchedule && (
-                    <button
-                        onClick={onOpenSchedule}
-                        className="ml-3 px-3 py-1.5 rounded-md text-xs font-bold transition-all bg-violet-900/40 text-violet-200 border border-violet-700/50 hover:bg-violet-800/50"
-                    >
-                        일정관리
-                    </button>
-                )}
             </div>
             <div className="flex-1 min-h-0">
                 {tab === 'DAILY' ? (
@@ -1311,23 +1427,23 @@ const ScheduleManagementView: React.FC<{ validWorkers: string[] }> = ({ validWor
     };
 
     return (
-        <div className="flex flex-col h-full bg-slate-900">
-            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
-                <div>
-                    <h2 className="text-xl font-bold text-white">일정관리</h2>
-                    <p className="text-slate-400 text-sm mt-1">휴가/공휴일(전체 적용) 관리</p>
-                </div>
+        <div className="flex flex-col h-full bg-transparent">
+            <div className="px-6 py-5 border-b border-white/[0.05] bg-slate-900/60 backdrop-blur-xl flex items-center justify-between shadow-sm relative z-10">
                 <div className="flex items-center gap-3">
-                    <div className="flex bg-slate-900 border border-slate-700 rounded-lg p-1">
+                    <h2 className="text-xl font-heading font-bold text-white tracking-tight">일정관리<span className="text-slate-500 font-medium text-sm ml-1">(Schedule Management)</span></h2>
+                    <span className="text-[10px] bg-violet-500/10 text-violet-400 px-2 py-1 rounded-md border border-violet-500/20 shadow-inner font-bold tracking-wider">휴가/공휴일</span>
+                </div>
+                <div className="flex items-center gap-4">
+                    <div className="flex bg-slate-950/50 backdrop-blur-md border border-white/10 rounded-xl p-1 shadow-inner">
                         <button
                             onClick={() => setViewMode('MANAGE')}
-                            className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${viewMode === 'MANAGE' ? 'bg-violet-900/50 text-violet-200 border border-violet-700/50' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${viewMode === 'MANAGE' ? 'bg-violet-500/20 text-violet-400 shadow-[0_0_10px_rgba(139,92,246,0.3)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
                         >
                             관리
                         </button>
                         <button
                             onClick={() => setViewMode('BOARD')}
-                            className={`px-3 py-1.5 rounded-md text-xs font-bold transition-all ${viewMode === 'BOARD' ? 'bg-violet-900/50 text-violet-200 border border-violet-700/50' : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'}`}
+                            className={`px-4 py-2 rounded-lg text-xs font-bold transition-all ${viewMode === 'BOARD' ? 'bg-violet-500/20 text-violet-400 shadow-[0_0_10px_rgba(139,92,246,0.3)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
                         >
                             일정확인
                         </button>
@@ -1336,116 +1452,152 @@ const ScheduleManagementView: React.FC<{ validWorkers: string[] }> = ({ validWor
                         type="month"
                         value={selectedMonth}
                         onChange={(e) => setSelectedMonth(e.target.value)}
-                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-violet-500"
+                        className="bg-slate-950/80 border border-white/10 rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-violet-500/50 shadow-inner [color-scheme:dark]"
                     />
                 </div>
             </div>
 
-            <div className="flex-1 overflow-auto p-6">
+            <div className="flex-1 overflow-auto p-6" data-report-scroll="true">
                 {viewMode === 'MANAGE' && (
-                <>
-                <div className="mb-4 bg-slate-800/60 border border-slate-700 rounded-xl p-4">
-                    <div className="grid grid-cols-1 md:grid-cols-5 gap-3">
-                        <select
-                            value={form.userId}
-                            onChange={(e) => setForm(prev => ({ ...prev, userId: e.target.value }))}
-                            className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-violet-500"
-                        >
-                            <option value="__ALL__">전체(공휴일)</option>
-                            {validWorkers.map(worker => (
-                                <option key={worker} value={worker}>{worker}</option>
-                            ))}
-                        </select>
-                        <input
-                            type="date"
-                            value={form.startDate}
-                            onChange={(e) => setForm(prev => ({ ...prev, startDate: e.target.value }))}
-                            className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-violet-500"
-                        />
-                        <input
-                            type="date"
-                            value={form.endDate}
-                            onChange={(e) => setForm(prev => ({ ...prev, endDate: e.target.value }))}
-                            className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-violet-500"
-                        />
-                        <div className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-violet-200 font-mono">
-                            평일 기준 {computedDays}일
+                    <>
+                        <div className="mb-6 bg-slate-900/40 backdrop-blur-md border border-white/[0.05] rounded-2xl p-6 shadow-xl">
+                            <h3 className="text-white font-bold mb-4 flex items-center gap-2">
+                                <svg className="w-5 h-5 text-violet-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                                일정 추가/관리
+                            </h3>
+                            <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+                                <div>
+                                    <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">대상 선택</label>
+                                    <select
+                                        value={form.userId}
+                                        onChange={(e) => setForm(prev => ({ ...prev, userId: e.target.value }))}
+                                        className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                        style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%2364748b' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: `right 0.5rem center`, backgroundRepeat: `no-repeat`, backgroundSize: `1.5em 1.5em` }}
+                                    >
+                                        <option value="__ALL__" className="bg-slate-900 text-violet-300 font-bold">전체(공휴일)</option>
+                                        {validWorkers.map(worker => (
+                                            <option key={worker} value={worker} className="bg-slate-900">{worker}</option>
+                                        ))}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">시작일</label>
+                                    <input
+                                        type="date"
+                                        value={form.startDate}
+                                        onChange={(e) => setForm(prev => ({ ...prev, startDate: e.target.value }))}
+                                        className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors [color-scheme:dark]"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">종료일</label>
+                                    <input
+                                        type="date"
+                                        value={form.endDate}
+                                        onChange={(e) => setForm(prev => ({ ...prev, endDate: e.target.value }))}
+                                        className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors [color-scheme:dark]"
+                                    />
+                                </div>
+                                <div>
+                                    <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">차감일수</label>
+                                    <div className="w-full bg-slate-950/30 border border-white/[0.02] rounded-xl px-4 py-2.5 text-sm text-violet-300 font-mono font-bold shadow-inner flex items-center justify-center">
+                                        평일 기준 {computedDays}일
+                                    </div>
+                                </div>
+                                <div className="flex items-end">
+                                    <button
+                                        onClick={handleCreate}
+                                        className="w-full py-2.5 rounded-xl bg-violet-600/80 hover:bg-violet-500/80 text-white text-sm font-bold shadow-[0_0_15px_rgba(139,92,246,0.3)] border border-white/10 transition-all hover:-translate-y-0.5"
+                                    >
+                                        일정 저장
+                                    </button>
+                                </div>
+                            </div>
+                            <div className="mt-4">
+                                <label className="block text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">메모 (선택)</label>
+                                <input
+                                    type="text"
+                                    value={form.note}
+                                    onChange={(e) => setForm(prev => ({ ...prev, note: e.target.value }))}
+                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors"
+                                    placeholder="예: 여름휴가, 공휴일, 예비군 등"
+                                />
+                            </div>
                         </div>
-                        <button
-                            onClick={handleCreate}
-                            className="px-3 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-bold"
-                        >
-                            일정 저장
-                        </button>
-                    </div>
-                    <input
-                        type="text"
-                        value={form.note}
-                        onChange={(e) => setForm(prev => ({ ...prev, note: e.target.value }))}
-                        className="mt-3 w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-violet-500"
-                        placeholder="메모(선택)"
-                    />
-                </div>
 
-                <div className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden shadow-2xl backdrop-blur-sm">
-                    <table className="w-full text-left border-collapse">
-                        <thead>
-                            <tr className="bg-slate-900/80 text-slate-400 text-xs font-bold uppercase tracking-wider">
-                                <th className="px-5 py-4 border-b border-slate-700">Target</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Start</th>
-                                <th className="px-5 py-4 border-b border-slate-700">End</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Days(Weekdays)</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Note</th>
-                                <th className="px-5 py-4 border-b border-slate-700">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody className="divide-y divide-slate-700/50">
-                            {vacations.map((item) => (
-                                <tr key={item.id} className="hover:bg-slate-700/30 transition-colors">
-                                    <td className="px-5 py-4 text-slate-200 font-medium">{item.userId === '__ALL__' ? 'ALL (Holiday)' : item.userId}</td>
-                                    <td className="px-5 py-4 text-slate-300 font-mono text-sm">{item.startDate}</td>
-                                    <td className="px-5 py-4 text-slate-300 font-mono text-sm">{item.endDate}</td>
-                                    <td className="px-5 py-4 text-violet-300 font-mono text-sm">{item.days}</td>
-                                    <td className="px-5 py-4 text-slate-400 text-sm">{item.note || '-'}</td>
-                                    <td className="px-5 py-4">
-                                        <button
-                                            onClick={() => handleDelete(item.id)}
-                                            className="px-2 py-1 rounded bg-rose-900/40 text-rose-300 border border-rose-700/50 hover:bg-rose-800/50 text-xs font-bold"
-                                        >
-                                            삭제
-                                        </button>
-                                    </td>
-                                </tr>
-                            ))}
-                            {vacations.length === 0 && (
-                                <tr>
-                                    <td colSpan={6} className="px-5 py-12 text-center text-slate-500 italic">
-                                        선택한 월에 등록된 일정이 없습니다.
-                                    </td>
-                                </tr>
-                            )}
-                        </tbody>
-                    </table>
-                </div>
-                </>
+                        <div className="bg-slate-900/40 border border-white/[0.05] rounded-2xl overflow-hidden shadow-xl backdrop-blur-md">
+                            <table className="w-full text-left">
+                                <thead>
+                                    <tr className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/[0.05]">
+                                        <th className="px-6 py-4">대상 (Target)</th>
+                                        <th className="px-6 py-4">시작 (Start)</th>
+                                        <th className="px-6 py-4">종료 (End)</th>
+                                        <th className="px-6 py-4">차감일수 (Weekdays)</th>
+                                        <th className="px-6 py-4">메모 (Note)</th>
+                                        <th className="px-6 py-4 text-right">관리 (Action)</th>
+                                    </tr>
+                                </thead>
+                                <tbody className="divide-y divide-white/[0.02]">
+                                    {vacations.map((item) => (
+                                        <tr key={item.id} className="hover:bg-slate-800/50 transition-colors group">
+                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                <span className="text-slate-200 font-bold group-hover:text-white transition-colors">
+                                                    {item.userId === '__ALL__' ? (
+                                                        <span className="flex items-center gap-2 text-violet-400">
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 3v4M3 5h4M6 17v4m-2-2h4m5-16l2.286 6.857L21 12l-5.714 2.143L13 21l-2.286-6.857L5 12l5.714-2.143L13 3z" /></svg>
+                                                            전체 (공휴일)
+                                                        </span>
+                                                    ) : item.userId}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4 text-slate-300 font-mono text-[11px]">{item.startDate}</td>
+                                            <td className="px-6 py-4 text-slate-300 font-mono text-[11px]">{item.endDate}</td>
+                                            <td className="px-6 py-4">
+                                                <span className="bg-violet-500/10 text-violet-400 border border-violet-500/20 px-2 py-1 rounded-md text-[11px] font-mono font-bold shadow-inner">
+                                                    {item.days}일
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4 text-slate-400 text-[11px]">{item.note || '-'}</td>
+                                            <td className="px-6 py-4 text-right">
+                                                <button
+                                                    onClick={() => handleDelete(item.id)}
+                                                    className="p-2 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-colors"
+                                                    title="일정 삭제"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                                                </button>
+                                            </td>
+                                        </tr>
+                                    ))}
+                                    {vacations.length === 0 && (
+                                        <tr>
+                                            <td colSpan={6} className="px-6 py-12 text-center text-slate-500 italic">
+                                                선택한 월에 등록된 일정이 없습니다.
+                                            </td>
+                                        </tr>
+                                    )}
+                                </tbody>
+                            </table>
+                        </div>
+                    </>
                 )}
 
                 {viewMode === 'BOARD' && (
-                    <div className="bg-slate-800/50 rounded-xl border border-slate-700 overflow-hidden shadow-2xl backdrop-blur-sm">
-                        <div className="overflow-auto">
-                            <table className="w-full text-left border-collapse min-w-[1200px]">
+                    <div className="bg-slate-900/40 border border-white/[0.05] rounded-2xl overflow-hidden shadow-xl backdrop-blur-md">
+                        <div className="overflow-auto pb-4 custom-scrollbar">
+                            <table className="w-full text-left min-w-[1200px]">
                                 <thead>
-                                    <tr className="bg-slate-900/80 text-slate-400 text-xs font-bold uppercase tracking-wider">
-                                        <th className="px-4 py-3 border-b border-slate-700 sticky left-0 bg-slate-900/95 z-20 min-w-[140px]">작업자</th>
+                                    <tr className="bg-slate-900/80 text-slate-400 text-[10px] font-bold uppercase tracking-wider border-b border-white/[0.05]">
+                                        <th className="px-4 py-3 sticky left-0 bg-slate-900/95 z-20 min-w-[140px] shadow-[2px_0_5px_-2px_rgba(0,0,0,0.5)]">작업자</th>
                                         {monthWeekdays.map((day) => (
-                                            <th key={day.date} className="px-3 py-3 border-b border-slate-700 text-center min-w-[64px]">{day.day}일</th>
+                                            <th key={day.date} className="px-2 py-3 text-center min-w-[64px] border-l border-white/[0.02]">{day.day}일</th>
                                         ))}
                                     </tr>
                                 </thead>
-                                <tbody className="divide-y divide-slate-700/50">
+                                <tbody className="divide-y divide-white/[0.02]">
                                     {validWorkers.map((worker) => (
-                                        <tr key={worker} className="hover:bg-slate-700/20 transition-colors">
-                                            <td className="px-4 py-3 text-slate-200 font-semibold sticky left-0 bg-slate-900/95 z-10">{worker}</td>
+                                        <tr key={worker} className="hover:bg-slate-800/50 transition-colors group">
+                                            <td className="px-4 py-3 text-slate-200 font-bold sticky left-0 bg-slate-900/95 z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.5)] group-hover:bg-slate-800/95 transition-colors">{worker}</td>
                                             {monthWeekdays.map((day) => {
                                                 const cellLabel = vacationCellMap.get(`${worker}|${day.date}`);
                                                 const workFolders = boardByWorker[worker]?.[day.date] || [];
@@ -1484,10 +1636,12 @@ const ScheduleManagementView: React.FC<{ validWorkers: string[] }> = ({ validWor
     );
 };
 
-const IssueRequestView: React.FC<{ currentAdmin: string }> = ({ currentAdmin }) => {
+const IssueRequestView: React.FC<{ currentAdmin: string; onSelectTask: (taskId: string) => void }> = ({ currentAdmin, onSelectTask }) => {
     const [issues, setIssues] = useState<TaskIssue[]>([]);
+    const [previewImage, setPreviewImage] = useState<string | null>(null);
     const [selectedStatus, setSelectedStatus] = useState<TaskIssueStatus | 'ALL'>('OPEN');
     const [isLoading, setIsLoading] = useState(false);
+    const [isResolving, setIsResolving] = useState(false);
 
     const fetchIssues = async () => {
         setIsLoading(true);
@@ -1507,11 +1661,16 @@ const IssueRequestView: React.FC<{ currentAdmin: string }> = ({ currentAdmin }) 
         const confirmed = window.confirm(`요청을 ${status} 상태로 처리할까요?`);
         if (!confirmed) return;
         const note = window.prompt('처리 메모를 입력하세요 (선택)', '') || '';
+
+        setIsResolving(true);
         try {
-            await Storage.updateTaskIssueStatus(issue.id, status, currentAdmin, note);
+            const data = await Storage.updateTaskIssueStatus(issue.id, status, currentAdmin, note);
+            if (data.error) throw new Error(data.error);
             await fetchIssues();
-        } catch {
-            alert('요청 처리에 실패했습니다.');
+        } catch (e: any) {
+            alert(`요청 처리에 실패했습니다: ${e.message || '알 수 없는 오류'}`);
+        } finally {
+            setIsResolving(false);
         }
     };
 
@@ -1549,8 +1708,9 @@ const IssueRequestView: React.FC<{ currentAdmin: string }> = ({ currentAdmin }) 
                         <thead className="bg-slate-900/80 text-slate-400 text-xs font-bold uppercase">
                             <tr>
                                 <th className="px-4 py-3">Type</th>
+                                <th className="px-4 py-3">Preview</th>
                                 <th className="px-4 py-3">Reason</th>
-                                <th className="px-4 py-3">Task</th>
+                                <th className="px-4 py-3">Folder</th>
                                 <th className="px-4 py-3">Created By</th>
                                 <th className="px-4 py-3">Status</th>
                                 <th className="px-4 py-3">Actions</th>
@@ -1560,19 +1720,48 @@ const IssueRequestView: React.FC<{ currentAdmin: string }> = ({ currentAdmin }) 
                             {issues.map(issue => (
                                 <tr key={issue.id} className="hover:bg-slate-700/20">
                                     <td className="px-4 py-3 text-slate-200 font-semibold">{issue.type}</td>
+                                    <td className="px-4 py-3">
+                                        <div
+                                            className="w-12 h-12 rounded bg-black border border-slate-700 overflow-hidden cursor-zoom-in hover:border-sky-500 transition-colors"
+                                            onClick={() => setPreviewImage(issue.imageUrl)}
+                                        >
+                                            <img src={issue.imageUrl} className="w-full h-full object-cover" alt="preview" />
+                                        </div>
+                                    </td>
                                     <td className="px-4 py-3 text-slate-300">{ISSUE_REASON_LABELS[issue.reasonCode] || issue.reasonCode}</td>
-                                    <td className="px-4 py-3 text-slate-300 truncate max-w-[240px]" title={issue.imageUrl}>{issue.folder}</td>
+                                    <td className="px-4 py-3 text-slate-400 text-xs truncate max-w-[180px]" title={issue.folder}>{issue.folder}</td>
                                     <td className="px-4 py-3 text-slate-300">{issue.createdBy}</td>
                                     <td className="px-4 py-3 text-slate-200">{ISSUE_STATUS_LABELS[issue.status] || issue.status}</td>
                                     <td className="px-4 py-3">
-                                        {issue.status === 'OPEN' || issue.status === 'IN_REVIEW' ? (
-                                            <div className="flex gap-1">
-                                                <button onClick={() => resolveIssue(issue, 'DELETE')} className="px-2 py-1 text-[11px] bg-red-700/30 border border-red-700 text-red-300 rounded">Delete</button>
-                                                <button onClick={() => resolveIssue(issue, 'RESOLVED')} className="px-2 py-1 text-[11px] bg-slate-700 border border-slate-600 text-slate-200 rounded">Resolve</button>
-                                            </div>
-                                        ) : (
-                                            <span className="text-xs text-slate-500">-</span>
-                                        )}
+                                        <div className="flex gap-1 items-center">
+                                            <button
+                                                onClick={() => onSelectTask(issue.taskId)}
+                                                disabled={isResolving}
+                                                className={`px-2 py-1 text-[11px] bg-sky-700/30 border border-sky-700 text-sky-300 rounded font-bold transition-colors mr-1 ${isResolving ? 'opacity-50 cursor-not-allowed' : 'hover:bg-sky-700/50'}`}
+                                            >
+                                                Go to Task
+                                            </button>
+                                            {(issue.status === 'OPEN' || issue.status === 'IN_REVIEW') ? (
+                                                <>
+                                                    <button
+                                                        onClick={() => resolveIssue(issue, 'DELETE')}
+                                                        disabled={isResolving}
+                                                        className={`px-2 py-1 text-[11px] bg-red-700/30 border border-red-700 text-red-300 rounded transition-colors ${isResolving ? 'opacity-50 cursor-not-allowed' : 'hover:bg-red-700/50'}`}
+                                                    >
+                                                        Delete
+                                                    </button>
+                                                    <button
+                                                        onClick={() => resolveIssue(issue, 'RESOLVED')}
+                                                        disabled={isResolving}
+                                                        className={`px-2 py-1 text-[11px] bg-slate-700 border border-slate-600 text-slate-200 rounded transition-colors ml-1 ${isResolving ? 'opacity-50 cursor-not-allowed' : 'hover:bg-slate-600'}`}
+                                                    >
+                                                        Resolve
+                                                    </button>
+                                                </>
+                                            ) : (
+                                                <span className="text-xs text-slate-500 whitespace-nowrap">-</span>
+                                            )}
+                                        </div>
                                     </td>
                                 </tr>
                             ))}
@@ -1583,250 +1772,2085 @@ const IssueRequestView: React.FC<{ currentAdmin: string }> = ({ currentAdmin }) 
                             )}
                         </tbody>
                     </table>
-                    {isLoading && <div className="px-4 py-6 text-center text-slate-500 text-sm">불러오는 중...</div>}
+                </div>
+            </div>
+
+            {/* Simple Image Modal Overlay */}
+            {previewImage && (
+                <div
+                    className="fixed inset-0 z-[9999] bg-black/90 backdrop-blur-sm flex items-center justify-center p-8 cursor-zoom-out"
+                    onClick={() => setPreviewImage(null)}
+                >
+                    <div className="relative max-w-full max-h-full">
+                        <img src={previewImage} className="max-w-full max-h-[90vh] rounded-lg shadow-2xl border border-white/10" alt="large preview" />
+                        <button
+                            className="absolute top-4 right-4 text-white/50 hover:text-white bg-white/10 hover:bg-white/20 p-2 rounded-full backdrop-blur-md transition-all"
+                            onClick={(e) => { e.stopPropagation(); setPreviewImage(null); }}
+                        >
+                            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" /></svg>
+                        </button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: boolean; onOpenProject: (projectId: string) => void; overviewRefreshKey?: number }> = ({ onSync, isSyncing, onOpenProject, overviewRefreshKey = 0 }) => {
+    const [loading, setLoading] = useState<boolean>(true);
+    const [savingProject, setSavingProject] = useState<boolean>(false);
+    const [mappingFolder, setMappingFolder] = useState<string>('');
+    const [projectName, setProjectName] = useState<string>('');
+    const [projectTarget, setProjectTarget] = useState<string>('');
+    const [projectWorkflowSourceType, setProjectWorkflowSourceType] = useState<'native-yolo' | 'vlm-review'>('native-yolo');
+    const [vlmSourceFileOptions, setVlmSourceFileOptions] = useState<Storage.VlmAssignSourceFileInfo[]>([]);
+    const [selectedVlmSourceFile, setSelectedVlmSourceFile] = useState<string>('');
+    const [projectVisibleToWorkers, setProjectVisibleToWorkers] = useState<boolean>(true);
+    const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'MAPPING' | 'ARCHIVE'>('OVERVIEW');
+    const [searchKeyword, setSearchKeyword] = useState<string>('');
+    const [unassignedOnly, setUnassignedOnly] = useState<boolean>(true);
+    const [selectedForBulk, setSelectedForBulk] = useState<Set<string>>(new Set());
+    const [bulkTargetProject, setBulkTargetProject] = useState<string>('');
+    const [editingProjectId, setEditingProjectId] = useState<string>('');
+    const [editingTargetTotal, setEditingTargetTotal] = useState<string>('');
+    const [editingWorkflowSourceType, setEditingWorkflowSourceType] = useState<'native-yolo' | 'vlm-review'>('native-yolo');
+    const [editingVisibleToWorkers, setEditingVisibleToWorkers] = useState<boolean>(true);
+    const [restoringProjectId, setRestoringProjectId] = useState<string>('');
+    const [overview, setOverview] = useState<Storage.ProjectOverviewPayload>({
+        projects: [],
+        projectMap: {},
+        unassigned: { folderCount: 0, allocated: 0, completed: 0 },
+        folders: []
+    });
+
+    const refreshOverview = async () => {
+        setLoading(true);
+        try {
+            const data = await Storage.getProjectOverview();
+            setOverview(data);
+            setSelectedForBulk(new Set());
+        } finally {
+            setLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        refreshOverview();
+    }, []);
+
+    useEffect(() => {
+        if (overviewRefreshKey > 0) refreshOverview();
+    }, [overviewRefreshKey]);
+
+    useEffect(() => {
+        if (projectWorkflowSourceType !== 'vlm-review') {
+            setVlmSourceFileOptions([]);
+            setSelectedVlmSourceFile('');
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const list = await Storage.getVlmAssignSourceFiles('');
+                if (!cancelled) setVlmSourceFileOptions(list);
+            } catch (_) {
+                if (!cancelled) setVlmSourceFileOptions([]);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, [projectWorkflowSourceType]);
+
+    const activeProjects = useMemo(
+        () => overview.projects.filter((p) => p.status !== 'ARCHIVED'),
+        [overview.projects]
+    );
+    const archivedProjects = useMemo(
+        () => overview.projects.filter((p) => p.status === 'ARCHIVED'),
+        [overview.projects]
+    );
+
+    useEffect(() => {
+        if (!activeProjects.length) {
+            setEditingProjectId('');
+            setEditingTargetTotal('');
+            setEditingWorkflowSourceType('native-yolo');
+            return;
+        }
+        const selected = activeProjects.find((p) => p.id === editingProjectId) || activeProjects[0];
+        setEditingProjectId(selected.id);
+        setEditingTargetTotal(String(selected.targetTotal ?? ''));
+        setEditingWorkflowSourceType(selected.workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
+        setEditingVisibleToWorkers(selected.visibleToWorkers !== false);
+    }, [activeProjects, editingProjectId]);
+
+    const totals = useMemo(() => {
+        const totalTarget = activeProjects.reduce((acc, p) => acc + Number(p.targetTotal || 0), 0);
+        const totalAllocated = activeProjects.reduce((acc, p) => acc + Number(p.allocated || 0), 0);
+        const totalCompleted = activeProjects.reduce((acc, p) => acc + Number(p.completed || 0), 0);
+        const progress = totalTarget > 0 ? Number(((totalCompleted / totalTarget) * 100).toFixed(2)) : 0;
+        return {
+            projectCount: activeProjects.length,
+            totalTarget,
+            totalAllocated,
+            totalCompleted,
+            progress
+        };
+    }, [activeProjects]);
+
+    const keyword = searchKeyword.trim().toLowerCase();
+    const filteredFolders = useMemo(() => {
+        return overview.folders.filter((row) => {
+            if (unassignedOnly && row.projectId) return false;
+            if (!keyword) return true;
+            return row.folder.toLowerCase().includes(keyword) || String(row.assignedWorker || '').toLowerCase().includes(keyword);
+        });
+    }, [keyword, overview.folders, unassignedOnly]);
+
+    const foldersByProject = useMemo(() => {
+        const map: Record<string, typeof overview.folders> = {};
+        map.__UNASSIGNED__ = [];
+        overview.projects.forEach((project) => {
+            map[project.id] = [];
+        });
+        filteredFolders.forEach((folderRow) => {
+            const key = folderRow.projectId || '__UNASSIGNED__';
+            if (!map[key]) map[key] = [];
+            map[key].push(folderRow);
+        });
+        return map;
+    }, [filteredFolders, overview.projects]);
+
+    const getWorkflowMismatchMessage = (row: Storage.ProjectOverviewPayload['folders'][number], projectId: string): string => {
+        if (!projectId) return '';
+        const project = overview.projects.find((p) => p.id === projectId);
+        if (!project) return '';
+        const nativeCount = Number(row.nativeTaskCount || 0);
+        const vlmCount = Number(row.vlmTaskCount || 0);
+        if (project.workflowSourceType === 'native-yolo' && vlmCount > 0) {
+            return `YOLO 프로젝트인데 VLM 작업 ${vlmCount}건이 포함되어 있습니다.`;
+        }
+        if (project.workflowSourceType === 'vlm-review' && nativeCount > 0) {
+            return `VLM 프로젝트인데 YOLO 작업 ${nativeCount}건이 포함되어 있습니다.`;
+        }
+        return '';
+    };
+
+    const mismatchCount = useMemo(() => {
+        return overview.folders.filter((row) => Boolean(getWorkflowMismatchMessage(row, row.projectId || ''))).length;
+    }, [overview.folders, overview.projects]);
+
+    const handleSaveProject = async () => {
+        const name = projectName.trim();
+        if (!name) {
+            alert('프로젝트명을 입력해주세요.');
+            return;
+        }
+        if (projectWorkflowSourceType === 'vlm-review' && !selectedVlmSourceFile.trim()) {
+            alert('VLM 프로젝트는 원본 JSON 파일을 선택해주세요.');
+            return;
+        }
+        const targetTotal = Math.max(0, Number(projectTarget || 0));
+        setSavingProject(true);
+        try {
+            await Storage.saveProject({
+                name,
+                targetTotal,
+                workflowSourceType: projectWorkflowSourceType,
+                vlmSourceFile: projectWorkflowSourceType === 'vlm-review' ? selectedVlmSourceFile.trim() || undefined : undefined,
+                visibleToWorkers: projectVisibleToWorkers
+            });
+            setProjectName('');
+            setProjectTarget('');
+            setProjectWorkflowSourceType('native-yolo');
+            setSelectedVlmSourceFile('');
+            setVlmSourceFileOptions([]);
+            setProjectVisibleToWorkers(true);
+            await refreshOverview();
+        } catch (e) {
+            alert('프로젝트 저장에 실패했습니다.');
+        } finally {
+            setSavingProject(false);
+        }
+    };
+
+    const handleUpdateProjectWorkflow = async () => {
+        if (!editingProjectId) return;
+        const target = activeProjects.find((p) => p.id === editingProjectId);
+        if (!target) return;
+        const hasMixedFolder = overview.folders.some((row) => {
+            const projectId = row.projectId;
+            if (projectId !== editingProjectId) return false;
+            return Boolean(getWorkflowMismatchMessage(row, projectId));
+        });
+        if (hasMixedFolder) {
+            const confirmed = window.confirm('현재 매핑된 폴더 중 타입 불일치 항목이 있습니다. 워크플로우를 변경하면 일부 폴더에서 경고가 표시됩니다. 계속할까요?');
+            if (!confirmed) return;
+        }
+        setSavingProject(true);
+        try {
+            await Storage.saveProject({
+                id: target.id,
+                name: target.name,
+                targetTotal: Math.max(0, Number(editingTargetTotal || 0)),
+                workflowSourceType: editingWorkflowSourceType,
+                visibleToWorkers: editingVisibleToWorkers
+            });
+            await refreshOverview();
+        } catch (_e) {
+            alert('프로젝트 설정 변경에 실패했습니다.');
+        } finally {
+            setSavingProject(false);
+        }
+    };
+
+    const handleRestoreProject = async (projectId: string) => {
+        if (!projectId) return;
+        const ok = window.confirm('이 프로젝트를 활성 상태로 복원할까요?');
+        if (!ok) return;
+        setRestoringProjectId(projectId);
+        try {
+            await Storage.restoreProject({ projectId });
+            await refreshOverview();
+            alert('프로젝트가 복원되었습니다.');
+        } catch (_e) {
+            alert('프로젝트 복원에 실패했습니다.');
+        } finally {
+            setRestoringProjectId('');
+        }
+    };
+
+    const handleMapFolder = async (folder: string, projectId: string) => {
+        const row = overview.folders.find((item) => item.folder === folder);
+        if (row && projectId) {
+            const warning = getWorkflowMismatchMessage(row, projectId);
+            if (warning) {
+                const confirmed = window.confirm(`${warning}\n그래도 매핑할까요?`);
+                if (!confirmed) return;
+            }
+        }
+        setMappingFolder(folder);
+        try {
+            await Storage.mapFolderToProject(folder, projectId || null);
+            await refreshOverview();
+        } catch (e) {
+            alert('프로젝트 매핑 저장에 실패했습니다.');
+        } finally {
+            setMappingFolder('');
+        }
+    };
+
+    const handleToggleBulk = (folderName: string) => {
+        setSelectedForBulk((prev) => {
+            const next = new Set(prev);
+            if (next.has(folderName)) next.delete(folderName);
+            else next.add(folderName);
+            return next;
+        });
+    };
+
+    const handleToggleColumnBulk = (rows: Storage.ProjectOverviewPayload['folders']) => {
+        const folderNames = rows.map((row) => row.folder);
+        if (folderNames.length === 0) return;
+        setSelectedForBulk((prev) => {
+            const next = new Set(prev);
+            const allSelected = folderNames.every((name) => next.has(name));
+            if (allSelected) {
+                folderNames.forEach((name) => next.delete(name));
+            } else {
+                folderNames.forEach((name) => next.add(name));
+            }
+            return next;
+        });
+    };
+
+    const handleBulkMove = async () => {
+        if (selectedForBulk.size === 0) return;
+        if (bulkTargetProject) {
+            const warnings = Array.from(selectedForBulk)
+                .map((folderName) => {
+                    const row = overview.folders.find((item) => item.folder === folderName);
+                    if (!row) return '';
+                    return getWorkflowMismatchMessage(row, bulkTargetProject);
+                })
+                .filter(Boolean);
+            if (warnings.length > 0) {
+                const confirmed = window.confirm(`선택 항목 중 ${warnings.length}개 폴더가 프로젝트 작업 방식과 불일치합니다. 그래도 이동할까요?`);
+                if (!confirmed) return;
+            }
+        }
+        setMappingFolder('__BULK__');
+        try {
+            const target = bulkTargetProject || null;
+            for (const folderName of Array.from(selectedForBulk)) {
+                await Storage.mapFolderToProject(folderName, target);
+            }
+            await refreshOverview();
+            setSelectedForBulk(new Set());
+        } catch (e) {
+            alert('일괄 매핑에 실패했습니다.');
+        } finally {
+            setMappingFolder('');
+        }
+    };
+
+    const renderFolderCard = (row: Storage.ProjectOverviewPayload['folders'][number]) => {
+        const progress = row.taskCount > 0 ? Math.round((Number(row.completedCount || 0) / Number(row.taskCount || 1)) * 100) : 0;
+        const isChecked = selectedForBulk.has(row.folder);
+        const workflowWarning = getWorkflowMismatchMessage(row, row.projectId || '');
+        return (
+            <label key={row.folder} className={`block rounded-lg border p-3 cursor-pointer transition-colors ${workflowWarning ? 'bg-rose-900/10 border-rose-700/50' : isChecked ? 'bg-sky-900/20 border-sky-600/50' : 'bg-slate-900/40 border-slate-700 hover:border-slate-500'}`}>
+                <div className="flex items-start gap-2">
+                    <input
+                        type="checkbox"
+                        checked={isChecked}
+                        onChange={() => handleToggleBulk(row.folder)}
+                        className="mt-0.5 rounded border-slate-600 bg-slate-800 text-sky-500 focus:ring-sky-500/40"
+                    />
+                    <div className="min-w-0 flex-1">
+                        <div className="text-sm font-bold text-slate-100 truncate">{row.folder}</div>
+                        <div className="text-xs text-slate-300 mt-1">작업자: <span className="font-medium text-slate-100">{row.assignedWorker || 'Unassigned'}</span></div>
+                        <div className="text-[11px] text-slate-400">YOLO {Number(row.nativeTaskCount || 0)} / VLM {Number(row.vlmTaskCount || 0)}</div>
+                        <div className="text-xs text-slate-300">완료 <span className="font-medium text-slate-100">{row.completedCount}</span> / <span className="font-medium text-slate-100">{row.taskCount}</span></div>
+                        {workflowWarning && (
+                            <div className="mt-1 text-[11px] text-rose-300">{workflowWarning}</div>
+                        )}
+                        <div className="mt-2 h-1.5 bg-slate-700 rounded-full overflow-hidden">
+                            <div className="h-full bg-cyan-500" style={{ width: `${Math.min(100, progress)}%` }} />
+                        </div>
+                    </div>
+                </div>
+            </label>
+        );
+    };
+
+    return (
+        <div className="flex flex-col h-full">
+            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                    <h2 className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-sky-400">프로젝트 개요</h2>
+                    <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/50">관리자용</span>
+                </div>
+                <div className="flex items-center gap-2">
+                    <div className="bg-slate-900 border border-slate-700 rounded-lg p-1 flex items-center">
+                        <button
+                            onClick={() => setActiveTab('OVERVIEW')}
+                            className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'OVERVIEW' ? 'bg-cyan-900/40 text-cyan-200' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                            개요
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('MAPPING')}
+                            className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'MAPPING' ? 'bg-cyan-900/40 text-cyan-200' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                            매핑
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('ARCHIVE')}
+                            className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'ARCHIVE' ? 'bg-amber-900/40 text-amber-200' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                            아카이브
+                        </button>
+                    </div>
+                    <button
+                        onClick={refreshOverview}
+                        disabled={loading}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
+                    >
+                        새로고침
+                    </button>
+                    <button
+                        onClick={onSync}
+                        disabled={isSyncing}
+                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
+                    >
+                        {isSyncing ? 'Syncing...' : 'Sync Data'}
+                    </button>
+                </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6 space-y-6">
+                {loading && (
+                    <div className="text-sm text-sky-300 bg-sky-900/20 border border-sky-700/40 rounded-lg px-4 py-3">
+                        프로젝트 통계 로딩 중...
+                    </div>
+                )}
+
+                {activeTab === 'OVERVIEW' ? (
+                    <>
+                        <div className="grid grid-cols-1 md:grid-cols-5 gap-5 mb-8">
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-white/10 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-slate-500/10 rounded-full blur-2xl group-hover:bg-slate-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-slate-400"></div> 프로젝트 수
+                                </div>
+                                <div className="text-3xl font-heading font-black text-white relative z-10 tracking-tight">{totals.projectCount}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-cyan-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></div> 전체 목표량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 to-sky-500 relative z-10 tracking-tight">{totals.totalTarget.toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-sky-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-sky-500/10 rounded-full blur-2xl group-hover:bg-sky-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]"></div> 배분량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-sky-300 to-blue-500 relative z-10 tracking-tight">{totals.totalAllocated.toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-lime-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-lime-500/10 rounded-full blur-2xl group-hover:bg-lime-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-lime-400 shadow-[0_0_8px_rgba(163,230,53,0.8)]"></div> 완료량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-lime-300 to-green-500 relative z-10 tracking-tight">{totals.totalCompleted.toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-violet-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> 전체 진행률
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">{totals.progress}%</div>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+                            <div className="xl:col-span-2 bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                                <h3 className="text-sm font-bold text-slate-200 mb-5 flex items-center gap-3">
+                                    <div className="w-8 h-8 rounded-xl bg-cyan-500/10 flex items-center justify-center border border-cyan-500/20">
+                                        <svg className="w-4 h-4 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                                    </div>
+                                    진행 중인 프로젝트
+                                </h3>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                    {activeProjects.map((project) => (
+                                        <button
+                                            key={project.id}
+                                            onClick={() => onOpenProject(project.id)}
+                                            className={`text-left rounded-2xl p-4 transition-all border ${project.status === 'ARCHIVED'
+                                                ? 'bg-slate-900/40 border-amber-700/20 hover:border-amber-500/40'
+                                                : 'bg-slate-900/40 border-cyan-700/20 hover:border-cyan-400/40 hover:shadow-[0_0_20px_rgba(34,211,238,0.15)] hover:-translate-y-0.5'
+                                                }`}
+                                        >
+                                            <div className="flex items-center justify-between gap-2">
+                                                <div className="text-lg font-black text-white tracking-tight">{project.name}</div>
+                                                <div className="flex items-center gap-1.5">
+                                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border shadow-inner ${project.workflowSourceType === 'vlm-review' ? 'bg-violet-500/10 text-violet-300 border-violet-500/20' : 'bg-sky-500/10 text-sky-300 border-sky-500/20'}`}>
+                                                        {project.workflowSourceType === 'vlm-review' ? 'VLM' : 'YOLO'}
+                                                    </span>
+                                                    {project.status === 'ARCHIVED' && (
+                                                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-amber-500/10 text-amber-300 border-amber-500/20 shadow-inner">
+                                                            Archived
+                                                        </span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            <div className="mt-4 text-sm text-slate-300 space-y-2">
+                                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">목표량</span><span className="text-white font-bold">{Number(project.targetTotal || 0).toLocaleString()}</span></div>
+                                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">배분량</span><span className="text-white font-bold">{Number(project.allocated || 0).toLocaleString()}</span></div>
+                                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">완료량</span><span className="text-emerald-400 font-bold">{Number(project.completed || 0).toLocaleString()}</span></div>
+                                            </div>
+                                            <div className="mt-4 pt-4 border-t border-white/[0.05]">
+                                                <div className="flex justify-between text-[11px] font-bold text-slate-400 mb-1.5">
+                                                    <span>진행률</span>
+                                                    <span className="text-cyan-400">{Number(project.progress || 0)}%</span>
+                                                </div>
+                                                <div className="h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                    <div className="h-full bg-gradient-to-r from-sky-500 to-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.5)]" style={{ width: `${Math.min(100, Number(project.progress || 0))}%` }} />
+                                                </div>
+                                            </div>
+                                        </button>
+                                    ))}
+                                    <div className="rounded-2xl p-4 border border-dashed border-violet-500/30 bg-violet-500/5">
+                                        <div className="text-lg font-black text-violet-200 tracking-tight">미분류</div>
+                                        <div className="mt-4 text-sm text-slate-300 space-y-2">
+                                            <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">폴더 수</span><span className="text-white font-bold">{overview.unassigned.folderCount}</span></div>
+                                            <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">배분량</span><span className="text-white font-bold">{Number(overview.unassigned.allocated || 0).toLocaleString()}</span></div>
+                                            <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">완료량</span><span className="text-emerald-400 font-bold">{Number(overview.unassigned.completed || 0).toLocaleString()}</span></div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {archivedProjects.length > 0 && (
+                                    <>
+                                        <h3 className="text-sm font-bold text-slate-200 mt-8 mb-5 flex items-center gap-3">
+                                            <div className="w-8 h-8 rounded-xl bg-amber-500/10 flex items-center justify-center border border-amber-500/20">
+                                                <svg className="w-4 h-4 text-amber-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" /></svg>
+                                            </div>
+                                            완료된 프로젝트
+                                        </h3>
+                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                                            {archivedProjects.map((project) => (
+                                                <button
+                                                    key={project.id}
+                                                    onClick={() => onOpenProject(project.id)}
+                                                    className="text-left rounded-2xl p-4 transition-all border bg-slate-900/40 border-amber-700/20 hover:border-amber-500/40 hover:shadow-[0_0_20px_rgba(245,158,11,0.1)] hover:-translate-y-0.5"
+                                                >
+                                                    <div className="flex items-center justify-between gap-2">
+                                                        <div className="text-lg font-black text-white/70 tracking-tight">{project.name}</div>
+                                                        <div className="flex items-center gap-1.5">
+                                                            <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-amber-500/10 text-amber-300 border-amber-500/20 shadow-inner">
+                                                                Archived
+                                                            </span>
+                                                        </div>
+                                                    </div>
+                                                    <div className="mt-4 text-sm text-slate-400 space-y-2">
+                                                        <div className="flex justify-between items-center"><span className="font-medium">목표량</span><span className="font-bold">{Number(project.targetTotal || 0).toLocaleString()}</span></div>
+                                                        <div className="flex justify-between items-center"><span className="font-medium">배분량</span><span className="font-bold">{Number(project.allocated || 0).toLocaleString()}</span></div>
+                                                        <div className="flex justify-between items-center"><span className="font-medium">완료량</span><span className="text-emerald-500/70 font-bold">{Number(project.completed || 0).toLocaleString()}</span></div>
+                                                    </div>
+                                                    <div className="mt-4 pt-4 border-t border-white/[0.05]">
+                                                        <div className="flex justify-between text-[11px] font-bold text-slate-500 mb-1.5">
+                                                            <span>진행률</span>
+                                                            <span className="text-amber-400/70">{Number(project.progress || 0)}%</span>
+                                                        </div>
+                                                        <div className="h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                            <div className="h-full bg-gradient-to-r from-amber-600 to-amber-400 opacity-60" style={{ width: `${Math.min(100, Number(project.progress || 0))}%` }} />
+                                                        </div>
+                                                    </div>
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col gap-6">
+                                <div>
+                                    <h3 className="text-sm font-bold text-slate-200 mb-5 flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-xl bg-emerald-500/10 flex items-center justify-center border border-emerald-500/20">
+                                            <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" /></svg>
+                                        </div>
+                                        프로젝트 생성
+                                    </h3>
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">프로젝트명</label>
+                                            <input
+                                                value={projectName}
+                                                onChange={(e) => setProjectName(e.target.value)}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors"
+                                                placeholder="예: YOLO-Phase-1"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">작업 방식</label>
+                                            <select
+                                                value={projectWorkflowSourceType}
+                                                onChange={(e) => {
+                                                    const next = e.target.value === 'vlm-review' ? 'vlm-review' : 'native-yolo';
+                                                    setProjectWorkflowSourceType(next);
+                                                    if (next !== 'vlm-review') setProjectTarget('');
+                                                }}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                            >
+                                                <option value="native-yolo">YOLO (바운딩박스/클래스)</option>
+                                                <option value="vlm-review">VLM (수용/거절 검수)</option>
+                                            </select>
+                                        </div>
+                                        {projectWorkflowSourceType === 'vlm-review' && (
+                                            <div>
+                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">원본 JSON 파일</label>
+                                                <select
+                                                    value={selectedVlmSourceFile}
+                                                    onChange={(e) => {
+                                                        const file = e.target.value;
+                                                        setSelectedVlmSourceFile(file);
+                                                        const row = vlmSourceFileOptions.find((r) => r.sourceFile === file);
+                                                        if (row) setProjectTarget(String(row.total));
+                                                    }}
+                                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                                >
+                                                    <option value="">선택 (필수)</option>
+                                                    {vlmSourceFileOptions.map((row) => (
+                                                        <option key={row.sourceFile} value={row.sourceFile}>
+                                                            {row.sourceFile} (전체 {row.total}건)
+                                                        </option>
+                                                    ))}
+                                                </select>
+                                                <p className="text-[10px] text-slate-500 mt-1">DB에 이미 이관된 JSON 파일 중 하나를 선택하세요. 목표량이 자동으로 채워집니다.</p>
+                                            </div>
+                                        )}
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">목표량</label>
+                                            <input
+                                                type="number"
+                                                min={0}
+                                                value={projectTarget}
+                                                onChange={(e) => setProjectTarget(e.target.value)}
+                                                readOnly={projectWorkflowSourceType === 'vlm-review' && !!selectedVlmSourceFile}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors disabled:opacity-80"
+                                                placeholder="예: 50000"
+                                            />
+                                        </div>
+                                        <label className="flex items-center justify-between gap-3 rounded-xl border border-white/[0.06] bg-slate-950/40 px-4 py-2.5">
+                                            <span className="text-sm font-semibold text-slate-200">작업자에게 공개</span>
+                                            <input
+                                                type="checkbox"
+                                                checked={projectVisibleToWorkers}
+                                                onChange={(e) => setProjectVisibleToWorkers(e.target.checked)}
+                                                className="h-4 w-4 accent-emerald-400"
+                                            />
+                                        </label>
+                                        <button
+                                            onClick={handleSaveProject}
+                                            disabled={savingProject}
+                                            className="w-full bg-emerald-600/80 hover:bg-emerald-500/80 border border-emerald-500/30 text-white rounded-xl py-2.5 text-sm font-bold shadow-[0_0_15px_rgba(16,185,129,0.2)] transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:hover:translate-y-0"
+                                        >
+                                            {savingProject ? '저장 중...' : '프로젝트 저장'}
+                                        </button>
+                                    </div>
+                                </div>
+                                <div className="border-t border-white/[0.05]" />
+                                <div>
+                                    <h3 className="text-sm font-bold text-slate-200 mb-5 flex items-center gap-3">
+                                        <div className="w-8 h-8 rounded-xl bg-violet-500/10 flex items-center justify-center border border-violet-500/20">
+                                            <svg className="w-4 h-4 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                        </div>
+                                        프로젝트 설정 변경
+                                    </h3>
+                                    <div className="space-y-4">
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">대상 프로젝트</label>
+                                            <select
+                                                value={editingProjectId}
+                                                onChange={(e) => {
+                                                    const nextId = e.target.value;
+                                                    setEditingProjectId(nextId);
+                                                    const target = overview.projects.find((p) => p.id === nextId);
+                                                    if (target) {
+                                                        setEditingTargetTotal(String(target.targetTotal ?? ''));
+                                                        setEditingWorkflowSourceType(target.workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
+                                                        setEditingVisibleToWorkers(target.visibleToWorkers !== false);
+                                                    }
+                                                }}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                            >
+                                                {activeProjects.map((project) => (
+                                                    <option key={project.id} value={project.id}>
+                                                        {project.name}
+                                                    </option>
+                                                ))}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">목표량</label>
+                                            <input
+                                                type="number"
+                                                min={0}
+                                                value={editingTargetTotal}
+                                                onChange={(e) => setEditingTargetTotal(e.target.value)}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors"
+                                                placeholder="예: 50000"
+                                            />
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">변경할 방식</label>
+                                            <select
+                                                value={editingWorkflowSourceType}
+                                                onChange={(e) => setEditingWorkflowSourceType(e.target.value === 'vlm-review' ? 'vlm-review' : 'native-yolo')}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
+                                            >
+                                                <option value="native-yolo">YOLO (바운딩박스/클래스)</option>
+                                                <option value="vlm-review">VLM (수용/거절 검수)</option>
+                                            </select>
+                                        </div>
+                                        <label className="flex items-center justify-between gap-3 rounded-xl border border-white/[0.06] bg-slate-950/40 px-4 py-2.5">
+                                            <span className="text-sm font-semibold text-slate-200">작업자에게 공개</span>
+                                            <input
+                                                type="checkbox"
+                                                checked={editingVisibleToWorkers}
+                                                onChange={(e) => setEditingVisibleToWorkers(e.target.checked)}
+                                                className="h-4 w-4 accent-violet-400"
+                                            />
+                                        </label>
+                                        <button
+                                            onClick={handleUpdateProjectWorkflow}
+                                            disabled={savingProject || !editingProjectId}
+                                            className="w-full bg-violet-600/80 hover:bg-violet-500/80 border border-violet-500/30 text-white rounded-xl py-2.5 text-sm font-bold shadow-[0_0_15px_rgba(139,92,246,0.2)] transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:hover:translate-y-0"
+                                        >
+                                            {savingProject ? '변경 중...' : '프로젝트 설정 변경'}
+                                        </button>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </>
+                ) : activeTab === 'MAPPING' ? (
+                    <>
+                        <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
+                            <div className="flex flex-wrap items-center gap-3">
+                                <input
+                                    value={searchKeyword}
+                                    onChange={(e) => setSearchKeyword(e.target.value)}
+                                    placeholder="폴더명/작업자 검색"
+                                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-sky-500 min-w-[260px]"
+                                />
+                                <label className="inline-flex items-center gap-2 text-xs text-slate-300">
+                                    <input
+                                        type="checkbox"
+                                        checked={unassignedOnly}
+                                        onChange={(e) => setUnassignedOnly(e.target.checked)}
+                                        className="rounded border-slate-600 bg-slate-900 text-sky-500"
+                                    />
+                                    미분류 우선 보기
+                                </label>
+                            </div>
+                        </div>
+
+                        {mismatchCount > 0 && (
+                            <div className="text-xs text-rose-200 bg-rose-900/20 border border-rose-700/40 rounded-lg px-3 py-2">
+                                현재 매핑에서 작업 방식 불일치 폴더가 {mismatchCount}개 있습니다. 카드의 경고 문구를 확인해주세요.
+                            </div>
+                        )}
+                        <div className="grid grid-cols-1 xl:grid-cols-4 gap-4">
+                            <div className="bg-slate-800/20 border border-slate-700 rounded-xl p-3">
+                                <div className="flex items-center justify-between mb-2 gap-2">
+                                    <div className="text-xs font-bold text-amber-300">미분류 ({foldersByProject.__UNASSIGNED__?.length || 0})</div>
+                                    <button
+                                        onClick={() => handleToggleColumnBulk(foldersByProject.__UNASSIGNED__ || [])}
+                                        className="text-[10px] px-2 py-1 rounded border border-amber-700/40 text-amber-200 hover:bg-amber-900/20"
+                                    >
+                                        {(foldersByProject.__UNASSIGNED__ || []).length > 0 && (foldersByProject.__UNASSIGNED__ || []).every((row) => selectedForBulk.has(row.folder)) ? '해제' : '전체 선택'}
+                                    </button>
+                                </div>
+                                <div className="space-y-2 max-h-[60vh] overflow-auto pr-1">
+                                    {(foldersByProject.__UNASSIGNED__ || []).map(renderFolderCard)}
+                                </div>
+                            </div>
+
+                            {activeProjects.map((project) => (
+                                <div key={project.id} className="bg-slate-800/20 border border-slate-700 rounded-xl p-3">
+                                    <div className="flex items-center justify-between mb-2 gap-2">
+                                        <div className="text-xs font-bold text-cyan-300">{project.name} ({foldersByProject[project.id]?.length || 0})</div>
+                                        <button
+                                            onClick={() => handleToggleColumnBulk(foldersByProject[project.id] || [])}
+                                            className="text-[10px] px-2 py-1 rounded border border-cyan-700/40 text-cyan-200 hover:bg-cyan-900/20"
+                                        >
+                                            {(foldersByProject[project.id] || []).length > 0 && (foldersByProject[project.id] || []).every((row) => selectedForBulk.has(row.folder)) ? '해제' : '전체 선택'}
+                                        </button>
+                                    </div>
+                                    <div className="space-y-2 max-h-[60vh] overflow-auto pr-1">
+                                        {(foldersByProject[project.id] || []).map(renderFolderCard)}
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        {selectedForBulk.size > 0 && (
+                            <div className="sticky bottom-0 bg-slate-900/95 border border-slate-700 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3">
+                                <div className="text-sm text-slate-200">
+                                    선택됨: <span className="font-bold text-cyan-300">{selectedForBulk.size}</span>개 폴더
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <select
+                                        value={bulkTargetProject}
+                                        onChange={(e) => setBulkTargetProject(e.target.value)}
+                                        className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-2 text-xs text-slate-200 outline-none focus:border-sky-500 min-w-[180px]"
+                                    >
+                                        <option value="">미분류로 이동</option>
+                                        {activeProjects.map((project) => (
+                                            <option key={project.id} value={project.id}>{project.name}</option>
+                                        ))}
+                                    </select>
+                                    <button
+                                        onClick={handleBulkMove}
+                                        disabled={mappingFolder === '__BULK__'}
+                                        className="px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold disabled:opacity-50"
+                                    >
+                                        {mappingFolder === '__BULK__' ? '이동 중...' : '선택 항목 이동'}
+                                    </button>
+                                    <button
+                                        onClick={() => setSelectedForBulk(new Set())}
+                                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs font-bold"
+                                    >
+                                        선택 해제
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                    </>
+                ) : (
+                    <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
+                        <div className="flex items-center justify-between mb-3">
+                            <h3 className="text-sm font-bold text-slate-200">아카이브 프로젝트</h3>
+                            <span className="text-xs text-slate-400">{archivedProjects.length}개</span>
+                        </div>
+                        <div className="space-y-2">
+                            {archivedProjects.map((project) => (
+                                <div key={project.id} className="rounded-lg border border-amber-700/40 bg-amber-900/10 p-3 flex items-center justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <div className="text-sm font-bold text-amber-100 truncate">{project.name}</div>
+                                        <div className="text-[11px] text-slate-300 mt-1">
+                                            목표 {Number(project.targetTotal || 0).toLocaleString()} / 완료 {Number(project.completed || 0).toLocaleString()} / 진행률 {Number(project.progress || 0)}%
+                                        </div>
+                                        <div className="text-[10px] text-slate-400 mt-1">
+                                            아카이브 시각: {project.archivedAt ? new Date(project.archivedAt).toLocaleString() : '-'}
+                                        </div>
+                                    </div>
+                                    <div className="flex items-center gap-2 shrink-0">
+                                        <button
+                                            onClick={() => onOpenProject(project.id)}
+                                            className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-xs font-semibold"
+                                        >
+                                            상세 보기
+                                        </button>
+                                        <button
+                                            onClick={() => handleRestoreProject(project.id)}
+                                            disabled={restoringProjectId === project.id}
+                                            className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold disabled:opacity-50"
+                                        >
+                                            {restoringProjectId === project.id ? '복원 중...' : '복원'}
+                                        </button>
+                                    </div>
+                                </div>
+                            ))}
+                            {archivedProjects.length === 0 && (
+                                <div className="text-sm text-slate-500 italic py-8 text-center">아카이브된 프로젝트가 없습니다.</div>
+                            )}
+                        </div>
+                    </div>
+                )}
+
+                {mappingFolder && mappingFolder !== '__BULK__' && (
+                    <div className="text-xs text-slate-500">매핑 저장 중: {mappingFolder}</div>
+                )}
+            </div>
+        </div>
+    );
+};
+
+const DashboardHomeView: React.FC = () => {
+    const [loading, setLoading] = useState<boolean>(true);
+    const [overview, setOverview] = useState<Storage.ProjectOverviewPayload>({
+        projects: [],
+        projectMap: {},
+        unassigned: { folderCount: 0, allocated: 0, completed: 0 },
+        folders: []
+    });
+
+    useEffect(() => {
+        const fetchOverview = async () => {
+            setLoading(true);
+            try {
+                const payload = await Storage.getProjectOverview();
+                setOverview(payload || {
+                    projects: [],
+                    projectMap: {},
+                    unassigned: { folderCount: 0, allocated: 0, completed: 0 },
+                    folders: []
+                });
+            } finally {
+                setLoading(false);
+            }
+        };
+        fetchOverview();
+    }, []);
+
+    const workerVisibleProjects = useMemo(() => {
+        return overview.projects.filter((project) => project.status !== 'ARCHIVED' && project.visibleToWorkers !== false);
+    }, [overview.projects]);
+
+    const totals = useMemo(() => {
+        const totalTarget = workerVisibleProjects.reduce((acc, row) => acc + Number(row.targetTotal || 0), 0);
+        const totalAllocated = workerVisibleProjects.reduce((acc, row) => acc + Number(row.allocated || 0), 0) + Number(overview.unassigned.allocated || 0);
+        const totalCompleted = workerVisibleProjects.reduce((acc, row) => acc + Number(row.completed || 0), 0) + Number(overview.unassigned.completed || 0);
+        const progress = totalTarget > 0 ? Number(((totalCompleted / totalTarget) * 100).toFixed(2)) : 0;
+        return { totalTarget, totalAllocated, totalCompleted, progress };
+    }, [overview.unassigned.allocated, overview.unassigned.completed, workerVisibleProjects]);
+
+    return (
+        <div className="h-full overflow-auto p-6 space-y-6">
+            {loading && (
+                <div className="text-sm text-sky-300 bg-sky-900/20 border border-sky-700/40 rounded-lg px-4 py-3">
+                    프로젝트 대시보드 로딩 중...
+                </div>
+            )}
+
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-5 mb-8">
+                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-cyan-500/30 transition-colors">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors" />
+                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></div> 총 목표량
+                    </div>
+                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 to-sky-500 relative z-10 tracking-tight">{Number(totals.totalTarget || 0).toLocaleString()}</div>
+                </div>
+                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-sky-500/30 transition-colors">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-sky-500/10 rounded-full blur-2xl group-hover:bg-sky-500/20 transition-colors" />
+                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]"></div> 총 배분량
+                    </div>
+                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-sky-300 to-blue-500 relative z-10 tracking-tight">{Number(totals.totalAllocated || 0).toLocaleString()}</div>
+                </div>
+                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-lime-500/30 transition-colors">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-lime-500/10 rounded-full blur-2xl group-hover:bg-lime-500/20 transition-colors" />
+                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-lime-400 shadow-[0_0_8px_rgba(163,230,53,0.8)]"></div> 총 완료량
+                    </div>
+                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-lime-300 to-green-500 relative z-10 tracking-tight">{Number(totals.totalCompleted || 0).toLocaleString()}</div>
+                </div>
+                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-violet-500/30 transition-colors">
+                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors" />
+                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                        <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> 전체 진행률
+                    </div>
+                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">{Number(totals.progress || 0)}%</div>
+                </div>
+            </div>
+
+            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                <h3 className="text-sm font-bold text-slate-200 mb-5 flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-cyan-500/10 flex items-center justify-center border border-cyan-500/20">
+                        <svg className="w-4 h-4 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
+                    </div>
+                    프로젝트 카드
+                </h3>
+                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+                    {workerVisibleProjects.map((project) => (
+                        <div key={project.id} className={`rounded-2xl border p-4 transition-all ${project.status === 'ARCHIVED' ? 'border-amber-700/20 bg-slate-900/40' : 'border-cyan-700/20 bg-slate-900/40 hover:border-cyan-400/40 hover:shadow-[0_0_20px_rgba(34,211,238,0.15)] hover:-translate-y-0.5'}`}>
+                            <div className="flex items-center justify-between gap-2">
+                                <div className="text-lg font-black text-white tracking-tight">{project.name}</div>
+                                <div className="flex items-center gap-1.5">
+                                    <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border shadow-inner ${project.workflowSourceType === 'vlm-review' ? 'bg-violet-500/10 text-violet-300 border-violet-500/20' : 'bg-sky-500/10 text-sky-300 border-sky-500/20'}`}>
+                                        {project.workflowSourceType === 'vlm-review' ? 'VLM' : 'YOLO'}
+                                    </span>
+                                    {project.visibleToWorkers === false && (
+                                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-slate-700/40 text-slate-200 border-slate-600/60 shadow-inner">
+                                            Hidden
+                                        </span>
+                                    )}
+                                    {project.status === 'ARCHIVED' && (
+                                        <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-amber-500/10 text-amber-300 border-amber-500/20 shadow-inner">
+                                            Archived
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                            <div className="mt-4 text-sm text-slate-300 space-y-2">
+                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">목표량</span><span className="text-white font-bold">{Number(project.targetTotal || 0).toLocaleString()}</span></div>
+                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">배분량</span><span className="text-white font-bold">{Number(project.allocated || 0).toLocaleString()}</span></div>
+                                <div className="flex justify-between items-center"><span className="text-slate-400 font-medium">완료량</span><span className="text-emerald-400 font-bold">{Number(project.completed || 0).toLocaleString()}</span></div>
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-white/[0.05]">
+                                <div className="flex justify-between text-[11px] font-bold text-slate-400 mb-1.5">
+                                    <span>진행률</span>
+                                    <span className="text-cyan-400">{Number(project.progress || 0)}%</span>
+                                </div>
+                                <div className="h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                    <div className="h-full bg-gradient-to-r from-sky-500 to-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.5)]" style={{ width: `${Math.min(100, Number(project.progress || 0))}%` }} />
+                                </div>
+                            </div>
+                        </div>
+                    ))}
+                    {workerVisibleProjects.length === 0 && (
+                        <div className="col-span-full text-sm text-slate-500 italic flex justify-center py-8">프로젝트 데이터가 없습니다.</div>
+                    )}
                 </div>
             </div>
         </div>
     );
 };
 
-const FolderRow = ({ folder, groups, allFolderMeta, onUpdateGroup, onUpdateTags, onAssignWorker, workers, onSelectFolder, isSelected, onToggleSelect }: any) => {
-    const [tagsInput, setTagsInput] = useState('');
-    const currentTags = allFolderMeta[folder.name]?.tags || [];
+const VlmMigrationView: React.FC<{ onRefreshTasks: () => void; workers: string[]; onRefreshOverview?: () => void }> = ({ onRefreshTasks, workers, onRefreshOverview }) => {
+    const [loadingDryRun, setLoadingDryRun] = useState<boolean>(false);
+    const [loadingCommit, setLoadingCommit] = useState<boolean>(false);
+    const [dryRun, setDryRun] = useState<Storage.VlmMigrationDryRunResult | null>(null);
+    const [lastCommitResult, setLastCommitResult] = useState<any>(null);
+    const [importFiles, setImportFiles] = useState<Storage.VlmImportJsonFileInfo[]>([]);
+    const [loadingImportFiles, setLoadingImportFiles] = useState<boolean>(false);
+    const [selectedImportFiles, setSelectedImportFiles] = useState<Set<string>>(new Set());
+    const [importDryRunResult, setImportDryRunResult] = useState<Storage.VlmJsonImportResult | null>(null);
+    const [importCommitResult, setImportCommitResult] = useState<Storage.VlmJsonImportResult | null>(null);
+    const [exportFiles, setExportFiles] = useState<Storage.VlmExportJsonFileInfo[]>([]);
+    const [selectedExportFiles, setSelectedExportFiles] = useState<Set<string>>(new Set());
+    const [loadingExportFiles, setLoadingExportFiles] = useState<boolean>(false);
+    const [exportOnlySubmitted, setExportOnlySubmitted] = useState<boolean>(true);
+    const [exportIncludeResult, setExportIncludeResult] = useState<boolean>(true);
+    const [exportResult, setExportResult] = useState<Storage.VlmExportJsonResult | null>(null);
+    const [exportProgress, setExportProgress] = useState<{
+        inProgress: boolean;
+        done: number;
+        total: number;
+        percent: number;
+        currentFile: string;
+    }>({
+        inProgress: false,
+        done: 0,
+        total: 0,
+        percent: 0,
+        currentFile: ''
+    });
 
-    const handleAddTag = () => {
-        if (tagsInput.trim() && !currentTags.includes(tagsInput.trim())) {
-            const newTags = [...currentTags, tagsInput.trim()];
-            onUpdateTags(folder.name, newTags.join(', '));
-            setTagsInput('');
+    const importPlanSummary = useMemo(() => {
+        const selectedFiles = importFiles.filter((file) => selectedImportFiles.has(file.fileName));
+        const total = selectedFiles.reduce((acc, file) => acc + Math.max(0, Number(file.totalRows || 0)), 0);
+        const assigned = selectedFiles.reduce((acc, file) => acc + Math.max(0, Number(file.alreadyImportedCount ?? 0)), 0);
+        const unassigned = total - assigned;
+        return {
+            total,
+            assigned,
+            unassigned,
+            parseErrorCount: selectedFiles.filter((file) => Boolean(file.parseError)).length
+        };
+    }, [importFiles, selectedImportFiles]);
+
+    const refreshImportFiles = async () => {
+        setLoadingImportFiles(true);
+        try {
+            const files = await Storage.listVlmImportJsonFiles();
+            setImportFiles(files);
+            setSelectedImportFiles((prev) => {
+                const next = new Set<string>();
+                files.forEach((file) => {
+                    if (prev.has(file.fileName)) next.add(file.fileName);
+                });
+                return next;
+            });
+        } finally {
+            setLoadingImportFiles(false);
         }
     };
 
-    const handleRemoveTag = (tagToRemove: string) => {
-        const newTags = currentTags.filter((t: string) => t !== tagToRemove);
-        onUpdateTags(folder.name, newTags.join(', '));
+    useEffect(() => {
+        refreshImportFiles();
+    }, []);
+
+    const refreshExportFiles = async () => {
+        setLoadingExportFiles(true);
+        try {
+            const files = await Storage.listVlmExportJsonFiles();
+            setExportFiles(files);
+            setSelectedExportFiles((prev) => {
+                const next = new Set<string>();
+                files.forEach((file) => {
+                    if (prev.has(file.sourceFile)) next.add(file.sourceFile);
+                });
+                return next;
+            });
+        } finally {
+            setLoadingExportFiles(false);
+        }
     };
 
-    const percent = Math.round((folder.completed / folder.count) * 100) || 0;
-    const currentGroup = groups[folder.name]?.group || '';
+    useEffect(() => {
+        refreshExportFiles();
+    }, []);
 
-    // Get unique groups for dropdown
-    const allGroups = Array.from(new Set(Object.values(groups).map((g: any) => g.group))).sort() as string[];
+    const handleDryRun = async () => {
+        setLoadingDryRun(true);
+        try {
+            const result = await Storage.getVlmMigrationDryRun(100, 0);
+            setDryRun(result);
+        } finally {
+            setLoadingDryRun(false);
+        }
+    };
 
-    const handleGroupChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        const val = e.target.value;
-        if (val === '__NEW_GROUP__') {
-            const newGroup = prompt("Enter new group name:");
-            if (newGroup) onUpdateGroup(folder.name, newGroup);
-        } else {
-            onUpdateGroup(folder.name, val); // Empty string unassigns
+    const handleCommit = async () => {
+        const ok = window.confirm('VLM 데이터를 1회 이관할까요? 이미 이관된 항목은 안정 ID 기준으로 upsert 됩니다.');
+        if (!ok) return;
+        setLoadingCommit(true);
+        try {
+            const result = await Storage.migrateVlmData({ commit: true, limit: 100000, offset: 0 });
+            setLastCommitResult(result);
+            onRefreshTasks();
+            alert('VLM 이관이 완료되었습니다.');
+        } catch (_e) {
+            alert('VLM 이관에 실패했습니다. 콘솔/서버 로그를 확인해주세요.');
+        } finally {
+            setLoadingCommit(false);
+        }
+    };
+
+    const runJsonImport = async (commit: boolean) => {
+        const sourceFiles = Array.from(selectedImportFiles);
+        if (sourceFiles.length === 0) {
+            alert('import할 json 파일을 선택해주세요.');
+            return;
+        }
+        const payload = { sourceFiles, commit };
+        setLoadingCommit(true);
+        try {
+            const result = await Storage.importVlmJsonData(payload);
+            if (commit) {
+                setImportCommitResult(result);
+                onRefreshTasks();
+                await refreshImportFiles();
+                onRefreshOverview?.();
+                alert('VLM JSON import가 완료되었습니다.');
+            } else {
+                setImportDryRunResult(result);
+            }
+        } catch (e: any) {
+            const msg = e?.message || (commit ? 'VLM JSON import에 실패했습니다.' : 'VLM JSON dry-run에 실패했습니다.');
+            alert(commit ? `VLM JSON import 실패: ${msg}` : `VLM JSON dry-run 실패: ${msg}`);
+        } finally {
+            setLoadingCommit(false);
+        }
+    };
+
+    const runJsonExport = async () => {
+        const sourceFiles = Array.from(selectedExportFiles);
+        if (sourceFiles.length === 0) {
+            alert('export할 source file을 선택해주세요.');
+            return;
+        }
+        setLoadingCommit(true);
+        setExportProgress({
+            inProgress: true,
+            done: 0,
+            total: sourceFiles.length,
+            percent: 0,
+            currentFile: sourceFiles[0] || ''
+        });
+        try {
+            const mergedSavedFiles: Array<{ sourceFile: string; outputPath: string; count: number }> = [];
+            for (let i = 0; i < sourceFiles.length; i += 1) {
+                const sourceFile = sourceFiles[i];
+                setExportProgress({
+                    inProgress: true,
+                    done: i,
+                    total: sourceFiles.length,
+                    percent: Math.round((i / Math.max(sourceFiles.length, 1)) * 100),
+                    currentFile: sourceFile
+                });
+                const partial = await Storage.exportVlmJsonData({
+                    sourceFiles: [sourceFile],
+                    onlySubmitted: exportOnlySubmitted,
+                    includeResult: exportIncludeResult
+                });
+                if (Array.isArray(partial?.savedFiles)) {
+                    mergedSavedFiles.push(...partial.savedFiles);
+                }
+                setExportProgress({
+                    inProgress: true,
+                    done: i + 1,
+                    total: sourceFiles.length,
+                    percent: Math.round(((i + 1) / Math.max(sourceFiles.length, 1)) * 100),
+                    currentFile: sourceFile
+                });
+            }
+            setExportResult({
+                success: true,
+                onlySubmitted: exportOnlySubmitted,
+                savedFiles: mergedSavedFiles
+            });
+            alert('VLM JSON export가 완료되었습니다. datasets/vlm_export 폴더를 확인해주세요.');
+            await refreshExportFiles();
+        } catch (_e) {
+            alert('VLM JSON export에 실패했습니다.');
+        } finally {
+            setExportProgress((prev) => ({
+                ...prev,
+                inProgress: false
+            }));
+            setLoadingCommit(false);
         }
     };
 
     return (
-        <tr className={`group hover:bg-slate-800/40 transition-colors border-b border-slate-800/50 last:border-0 ${isSelected ? 'bg-sky-900/10' : ''}`}>
-            {/* Checkbox */}
-            <td className="py-4 pl-4 align-middle w-10">
-                <input
-                    type="checkbox"
-                    checked={isSelected}
-                    onChange={() => onToggleSelect(folder.name)}
-                    className="w-4 h-4 rounded border-slate-600 bg-slate-700 text-sky-500 focus:ring-offset-slate-900 focus:ring-1 focus:ring-sky-500 transition-colors cursor-pointer"
-                />
-            </td>
-
-            {/* Folder Name & Count */}
-            <td className="py-4 pl-2 align-middle">
-                <div className="flex flex-col">
+        <div className="h-full overflow-auto p-6 space-y-6">
+            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                <h2 className="text-lg font-bold text-white mb-2 flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-violet-500/10 flex items-center justify-center border border-violet-500/20">
+                        <svg className="w-4 h-4 text-violet-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                    </div>
+                    VLM Migration
+                </h2>
+                <p className="text-sm text-slate-400 ml-11 mb-4">VLM(tasks.db) 데이터를 Data Studio 공통 스키마로 1회 이관합니다.</p>
+                <div className="flex gap-3 ml-11">
                     <button
-                        onClick={() => onSelectFolder(folder.name)}
-                        className="font-medium text-base text-slate-200 hover:text-sky-400 hover:underline text-left transition-colors truncate max-w-[240px]"
-                        title={folder.name}
+                        onClick={handleDryRun}
+                        disabled={loadingDryRun || loadingCommit}
+                        className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 text-sm font-semibold shadow-inner border border-white/5 disabled:opacity-50 transition-all"
                     >
-                        {folder.name}
+                        {loadingDryRun ? 'Dry-run 실행 중...' : 'Dry-run'}
                     </button>
-                    <span className="text-xs text-slate-500 font-medium mt-0.5">{folder.count.toLocaleString()} tasks</span>
-                </div>
-            </td>
-
-            {/* Group Selector */}
-            <td className="py-4 align-middle">
-                <div className="relative group/select">
-                    <select
-                        className="w-full bg-transparent text-xs text-slate-400 border border-slate-700/50 hover:border-slate-600 rounded px-2 py-1.5 outline-none focus:border-sky-500 transition-colors appearance-none cursor-pointer"
-                        value={currentGroup}
-                        onChange={handleGroupChange}
+                    <button
+                        onClick={handleCommit}
+                        disabled={loadingDryRun || loadingCommit}
+                        className="px-4 py-2 rounded-xl bg-violet-600/80 hover:bg-violet-500/80 border border-violet-500/30 text-white text-sm font-bold shadow-[0_0_15px_rgba(139,92,246,0.2)] transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:hover:translate-y-0"
                     >
-                        <option value="">(No Group)</option>
-                        {allGroups.map((g) => (
-                            <option key={g} value={g}>{g}</option>
-                        ))}
-                        <option value="__NEW_GROUP__" className="text-sky-400 font-bold">+ New Group...</option>
-                    </select>
-                    {/* Custom Arrow for better look */}
-                    <div className="absolute right-2 top-1/2 -translate-y-1/2 pointer-events-none text-slate-600 group-hover/select:text-slate-400">
-                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-                    </div>
+                        {loadingCommit ? '이관 중...' : '이관 실행'}
+                    </button>
                 </div>
-            </td>
+            </div>
 
-            {/* Tags Input */}
-            <td className="py-4 align-middle">
-                <div className="flex flex-col gap-1.5 w-full max-w-[200px]">
-                    <div className="flex flex-wrap gap-1">
-                        {currentTags.map((tag: string, idx: number) => (
-                            <span key={`${tag}-${idx}`} className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
-                                {tag}
-                                <button onClick={() => handleRemoveTag(tag)} className="ml-1 hover:text-sky-200 outline-none">×</button>
-                            </span>
-                        ))}
-                    </div>
-                    <input
-                        type="text"
-                        value={tagsInput}
-                        onChange={(e) => setTagsInput(e.target.value)}
-                        onKeyDown={(e) => e.key === 'Enter' && handleAddTag()}
-                        className="w-full bg-transparent text-xs text-slate-400 placeholder-slate-600 border-none p-0 focus:ring-0 hover:text-slate-200 transition-colors"
-                        placeholder="+ Add tag..."
-                    />
-                </div>
-            </td>
-
-            {/* Progress Bar */}
-            <td className="py-4 pr-6 align-middle">
-                <div className="w-full flex flex-col gap-1.5">
-                    <div className="flex justify-between items-end text-xs">
-                        <span className={`font-bold text-sm ${percent === 100 ? 'text-lime-400' : 'text-slate-300'}`}>{percent}%</span>
-                        <span className="text-xs text-slate-500">Done: {folder.completed} / {folder.count}</span>
-                    </div>
-                    <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                        <div
-                            className={`h-full transition-all duration-500 ease-out ${percent === 100 ? 'bg-lime-500' : 'bg-sky-600'}`}
-                            style={{ width: `${percent}%` }}
-                        ></div>
-                    </div>
-                </div>
-            </td>
-
-            {/* Stats (Approved/Rejected) - Unifying visuals */}
-            <td className="py-4 text-center align-middle">
-                <div className="flex items-center justify-center gap-2">
-                    <div className="flex flex-col items-center min-w-[32px]">
-                        <span className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">OK</span>
-                        <span className="text-xs font-bold text-lime-400 bg-lime-400/10 px-1.5 py-0.5 rounded border border-lime-400/20 w-full text-center">{folder.approved}</span>
-                    </div>
-                    <div className="w-px h-6 bg-slate-800"></div>
-                    <div className="flex flex-col items-center min-w-[32px]">
-                        <span className="text-[10px] text-slate-500 uppercase tracking-wider mb-0.5">NG</span>
-                        <span className="text-xs font-bold text-red-400 bg-red-400/10 px-1.5 py-0.5 rounded border border-red-400/20 w-full text-center">{folder.rejected}</span>
-                    </div>
-                </div>
-            </td>
-
-            {/* Worker Display (Static) */}
-            <td className="py-4 align-middle pr-6">
-                <div className="flex justify-start">
-                    {folder.assignedWorker ? (
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-sky-500/10 border border-sky-500/30 text-sky-400 text-xs font-bold shadow-sm">
-                            <div className="w-2 h-2 rounded-full bg-sky-500 animate-pulse"></div>
-                            {folder.assignedWorker}
+            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)] space-y-4">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                    <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-xl bg-emerald-500/10 flex items-center justify-center border border-emerald-500/20">
+                            <svg className="w-4 h-4 text-emerald-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" /></svg>
                         </div>
-                    ) : (
-                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-slate-800 border border-slate-700 text-slate-500 text-xs font-medium">
-                            <div className="w-2 h-2 rounded-full bg-slate-600"></div>
-                            Unassigned
+                        <div>
+                            <h3 className="text-sm font-bold text-slate-200">VLM JSON Import</h3>
+                            <p className="text-xs text-slate-400 mt-0.5">`datasets` 또는 `datasets/vlm_import`의 json을 가져옵니다.</p>
                         </div>
-                    )}
+                    </div>
+                    <button
+                        onClick={refreshImportFiles}
+                        disabled={loadingImportFiles || loadingCommit}
+                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/5 text-slate-200 text-xs font-semibold disabled:opacity-50 shadow-inner transition-colors"
+                    >
+                        {loadingImportFiles ? '목록 갱신 중...' : '파일 목록 갱신'}
+                    </button>
                 </div>
-            </td>
-        </tr>
+
+                <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
+                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3">
+                        <div className="text-xs font-bold text-slate-300 mb-2">JSON 파일 선택</div>
+                        <div className="max-h-56 overflow-auto space-y-1">
+                            {importFiles.map((file) => (
+                                <label key={file.fileName} className="flex items-center gap-2 text-xs text-slate-200">
+                                    <input
+                                        type="checkbox"
+                                        checked={selectedImportFiles.has(file.fileName)}
+                                        onChange={(e) => {
+                                            setSelectedImportFiles((prev) => {
+                                                const next = new Set(prev);
+                                                if (e.target.checked) next.add(file.fileName);
+                                                else next.delete(file.fileName);
+                                                return next;
+                                            });
+                                        }}
+                                        className="rounded border-slate-600 bg-slate-900 text-cyan-500"
+                                    />
+                                    <span className="truncate">{file.fileName}</span>
+                                    <span className="ml-auto text-[10px] text-slate-400">
+                                        {Number(file.totalRows || 0)} rows
+                                        {(file.alreadyImportedCount ?? 0) > 0 && (
+                                            <span className="ml-1 text-emerald-400/90">배분 완료 {file.alreadyImportedCount}/{file.totalRows}</span>
+                                        )}
+                                    </span>
+                                    {file.parseError && <span className="text-[10px] text-rose-300">오류</span>}
+                                </label>
+                            ))}
+                            {importFiles.length === 0 && <div className="text-xs text-slate-500 italic">json 파일이 없습니다.</div>}
+                        </div>
+                    </div>
+                    <div className="bg-slate-900/60 border border-slate-700 rounded-lg p-3 space-y-3">
+                        <p className="text-xs text-slate-400">
+                            JSON을 DB로 이관만 합니다. 이관 후 <strong className="text-slate-300">매핑·프로젝트 탭</strong>에서 폴더 단위로 배정/배정취소하세요.
+                        </p>
+                        <div className="flex gap-2">
+                            <button
+                                onClick={() => runJsonImport(false)}
+                                disabled={loadingCommit}
+                                className="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-100 text-xs font-semibold disabled:opacity-50"
+                            >
+                                Dry-run
+                            </button>
+                            <button
+                                onClick={() => runJsonImport(true)}
+                                disabled={loadingCommit}
+                                className="px-3 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold disabled:opacity-50"
+                            >
+                                {loadingCommit ? '처리 중...' : 'Import 실행'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                    <div className="bg-slate-950/50 border border-white/5 shadow-inner rounded-xl px-4 py-3">
+                        <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Total</div>
+                        <div className="text-xl font-black text-white">{importPlanSummary.total.toLocaleString()}</div>
+                    </div>
+                    <div className="bg-slate-950/50 border border-white/5 shadow-inner rounded-xl px-4 py-3">
+                        <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Assigned</div>
+                        <div className="text-xl font-black text-cyan-400">{importPlanSummary.assigned.toLocaleString()}</div>
+                    </div>
+                    <div className="bg-slate-950/50 border border-white/5 shadow-inner rounded-xl px-4 py-3">
+                        <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">Unassigned</div>
+                        <div className="text-xl font-black text-amber-400">{importPlanSummary.unassigned.toLocaleString()}</div>
+                    </div>
+                    <div className="bg-slate-950/50 border border-white/5 shadow-inner rounded-xl px-4 py-3">
+                        <div className="text-[10px] text-slate-500 font-bold uppercase tracking-wider mb-1">File Errors</div>
+                        <div className={`text-xl font-black ${importPlanSummary.parseErrorCount > 0 ? 'text-rose-400' : 'text-lime-400'}`}>
+                            {importPlanSummary.parseErrorCount}
+                        </div>
+                    </div>
+                </div>
+                {importPlanSummary.parseErrorCount > 0 && (
+                    <div className="text-xs text-rose-200 bg-rose-900/20 border border-rose-700/40 rounded-xl p-4 shadow-inner">
+                        선택한 파일 중 JSON 파싱 오류가 있습니다. 오류 파일은 import 시 실패합니다.
+                    </div>
+                )}
+
+                {importDryRunResult && (
+                    <div className="text-xs text-slate-300 bg-slate-950/50 border border-white/5 rounded-xl p-4 shadow-inner">
+                        Dry-run: total <span className="font-bold text-white">{importDryRunResult.total}</span>, assigned <span className="font-bold text-cyan-400">{importDryRunResult.assignedCount}</span>, unassigned <span className="font-bold text-amber-400">{importDryRunResult.unassignedCount}</span>, missingImages <span className="font-bold text-rose-400">{importDryRunResult.missingImages}</span>
+                    </div>
+                )}
+                {importCommitResult && (
+                    <div className="text-xs text-emerald-200 bg-emerald-900/20 border border-emerald-500/30 rounded-xl p-4 shadow-[0_0_15px_rgba(16,185,129,0.1)]">
+                        이관 완료: <span className="font-bold text-white">{importCommitResult.total}</span>건 DB 반영. 매핑·프로젝트 탭에서 폴더 단위로 배정하세요.
+                    </div>
+                )}
+            </div>
+
+            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)] space-y-4">
+                <div className="flex items-center justify-between gap-3 mb-2">
+                    <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 rounded-xl bg-sky-500/10 flex items-center justify-center border border-sky-500/20">
+                            <svg className="w-4 h-4 text-sky-400" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" /></svg>
+                        </div>
+                        <div>
+                            <h3 className="text-sm font-bold text-slate-200">VLM JSON Export</h3>
+                            <p className="text-xs text-slate-400 mt-0.5">원본 형태 JSON으로 `datasets/vlm_export`에 저장합니다.</p>
+                        </div>
+                    </div>
+                    <button
+                        onClick={refreshExportFiles}
+                        disabled={loadingExportFiles || loadingCommit}
+                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-white/5 text-slate-200 text-xs font-semibold disabled:opacity-50 shadow-inner transition-colors"
+                    >
+                        {loadingExportFiles ? '목록 갱신 중...' : 'Export 목록 갱신'}
+                    </button>
+                </div>
+
+                <div className="bg-slate-900/60 border border-slate-700 rounded-xl p-4 shadow-inner">
+                    <div className="max-h-40 overflow-auto space-y-2">
+                        {exportFiles.map((file) => (
+                            <label key={file.sourceFile} className="flex items-center gap-3 text-sm text-slate-200 hover:bg-slate-800/40 p-1.5 rounded-lg transition-colors cursor-pointer">
+                                <input
+                                    type="checkbox"
+                                    checked={selectedExportFiles.has(file.sourceFile)}
+                                    onChange={(e) => {
+                                        setSelectedExportFiles((prev) => {
+                                            const next = new Set(prev);
+                                            if (e.target.checked) next.add(file.sourceFile);
+                                            else next.delete(file.sourceFile);
+                                            return next;
+                                        });
+                                    }}
+                                    className="rounded border-slate-600 bg-slate-900 text-sky-500"
+                                />
+                                <span className="font-medium truncate">{file.sourceFile}</span>
+                                <span className="ml-auto text-xs text-slate-400 bg-slate-950 px-2 py-1 rounded-md border border-white/5">all <span className="text-white font-bold">{file.totalTasks}</span> / submitted <span className="text-emerald-400 font-bold">{file.submittedTasks}</span></span>
+                            </label>
+                        ))}
+                        {exportFiles.length === 0 && <div className="text-xs text-slate-500 italic py-4 text-center">export 가능한 source file이 없습니다.</div>}
+                    </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-4 bg-slate-950/30 p-4 rounded-xl border border-white/5">
+                    <label className="inline-flex items-center gap-2 text-sm text-slate-300 cursor-pointer hover:text-white transition-colors">
+                        <input
+                            type="checkbox"
+                            checked={exportOnlySubmitted}
+                            onChange={(e) => setExportOnlySubmitted(e.target.checked)}
+                            className="rounded border-slate-600 bg-slate-900 text-sky-500"
+                        />
+                        제출 완료(SUBMITTED/APPROVED)만 export
+                    </label>
+                    <label className="inline-flex items-center gap-2 text-sm text-slate-300 cursor-pointer hover:text-white transition-colors">
+                        <input
+                            type="checkbox"
+                            checked={exportIncludeResult}
+                            onChange={(e) => setExportIncludeResult(e.target.checked)}
+                            className="rounded border-slate-600 bg-slate-900 text-sky-500"
+                        />
+                        result 필드 끼워넣기
+                    </label>
+                    <div className="flex-1" />
+                    <button
+                        onClick={runJsonExport}
+                        disabled={loadingCommit}
+                        className="px-6 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 border border-sky-500/30 text-white text-sm font-bold shadow-[0_0_15px_rgba(14,165,233,0.3)] transition-all hover:-translate-y-0.5 disabled:opacity-50 disabled:hover:translate-y-0"
+                    >
+                        {loadingCommit ? '처리 중...' : 'Export 실행'}
+                    </button>
+                </div>
+
+                {exportProgress.inProgress && (
+                    <div className="bg-slate-900/60 border border-slate-700/50 rounded-xl p-4 shadow-inner">
+                        <div className="flex items-center justify-between text-xs font-bold text-slate-300 mb-2.5">
+                            <span>Export 진행 중: <span className="text-sky-300 font-mono">{exportProgress.currentFile || '-'}</span></span>
+                            <span className="bg-slate-950 px-2 py-1 rounded-md border border-white/5">{exportProgress.done}/{exportProgress.total} <span className="text-sky-400 ml-1">({exportProgress.percent}%)</span></span>
+                        </div>
+                        <div className="w-full h-2.5 bg-slate-950 rounded-full overflow-hidden border border-white/5 shadow-inner">
+                            <div
+                                className="h-full bg-gradient-to-r from-sky-500 to-cyan-400 shadow-[0_0_10px_rgba(56,189,248,0.5)] transition-all duration-300"
+                                style={{ width: `${exportProgress.percent}%` }}
+                            />
+                        </div>
+                    </div>
+                )}
+
+                {exportResult && (
+                    <div className="text-xs font-mono text-emerald-200 bg-emerald-900/20 border border-emerald-500/30 rounded-xl p-4 shadow-inner space-y-1">
+                        {exportResult.savedFiles.map((row) => (
+                            <div key={row.outputPath} className="flex items-center justify-between hover:bg-emerald-900/30 p-1 rounded transition-colors">
+                                <span>{row.sourceFile} <span className="text-emerald-500 mx-1">→</span> {row.outputPath}</span>
+                                <span className="bg-emerald-950/50 px-1.5 py-0.5 rounded border border-emerald-500/20">{row.count} rows</span>
+                            </div>
+                        ))}
+                    </div>
+                )}
+            </div>
+
+            {dryRun && (
+                <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
+                    <h3 className="text-sm font-bold text-slate-200 mb-2">Dry-run 결과</h3>
+                    <div className="text-xs text-slate-400 mb-3">
+                        total: <span className="text-slate-200 font-semibold">{dryRun.total}</span>, sample: <span className="text-slate-200 font-semibold">{dryRun.sampleCount}</span>
+                    </div>
+                    <div className="overflow-auto">
+                        <table className="w-full text-left text-xs">
+                            <thead className="text-slate-500 uppercase">
+                                <tr>
+                                    <th className="px-2 py-2">taskId</th>
+                                    <th className="px-2 py-2">folder</th>
+                                    <th className="px-2 py-2">status</th>
+                                    <th className="px-2 py-2">worker</th>
+                                </tr>
+                            </thead>
+                            <tbody className="divide-y divide-slate-800">
+                                {dryRun.sample.map((row) => (
+                                    <tr key={row.taskId}>
+                                        <td className="px-2 py-2 text-slate-300">{row.taskId}</td>
+                                        <td className="px-2 py-2 text-slate-300">{row.mappedFolder}</td>
+                                        <td className="px-2 py-2 text-sky-300">{row.mappedStatus}</td>
+                                        <td className="px-2 py-2 text-slate-300">{row.assignedWorker || '-'}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            )}
+
+            {lastCommitResult && (
+                <div className="bg-emerald-900/20 border border-emerald-700/40 rounded-xl p-4 text-sm text-emerald-200">
+                    processed: {lastCommitResult.processed}, insertedTasks: {lastCommitResult.insertedTasks}, estimatedLogs: {lastCommitResult.estimatedLogs}
+                </div>
+            )}
+        </div>
     );
 };
 
-const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, onRefresh, onSync, tasks, username, token, openIssueRequestsSignal }) => {
-    const [groups, setGroups] = useState<Record<string, { group: string }>>({});
-    const [sidebarCollapsedGroups, setSidebarCollapsedGroups] = useState<Set<string>>(new Set());
-    const [tempGroup, setTempGroup] = useState('');
-    const [workers, setWorkers] = useState<string[]>([]);
-    const [allFolderMeta, setAllFolderMeta] = useState<Record<string, FolderMetadata>>({});
+const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review') => void; onArchived?: () => void; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, workerNames = [], tasks, onSelectTask }) => {
+    const [days, setDays] = useState<number>(30);
+    const [loading, setLoading] = useState<boolean>(true);
+    const [refreshing, setRefreshing] = useState<boolean>(false);
+    const [archiving, setArchiving] = useState<boolean>(false);
+    const [folderWorkerFilter, setFolderWorkerFilter] = useState<string>('ALL');
+    const [detail, setDetail] = useState<Storage.ProjectDetailPayload | null>(null);
+    const [showVlmModal, setShowVlmModal] = useState<boolean>(false);
+    const [vlmAssignCount, setVlmAssignCount] = useState<string>('10');
+    const [vlmAssignWorker, setVlmAssignWorker] = useState<string>('');
+    const [vlmUnassignCount, setVlmUnassignCount] = useState<string>('10');
+    const [vlmUnassignWorker, setVlmUnassignWorker] = useState<string>('');
+    const [vlmAssigning, setVlmAssigning] = useState<boolean>(false);
+    const [vlmUnassigning, setVlmUnassigning] = useState<boolean>(false);
+
+    const fetchDetail = useCallback(async (force: boolean = false) => {
+        const cacheKey = `${projectId}::${days}`;
+        const cached = projectDetailCache.get(cacheKey);
+        const cacheValid = cached && (Date.now() - cached.fetchedAt) < PROJECT_DETAIL_CACHE_TTL_MS;
+        if (!force && cacheValid) {
+            setDetail(cached.payload || null);
+            setLoading(false);
+            return;
+        }
+        if (!force) setLoading(true);
+        try {
+            const payload = await Storage.getProjectDetail(projectId, days);
+            setDetail(payload);
+            projectDetailCache.set(cacheKey, { fetchedAt: Date.now(), payload: payload || null });
+        } finally {
+            setLoading(false);
+        }
+    }, [projectId, days]);
 
     useEffect(() => {
-        if (role === UserRole.REVIEWER) {
-            setAllFolderMeta(Storage.getAllFolderMetadata());
+        fetchDetail(false);
+    }, [fetchDetail]);
+
+    const handleRefreshDetail = async () => {
+        setRefreshing(true);
+        try {
+            await fetchDetail(true);
+        } finally {
+            setRefreshing(false);
         }
-    }, [role, tasks]);
-
-    const handleUpdateFolderTags = (folderName: string, tagsString: string) => {
-        // Ensure unique tags
-        const tags = Array.from(new Set(tagsString.split(',').map(t => t.trim()).filter(Boolean)));
-        const currentMeta = Storage.getFolderMetadata(folderName);
-        const newMeta = { ...currentMeta, tags };
-
-        Storage.saveFolderMetadata(folderName, newMeta);
-        setAllFolderMeta(prev => ({ ...prev, [folderName]: newMeta }));
     };
 
-    // Selection State for Bulk Actions
-    const [selectedFolders, setSelectedFolders] = useState<Set<string>>(new Set());
-
-    const toggleSelectFolder = (folderName: string) => {
-        const newSet = new Set(selectedFolders);
-        if (newSet.has(folderName)) {
-            newSet.delete(folderName);
-        } else {
-            newSet.add(folderName);
+    useEffect(() => {
+        const sameProjectKeys = Array.from(projectDetailCache.keys()).filter((key) => key.startsWith(`${projectId}::`));
+        if (sameProjectKeys.length === 0) {
+            return;
         }
-        setSelectedFolders(newSet);
-    };
-
-    const toggleSelectGroup = (groupFolders: any[]) => {
-        const newSet = new Set(selectedFolders);
-        const folderNames = groupFolders.map(f => f.name);
-        const allSelected = folderNames.every(name => newSet.has(name));
-
-        if (allSelected) {
-            folderNames.forEach(name => newSet.delete(name));
-        } else {
-            folderNames.forEach(name => newSet.add(name));
-        }
-        setSelectedFolders(newSet);
-    };
-
-    const handleBulkUpdateGroup = async (newGroup: string) => {
-        if (!newGroup) return;
-        const groupName = newGroup === '__NEW_GROUP__' ? prompt("Enter new group name:") : newGroup;
-        if (!groupName) return;
-
-        for (const folderName of Array.from(selectedFolders)) {
-            await handleUpdateGroupMain(folderName, groupName);
-        }
-        setSelectedFolders(new Set()); // Deselect after action
-    };
-
-    const handleBulkUpdateTags = (tagToAdd: string) => {
-        if (!tagToAdd.trim()) return;
-
-        Array.from(selectedFolders).forEach(folderName => {
-            const currentMeta = Storage.getFolderMetadata(folderName);
-            if (!currentMeta.tags.includes(tagToAdd)) {
-                const newTags = [...currentMeta.tags, tagToAdd];
-                handleUpdateFolderTags(folderName, newTags.join(', '));
+        // Keep cache size bounded per project by dropping very old entries on days/project switches.
+        const now = Date.now();
+        sameProjectKeys.forEach((key) => {
+            const row = projectDetailCache.get(key);
+            if (!row) return;
+            if (now - row.fetchedAt > PROJECT_DETAIL_CACHE_TTL_MS * 3) {
+                projectDetailCache.delete(key);
             }
         });
-        setSelectedFolders(new Set());
-    };
+    }, [projectId, days]);
 
-    const handleBulkAssignWorker = async (worker: string) => {
-        for (const folderName of Array.from(selectedFolders)) {
-            await handleAssignWorker(folderName, worker);
+    const project = detail?.project;
+    const trends = detail?.trends || [];
+    const workers = detail?.workers || [];
+    const folders = detail?.folders || [];
+    const folderWorkerOptions = useMemo(() => {
+        const names = Array.from(new Set(folders.map((row) => String(row.assignedWorker || 'Unassigned').trim() || 'Unassigned')));
+        return names.sort((a, b) => a.localeCompare(b));
+    }, [folders]);
+    const filteredFolders = useMemo(() => {
+        if (folderWorkerFilter === 'ALL') return folders;
+        return folders.filter((row) => (String(row.assignedWorker || 'Unassigned').trim() || 'Unassigned') === folderWorkerFilter);
+    }, [folders, folderWorkerFilter]);
+    const isArchived = Boolean(detail?.isArchived || project?.status === 'ARCHIVED');
+
+    useEffect(() => {
+        if (folderWorkerFilter === 'ALL') return;
+        if (!folderWorkerOptions.includes(folderWorkerFilter)) {
+            setFolderWorkerFilter('ALL');
         }
-        setSelectedFolders(new Set());
+    }, [folderWorkerFilter, folderWorkerOptions]);
+
+    const handleArchiveProject = async () => {
+        if (!project?.id || !detail) return;
+        if (isArchived) {
+            alert('이미 아카이브된 프로젝트입니다.');
+            return;
+        }
+        const ok = window.confirm('이 프로젝트를 아카이브할까요?\n데이터셋 파일은 건드리지 않고, 현재 기록/통계 스냅샷만 저장합니다.');
+        if (!ok) return;
+        setArchiving(true);
+        try {
+            await Storage.archiveProject({ projectId: project.id, snapshot: detail });
+            Array.from(projectDetailCache.keys()).forEach((key) => {
+                if (key.startsWith(`${project.id}::`)) {
+                    projectDetailCache.delete(key);
+                }
+            });
+            alert('프로젝트 아카이브가 완료되었습니다.');
+            onArchived?.();
+            onBack();
+        } catch (_e) {
+            alert('프로젝트 아카이브에 실패했습니다.');
+        } finally {
+            setArchiving(false);
+        }
     };
 
+    return (
+        <div className="flex flex-col h-full bg-slate-900">
+            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                    <button
+                        onClick={onBack}
+                        className="px-3 py-1.5 rounded-lg border border-slate-700 text-slate-300 hover:text-white hover:bg-slate-800 text-xs font-bold"
+                    >
+                        ← 프로젝트 목록
+                    </button>
+                    <div>
+                        <div className="flex items-center gap-2">
+                            <h2 className="text-xl font-bold text-white">{project?.name || '프로젝트 상세'}</h2>
+                            {project?.workflowSourceType && (
+                                <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border ${project.workflowSourceType === 'vlm-review' ? 'bg-violet-900/30 text-violet-200 border-violet-700/50' : 'bg-sky-900/30 text-sky-200 border-sky-700/50'}`}>
+                                    {project.workflowSourceType === 'vlm-review' ? 'VLM Workflow' : 'YOLO Workflow'}
+                                </span>
+                            )}
+                            {isArchived && (
+                                <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded border bg-amber-900/30 text-amber-200 border-amber-700/50">
+                                    Archived
+                                </span>
+                            )}
+                        </div>
+                        <p className="text-slate-400 text-sm mt-1">프로젝트 단위 작업/배분/추이 현황</p>
+                    </div>
+                </div>
+                <div className="flex items-center gap-2">
+                    <select
+                        value={folderWorkerFilter}
+                        onChange={(e) => setFolderWorkerFilter(e.target.value)}
+                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none focus:border-cyan-500"
+                        title="폴더 진행 현황 작업자 필터"
+                    >
+                        <option value="ALL">전체 작업자</option>
+                        {folderWorkerOptions.map((name) => (
+                            <option key={name} value={name}>{name}</option>
+                        ))}
+                    </select>
+                    <select
+                        value={String(days)}
+                        onChange={(e) => setDays(Number(e.target.value))}
+                        disabled={isArchived}
+                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none focus:border-sky-500 disabled:opacity-60"
+                    >
+                        <option value="7">최근 7일</option>
+                        <option value="30">최근 30일</option>
+                        <option value="90">최근 90일</option>
+                    </select>
+                    <button
+                        onClick={handleRefreshDetail}
+                        disabled={loading || refreshing || archiving}
+                        className="px-3 py-2 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-white text-xs font-bold disabled:opacity-50"
+                        title="캐시를 무시하고 최신 통계를 다시 불러옵니다."
+                    >
+                        {refreshing ? '새로고침 중...' : '지표 새로고침'}
+                    </button>
+                    <button
+                        onClick={handleArchiveProject}
+                        disabled={archiving || isArchived || loading || refreshing}
+                        className="px-3 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 text-white text-xs font-bold disabled:opacity-50"
+                    >
+                        {isArchived ? '아카이브 완료' : (archiving ? '아카이브 중...' : '아카이브')}
+                    </button>
+                </div>
+            </div>
+
+            <div className="flex-1 overflow-auto p-6 space-y-6">
+                {loading && !detail && (
+                    <div className="text-sm text-sky-300 bg-sky-900/20 border border-sky-700/40 rounded-lg px-4 py-3">
+                        프로젝트 상세 로딩 중...
+                    </div>
+                )}
+
+                {!loading && project && (
+                    <>
+                        <div className="grid grid-cols-1 md:grid-cols-5 gap-5 mb-8">
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-cyan-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></div> 목표량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 to-sky-500 relative z-10 tracking-tight">{Number(project.targetTotal || 0).toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-sky-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-sky-500/10 rounded-full blur-2xl group-hover:bg-sky-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]"></div> 배분량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-sky-300 to-blue-500 relative z-10 tracking-tight">{Number(project.allocated || 0).toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-lime-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-lime-500/10 rounded-full blur-2xl group-hover:bg-lime-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-lime-400 shadow-[0_0_8px_rgba(163,230,53,0.8)]"></div> 완료량
+                                </div>
+                                <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-lime-300 to-green-500 relative z-10 tracking-tight">{Number(project.completed || 0).toLocaleString()}</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-violet-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> 진행률
+                                </div>
+                                <div className="text-3xl font-heading font-black text-white relative z-10 tracking-tight">{Number(project.progress || 0)}%</div>
+                            </div>
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-amber-500/30 transition-colors">
+                                <div className="absolute -right-4 -top-4 w-24 h-24 bg-amber-500/10 rounded-full blur-2xl group-hover:bg-amber-500/20 transition-colors" />
+                                <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                    <div className="w-1.5 h-1.5 rounded-full bg-amber-400 shadow-[0_0_8px_rgba(245,158,11,0.8)]"></div> 폴더 수
+                                </div>
+                                <div className="text-3xl font-heading font-black text-amber-300 relative z-10 tracking-tight">{Number(project.folderCount || 0)}</div>
+                            </div>
+                        </div>
+
+                        <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
+                            <h3 className="text-sm font-bold text-slate-200 mb-3">기간별 추이 (Submissions / Work Time)</h3>
+                            <div className="h-[300px]">
+                                <ResponsiveContainer width="100%" height="100%">
+                                    <ComposedChart data={trends} margin={{ top: 8, right: 20, left: 0, bottom: 8 }}>
+                                        <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
+                                        <XAxis dataKey="date" stroke="#94a3b8" tick={{ fontSize: 11 }} />
+                                        <YAxis yAxisId="left" stroke="#34d399" tick={{ fontSize: 11 }} allowDecimals={false} />
+                                        <YAxis yAxisId="right" orientation="right" stroke="#38bdf8" tick={{ fontSize: 11 }} />
+                                        <Tooltip
+                                            contentStyle={{ backgroundColor: '#0f172a', border: '1px solid #334155', borderRadius: 8 }}
+                                            formatter={(value: any, name: string) => {
+                                                if (name === 'submissions' || name === 'submitted') return [`${value}`, 'Submissions'];
+                                                return [`${value}h`, 'Work Time'];
+                                            }}
+                                        />
+                                        <Legend wrapperStyle={{ fontSize: 12 }} />
+                                        <Bar yAxisId="left" dataKey="submissions" name="submissions" fill="#10b981" radius={[4, 4, 0, 0]} />
+                                        <Line yAxisId="right" type="monotone" dataKey="workTimeHours" name="workTime" stroke="#0ea5e9" strokeWidth={2.5} dot={{ r: 2 }} />
+                                    </ComposedChart>
+                                </ResponsiveContainer>
+                            </div>
+                        </div>
+
+                        {project.workflowSourceType === 'vlm-review' && !isArchived && (
+                            <div>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowVlmModal(true)}
+                                    className="px-4 py-2 rounded-lg bg-violet-600 hover:bg-violet-500 text-white text-sm font-bold transition-colors"
+                                >
+                                    VLM 배분
+                                </button>
+                            </div>
+                        )}
+
+                        {showVlmModal && project.workflowSourceType === 'vlm-review' && (
+                            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60" onClick={() => setShowVlmModal(false)}>
+                                <div className="bg-slate-900 border border-violet-700/50 rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+                                    <div className="px-6 py-4 border-b border-slate-700 flex items-center justify-between">
+                                        <h3 className="text-base font-bold text-violet-200">VLM 배분 (수량 단위 배정·배정 해제)</h3>
+                                        <button type="button" onClick={() => setShowVlmModal(false)} className="text-slate-400 hover:text-white p-1 rounded">✕</button>
+                                    </div>
+                                    <div className="p-6 overflow-auto space-y-5">
+                                        <p className="text-xs text-slate-400">이 프로젝트는 원본 JSON 1개에 대응됩니다. 미배정 풀에서 N건을 배정하거나, 작업자에게 배정된 N건을 해제할 수 있습니다.</p>
+
+                                        <div className="flex flex-wrap items-end gap-4">
+                                            <div className="flex items-center gap-2">
+                                                <label className="text-xs text-slate-400">배정 수량</label>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    value={vlmAssignCount}
+                                                    onChange={(e) => setVlmAssignCount(e.target.value)}
+                                                    className="w-20 bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs text-slate-200 font-mono"
+                                                />
+                                                <label className="text-xs text-slate-400">작업자</label>
+                                                <select
+                                                    value={vlmAssignWorker}
+                                                    onChange={(e) => setVlmAssignWorker(e.target.value)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-slate-200"
+                                                >
+                                                    <option value="">선택</option>
+                                                    {workerNames.filter((w) => w && String(w).trim() !== 'Unassigned').map((name) => (
+                                                        <option key={name} value={name}>{name}</option>
+                                                    ))}
+                                                </select>
+                                                <button
+                                                    disabled={vlmAssigning || !vlmAssignWorker || Number(vlmAssignCount) < 1}
+                                                    onClick={async () => {
+                                                        const count = Math.max(1, Math.floor(Number(vlmAssignCount) || 0));
+                                                        setVlmAssigning(true);
+                                                        try {
+                                                            const result = await Storage.assignVlmTasks({ workerName: vlmAssignWorker, count, projectId });
+                                                            alert(`${result.assigned}건 배정되었습니다.`);
+                                                            await handleRefreshDetail();
+                                                        } catch (e: any) {
+                                                            alert(e?.message || '배정 실패');
+                                                        } finally {
+                                                            setVlmAssigning(false);
+                                                        }
+                                                    }}
+                                                    className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold disabled:opacity-50"
+                                                >
+                                                    {vlmAssigning ? '처리 중...' : 'N건 배정'}
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <div className="text-xs font-bold text-slate-300 mb-2">배정 해제 (작업자 기준)</div>
+                                            <div className="flex flex-wrap items-end gap-4">
+                                                <label className="text-xs text-slate-400">해제 수량</label>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    value={vlmUnassignCount}
+                                                    onChange={(e) => setVlmUnassignCount(e.target.value)}
+                                                    className="w-20 bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs text-slate-200 font-mono"
+                                                />
+                                                <label className="text-xs text-slate-400">작업자</label>
+                                                <select
+                                                    value={vlmUnassignWorker}
+                                                    onChange={(e) => setVlmUnassignWorker(e.target.value)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-slate-200"
+                                                >
+                                                    <option value="">선택</option>
+                                                    {workers.filter((w) => w.userId && String(w.userId).trim() !== 'Unassigned' && Number(w.allocated || 0) > 0).map((w) => (
+                                                        <option key={w.userId} value={w.userId}>{w.userId} ({Number(w.allocated || 0)}건)</option>
+                                                    ))}
+                                                </select>
+                                                <button
+                                                    disabled={vlmUnassigning || !vlmUnassignWorker || Number(vlmUnassignCount) < 1}
+                                                    onClick={async () => {
+                                                        const count = Math.max(1, Math.floor(Number(vlmUnassignCount) || 0));
+                                                        setVlmUnassigning(true);
+                                                        try {
+                                                            const result = await Storage.unassignVlmTasks({ workerName: vlmUnassignWorker, count, projectId });
+                                                            alert(`${result.unassigned}건 배정 해제되었습니다.`);
+                                                            await handleRefreshDetail();
+                                                        } catch (e: any) {
+                                                            alert(e?.message || '배정 해제 실패');
+                                                        } finally {
+                                                            setVlmUnassigning(false);
+                                                        }
+                                                    }}
+                                                    className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold disabled:opacity-50"
+                                                >
+                                                    {vlmUnassigning ? '처리 중...' : 'N건 배정 해제'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="grid gap-4 grid-cols-1 xl:grid-cols-2">
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                                <div className="px-6 py-4 border-b border-white/5 bg-slate-900/60 text-sm font-bold text-slate-200">
+                                    {project.workflowSourceType === 'vlm-review' ? '작업자별 진행 현황' : '작업자 배분 현황'}
+                                </div>
+                                <div className="overflow-auto">
+                                    <table className="w-full text-left">
+                                        <thead className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/5">
+                                            <tr>
+                                                <th className="px-6 py-4">작업자</th>
+                                                <th className="px-6 py-4">배분량</th>
+                                                <th className="px-6 py-4">완료량</th>
+                                                <th className="px-6 py-4 text-right">진행률</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-white/5">
+                                            {workers.filter(row => !['unassigned', 'admin'].includes(String(row.userId).toLowerCase())).map((row) => (
+                                                <tr key={row.userId} className="hover:bg-slate-800/40 transition-colors group">
+                                                    <td className="px-6 py-4">
+                                                        <button
+                                                            onClick={() => {
+                                                                if (project.workflowSourceType === 'vlm-review') {
+                                                                    const projectFolderNames = folders.map(f => f.folder);
+                                                                    if (projectFolderNames.length === 0 && project.vlmSourceFile) {
+                                                                        projectFolderNames.push(project.vlmSourceFile);
+                                                                    }
+
+                                                                    const targetTasks = tasks.filter(t => projectFolderNames.includes(t.folder) && t.assignedWorker === row.userId);
+
+                                                                    if (targetTasks.length > 0) {
+                                                                        const isReviewer = role === UserRole.REVIEWER;
+                                                                        const incompleteTask = isReviewer
+                                                                            ? (targetTasks.find(t => t.status === TaskStatus.SUBMITTED) || targetTasks.find(t => t.status === TaskStatus.APPROVED) || targetTasks[0])
+                                                                            : (targetTasks.find(t => t.status !== TaskStatus.APPROVED && t.status !== TaskStatus.SUBMITTED) || targetTasks[0]);
+                                                                        onSelectTask(incompleteTask.id);
+                                                                    } else {
+                                                                        alert(`해당 작업자(${row.userId})에게 할당된 작업을 찾을 수 없습니다.`);
+                                                                    }
+                                                                }
+                                                            }}
+                                                            className={`flex items-center gap-3 w-full text-left group-hover:bg-slate-800/60 p-1 -m-1 rounded-lg transition-all ${project.workflowSourceType === 'vlm-review' ? 'cursor-pointer hover:ring-1 hover:ring-sky-500/50' : 'cursor-default'}`}
+                                                            title={project.workflowSourceType === 'vlm-review' ? `${row.userId}의 VLM 폴더로 이동` : undefined}
+                                                        >
+                                                            <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-[10px] font-bold text-slate-400 border border-white/5 group-hover:bg-sky-600/20 group-hover:text-sky-300 group-hover:border-sky-500/50 transition-all shadow-inner">
+                                                                {row.userId?.substring(0, 1)?.toUpperCase() || '?'}
+                                                            </div>
+                                                            <span className="font-semibold text-slate-200 group-hover:text-white transition-colors capitalize">{row.userId}</span>
+                                                        </button>
+                                                    </td>
+                                                    <td className="px-6 py-4 text-slate-300 font-mono text-sm">{Number(row.allocated || 0).toLocaleString()}</td>
+                                                    <td className="px-6 py-4 text-slate-300 font-mono text-sm">{Number(row.completed || 0).toLocaleString()}</td>
+                                                    <td className="px-6 py-4 text-right">
+                                                        <span className="bg-emerald-500/10 text-emerald-400 px-2 py-1 rounded-lg border border-emerald-500/20 text-xs font-bold font-mono">
+                                                            {Number(row.progress || 0)}%
+                                                        </span>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                            {workers.filter(row => !['unassigned', 'admin'].includes(String(row.userId).toLowerCase())).length === 0 && (
+                                                <tr>
+                                                    <td colSpan={4} className="px-4 py-10 text-center text-slate-500 italic">작업자 데이터가 없습니다.</td>
+                                                </tr>
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+
+                            <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
+                                <div className="px-6 py-4 border-b border-white/5 bg-slate-900/60 text-sm font-bold text-slate-200">폴더 진행 현황</div>
+                                <div className="overflow-auto">
+                                    <table className="w-full text-left">
+                                        <thead className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/5">
+                                            <tr>
+                                                <th className="px-6 py-4">폴더</th>
+                                                <th className="px-6 py-4">작업자</th>
+                                                <th className="px-6 py-4">완료 / 전체</th>
+                                                <th className="px-6 py-4">진행률</th>
+                                                <th className="px-6 py-4">검수 진행</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-white/5">
+                                            {(() => {
+                                                const groups = groupByTopLevel(filteredFolders, (r) => r.folder);
+                                                if (filteredFolders.length === 0) {
+                                                    return (
+                                                        <tr>
+                                                            <td colSpan={5} className="px-6 py-10 text-center text-slate-500 italic">
+                                                                {folders.length > 0 ? '선택한 작업자에 해당하는 폴더가 없습니다.' : '폴더 데이터가 없습니다.'}
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                }
+                                                return groups.flatMap(({ groupName, items }) => [
+                                                    <tr key={`group-${groupName}`} className="bg-slate-700/70 border-t border-b border-cyan-500/30">
+                                                        <td colSpan={5} className="px-6 py-3 text-base font-bold text-cyan-200 border-l-4 border-cyan-500 bg-slate-800/90">
+                                                            {groupName}
+                                                        </td>
+                                                    </tr>,
+                                                    ...items.map((row) => {
+                                                        const progress = Number(row.taskCount || 0) > 0
+                                                            ? Math.round((Number(row.completedCount || 0) / Number(row.taskCount || 1)) * 100)
+                                                            : 0;
+                                                        const submittedCount = Number(row.submittedCount || 0);
+                                                        const approvedCount = Number(row.approvedCount || 0);
+                                                        const rejectedCount = Number(row.rejectedCount || 0);
+                                                        const reviewTarget = submittedCount + approvedCount + rejectedCount;
+                                                        const reviewDone = approvedCount + rejectedCount;
+                                                        const reviewProgress = reviewTarget > 0
+                                                            ? Math.round((reviewDone / reviewTarget) * 100)
+                                                            : 0;
+                                                        return (
+                                                            <tr key={row.folder} className="hover:bg-slate-800/40 transition-colors group">
+                                                                <td className="px-6 py-4">
+                                                                    <button
+                                                                        onClick={() => onOpenFolder(row.folder, project?.workflowSourceType)}
+                                                                        className="text-slate-200 font-bold text-sm hover:text-cyan-300 hover:underline underline-offset-4 transition-all tracking-tight"
+                                                                        title={`${row.folder} 열기`}
+                                                                    >
+                                                                        {row.folder}
+                                                                    </button>
+                                                                </td>
+                                                                <td className="px-6 py-4">
+                                                                    <span className="text-slate-300 text-sm">{row.assignedWorker || 'Unassigned'}</span>
+                                                                </td>
+                                                                <td className="px-6 py-4">
+                                                                    <div className="flex items-baseline gap-1">
+                                                                        <span className="text-slate-200 font-bold font-mono text-sm">{Number(row.completedCount || 0).toLocaleString()}</span>
+                                                                        <span className="text-slate-500 font-mono text-xs">/ {Number(row.taskCount || 0).toLocaleString()}</span>
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-6 py-4">
+                                                                    <div className="flex items-center gap-3 min-w-[100px]">
+                                                                        <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                                            <div className="h-full bg-cyan-500 shadow-[0_0_8px_rgba(34,211,238,0.4)]" style={{ width: `${progress}%` }} />
+                                                                        </div>
+                                                                        <span className="text-cyan-400 font-mono text-xs font-bold">{progress}%</span>
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-6 py-4">
+                                                                    {reviewTarget > 0 ? (
+                                                                        <div className="flex flex-col gap-1.5 min-w-[140px]">
+                                                                            <div className="flex justify-between items-center text-[10px] font-bold">
+                                                                                <span className="text-slate-400">Review</span>
+                                                                                <span className="text-violet-400">{reviewProgress}%</span>
+                                                                            </div>
+                                                                            <div className="h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner relative">
+                                                                                <div className="absolute inset-y-0 left-0 bg-violet-500 shadow-[0_0_8px_rgba(139,92,246,0.4)]" style={{ width: `${reviewProgress}%` }} />
+                                                                            </div>
+                                                                            <div className="flex gap-2 text-[9px] font-black uppercase tracking-tighter opacity-70 group-hover:opacity-100 transition-opacity">
+                                                                                <span className="text-lime-400">OK {approvedCount}</span>
+                                                                                <span className="text-rose-400">RE {rejectedCount}</span>
+                                                                                <span className="text-amber-400">WAIT {submittedCount}</span>
+                                                                            </div>
+                                                                        </div>
+                                                                    ) : (
+                                                                        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest italic">No Review</span>
+                                                                    )}
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    })
+                                                ]);
+                                            })()}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    </>
+                )}
+            </div>
+        </div >
+    );
+};
+
+const NoticeHomeView: React.FC<{ notice: string; onStart: () => void }> = ({ notice, onStart }) => {
+    return (
+        <div className="h-full overflow-y-auto flex justify-center items-start p-10 bg-slate-950/20 font-sans">
+            <div className="max-w-6xl w-full bg-slate-900/60 backdrop-blur-3xl border border-white/10 rounded-[2.5rem] p-12 shadow-[0_20px_50px_rgba(0,0,0,0.5)] flex flex-col items-center text-center relative overflow-hidden group h-fit my-auto">
+                {/* Decorative Elements */}
+                <div className="absolute -top-24 -left-24 w-64 h-64 bg-cyan-500/10 rounded-full blur-[80px] group-hover:bg-cyan-500/20 transition-colors duration-700" />
+                <div className="absolute -bottom-24 -right-24 w-64 h-64 bg-amber-500/5 rounded-full blur-[80px] group-hover:bg-amber-500/10 transition-colors duration-700" />
+
+                {/* Header */}
+                <div className="w-20 h-20 rounded-3xl bg-cyan-500/10 flex items-center justify-center border border-cyan-500/20 mb-8 shadow-[0_0_20px_rgba(34,211,238,0.1)] relative z-10">
+                    <svg className="w-10 h-10 text-cyan-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z" />
+                    </svg>
+                </div>
+
+                <h1 className="text-3xl font-black text-white mb-3 tracking-tighter relative z-10">공지사항 (Notice)</h1>
+                <p className="text-slate-400 text-base mb-8 font-medium relative z-10">작업 시작 전 지침 사항을 반드시 숙지해 주시기 바랍니다.</p>
+
+                <div className="w-full h-px bg-gradient-to-r from-transparent via-white/10 to-transparent mb-10 relative z-10" />
+
+                {/* Content */}
+                <div className="w-full bg-slate-950/40 border border-white/5 rounded-3xl p-10 mb-12 text-left relative z-10 min-h-[300px]">
+                    <div
+                        className="text-[1.1rem] text-slate-200 whitespace-pre-wrap leading-[1.8] font-medium prose prose-invert max-w-none"
+                        dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(notice || '<span class="text-slate-500 italic">게시된 공지사항이 없습니다.</span>') }}
+                    />
+                </div>
+
+                {/* Action */}
+                <button
+                    onClick={onStart}
+                    className="group/btn relative px-12 py-5 bg-cyan-600 hover:bg-cyan-500 text-white rounded-2xl text-xl font-bold transition-all duration-300 shadow-[0_10px_30px_rgba(8,145,178,0.3)] hover:shadow-[0_15px_40px_rgba(8,145,178,0.5)] hover:-translate-y-1 relative z-10 overflow-hidden"
+                >
+                    <span className="relative z-10 flex items-center gap-3">
+                        작업 시작하기 (Go to Work List)
+                        <svg className="w-6 h-6 group-hover/btn:translate-x-1 transition-transform" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7l5 5m0 0l-5 5m5-5H6" />
+                        </svg>
+                    </span>
+                    <div className="absolute inset-x-0 bottom-0 h-1 bg-white/20 group-hover/btn:h-full transition-all duration-300" />
+                </button>
+            </div>
+        </div>
+    );
+};
+
+const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, onRefresh, onSync, onLightRefresh, tasks, username, token, openIssueRequestsSignal, openUserManagementSignal }) => {
+    const [workers, setWorkers] = useState<string[]>([]);
+    const [workerProjectOverview, setWorkerProjectOverview] = useState<Storage.ProjectOverviewPayload | null>(null);
+
+    useEffect(() => {
+        const fetchProjectOverview = async () => {
+            try {
+                const payload = await Storage.getProjectOverview();
+                setWorkerProjectOverview(payload || null);
+            } catch (_e) {
+                setWorkerProjectOverview(null);
+            }
+        };
+        fetchProjectOverview();
+    }, [accountType, tasks.length]);
+
+    const hiddenWorkerProjectIds = useMemo(() => {
+        if (accountType === AccountType.ADMIN || !workerProjectOverview) return new Set<string>();
+        const hidden = new Set<string>();
+        (workerProjectOverview.projects || []).forEach((project) => {
+            if (project.status === 'ARCHIVED' || project.visibleToWorkers === false) {
+                hidden.add(String(project.id));
+            }
+        });
+        return hidden;
+    }, [accountType, workerProjectOverview]);
+
+    const isWorkerVisibleFolder = (folderName: string): boolean => {
+        if (accountType === AccountType.ADMIN || !workerProjectOverview) return true;
+        const projectId = workerProjectOverview.projectMap?.[folderName]?.projectId;
+        if (!projectId) return true;
+        return !hiddenWorkerProjectIds.has(String(projectId));
+    };
 
     const visibleTasks = useMemo(() => {
         if (role === UserRole.WORKER) {
-            return tasks.filter(t => t.assignedWorker === username && t.status !== TaskStatus.APPROVED);
+            return tasks.filter((t) => t.assignedWorker === username && t.status !== TaskStatus.APPROVED && isWorkerVisibleFolder(t.folder));
         } else {
             return [...tasks].sort((a, b) => {
                 if (a.status === TaskStatus.SUBMITTED && b.status !== TaskStatus.SUBMITTED) return -1;
@@ -1834,7 +3858,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                 return 0;
             });
         }
-    }, [role, tasks, username]);
+    }, [role, tasks, username, accountType, workerProjectOverview, hiddenWorkerProjectIds]);
 
     const folderOverviews = useMemo(() => {
         const map = new Map<string, {
@@ -1850,7 +3874,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             lastUpdated?: number;
         }>();
 
-        tasks.forEach(t => {
+        const sourceTasks = role === UserRole.WORKER ? visibleTasks : tasks;
+        sourceTasks.forEach(t => {
             if (!map.has(t.folder)) {
                 map.set(t.folder, {
                     name: t.folder,
@@ -1882,55 +3907,14 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         });
 
         return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-    }, [tasks]);
+    }, [role, tasks, visibleTasks]);
 
-    const groupedSidebarFolders = useMemo(() => {
-        let foldersToShow = folderOverviews;
-        if (role === UserRole.WORKER) {
-            foldersToShow = folderOverviews.filter(f => f.assignedWorker === username);
-        }
-
-        const result: Record<string, any[]> = {};
-        const uncategorized: any[] = [];
-
-        foldersToShow.forEach(f => {
-            const groupName = groups[f.name]?.group;
-            if (groupName) {
-                if (!result[groupName]) result[groupName] = [];
-                result[groupName].push(f);
-            } else {
-                uncategorized.push(f);
-            }
-        });
-
-        // Sort groups
-        const sortedGroups = Object.keys(result).sort().reduce((acc, key) => {
-            acc[key] = result[key].sort((a, b) => a.name.localeCompare(b.name));
-            return acc;
-        }, {} as Record<string, any[]>);
-
-        return { groups: sortedGroups, uncategorized: uncategorized.sort((a, b) => a.name.localeCompare(b.name)) };
-    }, [folderOverviews, role, username, groups]);
-
-    // Initialize collapsed groups with all groups by default
-    const [collapsedTableGroups, setCollapsedTableGroups] = useState<Set<string>>(new Set());
-
-    useEffect(() => {
-        if (groupedSidebarFolders?.groups) {
-            setCollapsedTableGroups(new Set(Object.keys(groupedSidebarFolders.groups)));
-        }
-    }, [groupedSidebarFolders?.groups]);
-
-    const toggleTableGroup = (groupName: string) => {
-        const newSet = new Set(collapsedTableGroups);
-        if (newSet.has(groupName)) {
-            newSet.delete(groupName);
-        } else {
-            newSet.add(groupName);
-        }
-        setCollapsedTableGroups(newSet);
-    };
-
+    const assignedWorkListFolders = useMemo(() => {
+        return folderOverviews
+            .filter((f) => String(f.assignedWorker || '').trim() === String(username || '').trim())
+            .filter((f) => isWorkerVisibleFolder(f.name))
+            .sort((a, b) => a.name.localeCompare(b.name));
+    }, [folderOverviews, username, accountType, workerProjectOverview, hiddenWorkerProjectIds]);
 
     useEffect(() => {
         const fetchWorkers = async () => {
@@ -1965,62 +3949,110 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         fetchTodayStats();
     }, []); // Run once on mount
 
+    const statsSourceTasks = role === UserRole.WORKER ? visibleTasks : tasks;
     const globalStats = {
-        total: tasks.length,
-        completed: tasks.filter(t => t.status === TaskStatus.SUBMITTED || t.status === TaskStatus.APPROVED).length,
-        totalAnnotations: tasks.reduce((acc, t) => acc + (t.annotations || []).length, 0),
+        total: statsSourceTasks.length,
+        completed: statsSourceTasks.filter(t => t.status === TaskStatus.SUBMITTED || t.status === TaskStatus.APPROVED).length,
+        totalAnnotations: statsSourceTasks.reduce((acc, t) => acc + (t.annotations || []).length, 0),
         totalTime: todayWorkTime
     };
 
 
 
-    const [selectedFolder, setSelectedFolder] = useState<string>('');
+    const [selectedFolder, setSelectedFolder] = useState<string>(role === UserRole.WORKER ? NOTICE_HOME_VIEW : '');
     const [folderMeta, setFolderMeta] = useState<FolderMetadata>({ tags: [], memo: '' });
     const [isEditingMeta, setIsEditingMeta] = useState(false);
     const [tempMeta, setTempMeta] = useState<FolderMetadata>({ tags: [], memo: '' });
     const [newTagInput, setNewTagInput] = useState('');
     const [isExporting, setIsExporting] = useState(false);
     const [isSyncing, setIsSyncing] = useState(false);
+    const [isLightRefreshing, setIsLightRefreshing] = useState(false);
     const [convertedFolders] = useState<Set<string>>(new Set());
 
     const [loading, setLoading] = useState(false);
     const [noticeContent, setNoticeContent] = useState('');
     const [isEditingNotice, setIsEditingNotice] = useState(false);
     const [tempNotice, setTempNotice] = useState('');
+    const quillRef = useRef<any>(null);
 
-    const fetchGroups = async () => {
-        try {
-            const res = await fetch('/api/groups', {
-                headers: token ? { 'Authorization': `Bearer ${token}` } : {}
-            });
-            if (res.ok) {
-                const data = await res.json();
-                setGroups(data);
+    const imageHandler = useCallback(() => {
+        const input = document.createElement('input');
+        input.setAttribute('type', 'file');
+        input.setAttribute('accept', 'image/*');
+        input.click();
+
+        input.onchange = async () => {
+            if (input.files && input.files[0]) {
+                const file = input.files[0];
+                const reader = new FileReader();
+                reader.onload = async () => {
+                    const base64Content = reader.result as string;
+                    try {
+                        const response = await fetch('/api/upload-image', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                fileName: file.name,
+                                content: base64Content
+                            })
+                        });
+                        const data = await response.json();
+                        if (data.success) {
+                            const quill = quillRef.current.getEditor();
+                            const range = quill.getSelection();
+                            quill.insertEmbed(range.index, 'image', data.url);
+                        }
+                    } catch (e) {
+                        console.error("Image upload failed", e);
+                        alert("이미지 업로드에 실패했습니다.");
+                    }
+                };
+                reader.readAsDataURL(file);
             }
-        } catch (err) {
-            console.error("Failed to fetch groups", err);
+        };
+    }, []);
+
+    const quillModules = useMemo(() => ({
+        toolbar: {
+            container: [
+                ['bold', 'italic', 'underline', 'strike'],
+                [{ 'color': [] }, { 'background': [] }],
+                [{ 'list': 'ordered' }, { 'list': 'bullet' }],
+                ['link', 'image'],
+                ['clean']
+            ],
+            handlers: {
+                image: imageHandler
+            }
         }
-    };
+    }), [imageHandler]);
+
+    const [folderReturnView, setFolderReturnView] = useState<string>('');
+    const [activeProjectWorkflowSourceType, setActiveProjectWorkflowSourceType] = useState<'' | 'native-yolo' | 'vlm-review'>('');
+    const [overviewRefreshKey, setOverviewRefreshKey] = useState(0);
+    const isProjectDetailView = selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX);
+    const selectedProjectId = isProjectDetailView ? selectedFolder.substring(PROJECT_DETAIL_VIEW_PREFIX.length) : '';
 
     useEffect(() => {
-        fetchGroups();
-    }, [token]);
-
-    const handleUpdateGroupMain = async (folder: string, groupName: string) => {
-        try {
-            await fetch('/api/groups', {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    ...(token ? { 'Authorization': `Bearer ${token}` } : {})
-                },
-                body: JSON.stringify({ folder, groupName })
-            });
-            fetchGroups(); // Refresh groups after update
-        } catch (e) {
-            console.error("Failed to update group", e);
+        if (accountType === AccountType.ADMIN) return;
+        if (!selectedFolder) return;
+        const nonFolderViews = new Set([
+            DASHBOARD_HOME_VIEW,
+            WORK_LIST_VIEW,
+            USER_MANAGEMENT_VIEW,
+            WORKER_REPORT_VIEW,
+            WEEKLY_REPORT_VIEW,
+            DAILY_REPORT_VIEW,
+            SCHEDULE_VIEW,
+            ISSUE_REQUEST_VIEW,
+            PROJECT_OVERVIEW_VIEW,
+            VLM_MIGRATION_VIEW
+        ]);
+        if (nonFolderViews.has(selectedFolder) || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX)) return;
+        if (!isWorkerVisibleFolder(selectedFolder)) {
+            setSelectedFolder(WORK_LIST_VIEW);
         }
-    };
+    }, [accountType, selectedFolder, workerProjectOverview, hiddenWorkerProjectIds]);
 
     useEffect(() => {
         const fetchNotice = async () => {
@@ -2057,14 +4089,34 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
     useEffect(() => {
         if (!selectedFolder) {
-            if (role === UserRole.REVIEWER) {
-                setSelectedFolder(ALL_FOLDERS_VIEW);
-            } else {
-                const firstFolder = groupedSidebarFolders.uncategorized[0] || Object.values(groupedSidebarFolders.groups)[0]?.[0];
-                if (firstFolder) setSelectedFolder(firstFolder.name);
-            }
+            setSelectedFolder(accountType === AccountType.ADMIN ? PROJECT_OVERVIEW_VIEW : DASHBOARD_HOME_VIEW);
         }
-    }, [role, groupedSidebarFolders, selectedFolder]);
+    }, [accountType, selectedFolder]);
+
+    useEffect(() => {
+        if (accountType === AccountType.ADMIN && (selectedFolder === DASHBOARD_HOME_VIEW || selectedFolder === WORK_LIST_VIEW)) {
+            setSelectedFolder(PROJECT_OVERVIEW_VIEW);
+        }
+    }, [accountType, selectedFolder]);
+
+    useEffect(() => {
+        const nonFolderViews = new Set([
+            DASHBOARD_HOME_VIEW,
+            WORK_LIST_VIEW,
+            VLM_MIGRATION_VIEW,
+            PROJECT_OVERVIEW_VIEW,
+            USER_MANAGEMENT_VIEW,
+            WORKER_REPORT_VIEW,
+            WEEKLY_REPORT_VIEW,
+            DAILY_REPORT_VIEW,
+            SCHEDULE_VIEW,
+            ISSUE_REQUEST_VIEW
+        ]);
+        if (selectedFolder && (nonFolderViews.has(selectedFolder) || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX))) {
+            setFolderReturnView('');
+            setActiveProjectWorkflowSourceType('');
+        }
+    }, [selectedFolder]);
 
     useEffect(() => {
         if (accountType === AccountType.ADMIN && openIssueRequestsSignal) {
@@ -2072,11 +4124,20 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         }
     }, [accountType, openIssueRequestsSignal]);
 
+    useEffect(() => {
+        if (accountType === AccountType.ADMIN && openUserManagementSignal) {
+            setSelectedFolder(USER_MANAGEMENT_VIEW);
+        }
+    }, [accountType, openUserManagementSignal]);
+
 
     useEffect(() => {
         const handleFolderEntry = async () => {
             const nonFolderViews = new Set([
-                ALL_FOLDERS_VIEW,
+                DASHBOARD_HOME_VIEW,
+                WORK_LIST_VIEW,
+                VLM_MIGRATION_VIEW,
+                PROJECT_OVERVIEW_VIEW,
                 USER_MANAGEMENT_VIEW,
                 WORKER_REPORT_VIEW,
                 WEEKLY_REPORT_VIEW,
@@ -2084,29 +4145,19 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                 SCHEDULE_VIEW,
                 ISSUE_REQUEST_VIEW
             ]);
-            if (selectedFolder && !nonFolderViews.has(selectedFolder)) {
+            if (selectedFolder && !nonFolderViews.has(selectedFolder) && !selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX)) {
                 const meta = Storage.getFolderMetadata(selectedFolder);
                 setFolderMeta(meta);
                 setTempMeta(meta);
-
-                // Sync group
-                const currentGroup = groups[selectedFolder]?.group || '';
-                setTempGroup(currentGroup);
 
                 setIsEditingMeta(false);
             }
         };
         handleFolderEntry();
-    }, [selectedFolder, groups]);
+    }, [selectedFolder]);
 
     const handleSaveMeta = async () => {
         Storage.saveFolderMetadata(selectedFolder, tempMeta);
-
-        // Save group
-        const currentGroup = groups[selectedFolder]?.group || '';
-        if (tempGroup !== currentGroup) {
-            await handleUpdateGroupMain(selectedFolder, tempGroup);
-        }
 
         setFolderMeta(tempMeta);
         setIsEditingMeta(false);
@@ -2130,19 +4181,28 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     };
 
     const tasksInFolder = useMemo(() => {
-        if (!selectedFolder || selectedFolder === ALL_FOLDERS_VIEW) return [];
-        const list = visibleTasks.filter(t => t.folder === selectedFolder);
-        // Always keep task list ordering consistent with in-task navigation.
-        return list.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-    }, [visibleTasks, selectedFolder]);
+        if (!selectedFolder) return [];
+
+        const useProjectWorkflowFilter = Boolean(folderReturnView && activeProjectWorkflowSourceType);
+        const allInFolder = visibleTasks.filter((t) => t.folder === selectedFolder);
+        if (!useProjectWorkflowFilter) {
+            return allInFolder.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+        }
+        const filtered = allInFolder.filter((t) => {
+            const sourceType = t.sourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo';
+            return sourceType === activeProjectWorkflowSourceType;
+        });
+        const effective = filtered.length > 0 ? filtered : allInFolder;
+        return effective.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+    }, [visibleTasks, selectedFolder, activeProjectWorkflowSourceType, folderReturnView, workerProjectOverview]);
 
     const activeFolderStats = useMemo(() => {
-        if (!selectedFolder || selectedFolder === ALL_FOLDERS_VIEW) return null;
+        if (!selectedFolder) return null;
         return folderOverviews.find(f => f.name === selectedFolder);
-    }, [folderOverviews, selectedFolder]);
+    }, [folderOverviews, selectedFolder, tasksInFolder]);
 
     const activeFolderDetails = useMemo(() => {
-        if (!selectedFolder || selectedFolder === ALL_FOLDERS_VIEW) return null;
+        if (!selectedFolder) return null;
         const allInFolder = tasks.filter(t => t.folder === selectedFolder);
         const modifiedCount = allInFolder.filter(t => t.isModified).length;
         const uniqueClasses = new Set<number>();
@@ -2156,6 +4216,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
     const displayLimit = 10;
     const renderedTasks = tasksInFolder.slice(0, displayLimit);
+    const representativeTask = tasksInFolder.length > 0 ? tasksInFolder[0] : null;
 
     const formatTime = (seconds: number) => {
         const h = Math.floor(seconds / 3600);
@@ -2174,6 +4235,19 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             alert("Sync failed");
         } finally {
             setIsSyncing(false);
+        }
+    };
+
+    const handleLightRefresh = async () => {
+        if (!onLightRefresh) return;
+        setIsLightRefreshing(true);
+        try {
+            await onLightRefresh();
+        } catch (e) {
+            console.error(e);
+            alert("Refresh failed");
+        } finally {
+            setIsLightRefreshing(false);
         }
     };
 
@@ -2215,162 +4289,162 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                 </div>
 
                 <div className="flex gap-3">
-                    <button
-                        onClick={handleSync}
-                        disabled={isSyncing}
-                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
-                    >
-                        {isSyncing ? (
-                            <svg className="animate-spin h-4 w-4 text-sky-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                            </svg>
-                        ) : (
-                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-                        )}
-                        {isSyncing ? 'Syncing...' : 'Sync Data'}
-                    </button>
+                    {accountType === AccountType.ADMIN && (
+                        <>
+                            <button
+                                onClick={handleLightRefresh}
+                                disabled={isLightRefreshing || isSyncing}
+                                className="bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-700/50 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
+                                title="파일 스캔 없이 DB 기준으로 진행 현황만 새로고침"
+                            >
+                                {isLightRefreshing ? (
+                                    <svg className="animate-spin h-4 w-4 text-emerald-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                ) : (
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 4a1 1 0 011-1h4a1 1 0 010 2H5v3a1 1 0 11-2 0V4zm18 0a1 1 0 00-1-1h-4a1 1 0 100 2h3v3a1 1 0 102 0V4zM3 20a1 1 0 001 1h4a1 1 0 100-2H5v-3a1 1 0 10-2 0v4zm18 0a1 1 0 01-1 1h-4a1 1 0 110-2h3v-3a1 1 0 112 0v4z" /></svg>
+                                )}
+                                {isLightRefreshing ? 'Refreshing...' : 'Refresh Metrics'}
+                            </button>
+                            <button
+                                onClick={handleSync}
+                                disabled={isSyncing || isLightRefreshing}
+                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
+                                title="datasets 폴더 스캔 후 DB 갱신 및 목록 새로고침"
+                            >
+                                {isSyncing ? (
+                                    <svg className="animate-spin h-4 w-4 text-sky-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                    </svg>
+                                ) : (
+                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                                )}
+                                {isSyncing ? 'Syncing...' : 'Sync Data'}
+                            </button>
+                        </>
+                    )}
+                    {accountType !== AccountType.ADMIN && onLightRefresh && (
+                        <button
+                            onClick={handleLightRefresh}
+                            disabled={isLightRefreshing}
+                            className="bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-700/50 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
+                            title="DB에 반영된 목록만 새로고침 (폴더 스캔 없음)"
+                        >
+                            {isLightRefreshing ? (
+                                <svg className="animate-spin h-4 w-4 text-sky-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                                </svg>
+                            ) : (
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
+                            )}
+                            {isLightRefreshing ? '새로고침 중...' : '목록 새로고침'}
+                        </button>
+                    )}
                 </div>
             </div>
 
             {/* --- Main Workspace --- */}
             <div className="flex-1 flex gap-6 overflow-hidden">
 
-                {/* Left Sidebar: Folder List */}
-                <div className="w-[340px] flex-shrink-0 flex flex-col bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden">
+                {/* Left Sidebar: Navigation */}
+                <div className="w-[280px] flex-shrink-0 flex flex-col bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden">
                     <div className="p-4 border-b border-slate-800 bg-slate-800/30">
-                        <h3 className="font-bold text-slate-300 text-sm uppercase tracking-wide">Folders</h3>
+                        <h3 className="font-bold text-slate-300 text-sm uppercase tracking-wide">Dashboard</h3>
                     </div>
                     <div className="flex-1 overflow-y-auto p-3 space-y-1">
-                        {role === UserRole.REVIEWER && (
+                        {accountType !== AccountType.ADMIN && (
                             <>
                                 <button
-                                    onClick={() => setSelectedFolder(ALL_FOLDERS_VIEW)}
-                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-1 ${selectedFolder === ALL_FOLDERS_VIEW
-                                        ? 'bg-purple-900/30 text-purple-200 border border-purple-700/50 shadow-sm'
+                                    onClick={() => setSelectedFolder(NOTICE_HOME_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === NOTICE_HOME_VIEW
+                                        ? 'bg-amber-900/30 text-amber-200 border border-amber-700/50 shadow-sm'
                                         : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
                                         }`}
                                 >
-                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
-                                    Overview Dashboard
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5.882V19.24a1.76 1.76 0 01-3.417.592l-2.147-6.15M18 13a3 3 0 100-6M5.436 13.683A4.001 4.001 0 017 6h1.832c4.1 0 7.625-1.234 9.168-3v14c-1.543-1.766-5.067-3-9.168-3H7a3.988 3.988 0 01-1.564-.317z" /></svg>
+                                    Notice
                                 </button>
-
-                                {accountType === AccountType.ADMIN && (
-                                    <>
-                                        <button
-                                            onClick={() => setSelectedFolder(USER_MANAGEMENT_VIEW)}
-                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-1 ${selectedFolder === USER_MANAGEMENT_VIEW
-                                                ? 'bg-orange-900/30 text-orange-200 border border-orange-700/50 shadow-sm'
-                                                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-                                                }`}
-                                        >
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" /></svg>
-                                            User Management
-                                        </button>
-
-                                        <button
-                                            onClick={() => setSelectedFolder(WORKER_REPORT_VIEW)}
-                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-3 ${(selectedFolder === WORKER_REPORT_VIEW || selectedFolder === WEEKLY_REPORT_VIEW || selectedFolder === DAILY_REPORT_VIEW)
-                                                ? 'bg-blue-900/30 text-blue-200 border border-blue-700/50 shadow-sm'
-                                                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-                                                }`}
-                                        >
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2a4 4 0 00-4-4H5m11 0h.01M16 21h4a2 2 0 002-2v-9a2 2 0 00-2-2H6a2 2 0 00-2 2v1h2m10-4V7a2 2 0 00-2-2H8a2 2 0 00-2 2v2m4 6h.01" /></svg>
-                                            Reports
-                                        </button>
-
-                                        <button
-                                            onClick={() => setSelectedFolder(SCHEDULE_VIEW)}
-                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-3 ${selectedFolder === SCHEDULE_VIEW
-                                                ? 'bg-violet-900/30 text-violet-200 border border-violet-700/50 shadow-sm'
-                                                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-                                                }`}
-                                        >
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
-                                            Schedule
-                                        </button>
-
-                                        <button
-                                            onClick={() => setSelectedFolder(ISSUE_REQUEST_VIEW)}
-                                            className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-3 ${selectedFolder === ISSUE_REQUEST_VIEW
-                                                ? 'bg-rose-900/30 text-rose-200 border border-rose-700/50 shadow-sm'
-                                                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
-                                                }`}
-                                        >
-                                            <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l6.518 11.593c.75 1.334-.213 2.998-1.742 2.998H3.48c-1.53 0-2.492-1.664-1.743-2.998L8.257 3.1z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01" /></svg>
-                                            Issue Requests
-                                        </button>
-                                    </>
-                                )}
+                                <button
+                                    onClick={() => setSelectedFolder(DASHBOARD_HOME_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === DASHBOARD_HOME_VIEW
+                                        ? 'bg-cyan-900/30 text-cyan-200 border border-cyan-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 12l9-9 9 9M4 10v10h16V10" /></svg>
+                                    Dashboard
+                                </button>
+                                <button
+                                    onClick={() => setSelectedFolder(WORK_LIST_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === WORK_LIST_VIEW
+                                        ? 'bg-sky-900/30 text-sky-200 border border-sky-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" /></svg>
+                                    Work List
+                                </button>
                             </>
                         )}
 
-                        <div className="space-y-4">
-                            {/* Groups */}
-                            {Object.entries(groupedSidebarFolders.groups).map(([groupName, folders]) => (
-                                <div key={groupName} className="space-y-1">
-                                    <button
-                                        onClick={() => {
-                                            const newSet = new Set(sidebarCollapsedGroups);
-                                            if (newSet.has(groupName)) newSet.delete(groupName);
-                                            else newSet.add(groupName);
-                                            setSidebarCollapsedGroups(newSet);
-                                        }}
-                                        className="w-full flex items-center gap-2 px-2 py-1 text-[10px] font-bold text-slate-500 uppercase tracking-widest hover:text-slate-300 transition-colors"
-                                    >
-                                        <svg className={`w-3 h-3 transition-transform ${sidebarCollapsedGroups.has(groupName) ? '-rotate-90' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-                                        {groupName}
-                                        <span className="ml-auto bg-slate-800 px-1.5 py-0.5 rounded text-[8px]">{folders.length}</span>
-                                    </button>
-                                    {!sidebarCollapsedGroups.has(groupName) && (
-                                        <div className="space-y-1 ml-2 border-l border-slate-800 pl-2">
-                                            {folders.map(folder => (
-                                                <button
-                                                    key={folder.name}
-                                                    onClick={() => setSelectedFolder(folder.name)}
-                                                    className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-sm transition-all group ${selectedFolder === folder.name
-                                                        ? 'bg-sky-900/20 text-sky-300 border border-sky-800/50 shadow-sm'
-                                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent'
-                                                        }`}
-                                                >
-                                                    <span className="truncate">{folder.name}</span>
-                                                    <span className="text-[10px] opacity-50">{folder.count}</span>
-                                                </button>
-                                            ))}
-                                        </div>
-                                    )}
-                                </div>
-                            ))}
-
-                            {/* Uncategorized */}
-                            {groupedSidebarFolders.uncategorized.length > 0 && (
-                                <div className="space-y-1">
-                                    {Object.keys(groupedSidebarFolders.groups).length > 0 && (
-                                        <div className="px-2 py-1 text-[10px] font-bold text-slate-600 uppercase tracking-widest">
-                                            Uncategorized
-                                        </div>
-                                    )}
-                                    {groupedSidebarFolders.uncategorized.map(folder => (
-                                        <button
-                                            key={folder.name}
-                                            onClick={() => setSelectedFolder(folder.name)}
-                                            className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-sm transition-all group ${selectedFolder === folder.name
-                                                ? 'bg-sky-900/20 text-sky-300 border border-sky-800/50 shadow-sm'
-                                                : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200 border border-transparent'
-                                                }`}
-                                        >
-                                            <span className="flex items-center gap-3 truncate">
-                                                <svg className={`w-4 h-4 ${selectedFolder === folder.name ? 'text-sky-500' : 'text-slate-600 group-hover:text-slate-400'}`} fill="currentColor" viewBox="0 0 20 20"><path d="M2 6a2 2 0 012-2h5l2 2h5a2 2 0 012 2v6a2 2 0 01-2 2H4a2 2 0 01-2-2V6z" /></svg>
-                                                <span className="truncate">{folder.name}</span>
-                                            </span>
-                                            <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded-md ${selectedFolder === folder.name ? 'bg-sky-900 text-sky-200' : 'bg-slate-800 text-slate-500'}`}>
-                                                {folder.count}
-                                            </span>
-                                        </button>
-                                    ))}
-                                </div>
-                            )}
-                        </div>
+                        {accountType === AccountType.ADMIN && (
+                            <>
+                                <div className="my-3 border-t border-slate-800" />
+                                <button
+                                    onClick={() => setSelectedFolder(PROJECT_OVERVIEW_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${(selectedFolder === PROJECT_OVERVIEW_VIEW || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX))
+                                        ? 'bg-cyan-900/30 text-cyan-200 border border-cyan-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7h18M6 12h12M9 17h6" /></svg>
+                                    Project Overview
+                                </button>
+                                <button
+                                    onClick={() => setSelectedFolder(WORKER_REPORT_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${(selectedFolder === WORKER_REPORT_VIEW || selectedFolder === WEEKLY_REPORT_VIEW || selectedFolder === DAILY_REPORT_VIEW)
+                                        ? 'bg-blue-900/30 text-blue-200 border border-blue-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 17v-2a4 4 0 00-4-4H5m11 0h.01M16 21h4a2 2 0 002-2v-9a2 2 0 00-2-2H6a2 2 0 00-2 2v1h2m10-4V7a2 2 0 00-2-2H8a2 2 0 00-2 2v2m4 6h.01" /></svg>
+                                    Reports
+                                </button>
+                                <button
+                                    onClick={() => setSelectedFolder(SCHEDULE_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === SCHEDULE_VIEW
+                                        ? 'bg-violet-900/30 text-violet-200 border border-violet-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" /></svg>
+                                    Schedule
+                                </button>
+                                <button
+                                    onClick={() => setSelectedFolder(ISSUE_REQUEST_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === ISSUE_REQUEST_VIEW
+                                        ? 'bg-rose-900/30 text-rose-200 border border-rose-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.257 3.099c.765-1.36 2.722-1.36 3.486 0l6.518 11.593c.75 1.334-.213 2.998-1.742 2.998H3.48c-1.53 0-2.492-1.664-1.743-2.998L8.257 3.1z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v4m0 4h.01" /></svg>
+                                    Issue Requests
+                                </button>
+                                <button
+                                    onClick={() => setSelectedFolder(VLM_MIGRATION_VIEW)}
+                                    className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === VLM_MIGRATION_VIEW
+                                        ? 'bg-emerald-900/30 text-emerald-200 border border-emerald-700/50 shadow-sm'
+                                        : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                        }`}
+                                >
+                                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 16V4m10 16V8M3 20h18" /></svg>
+                                    VLM Migration
+                                </button>
+                            </>
+                        )}
                     </div>
                 </div>
 
@@ -2378,215 +4452,128 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                 <div className="flex-1 bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden flex flex-col relative min-w-0">
 
                     {/* --- ADMIN VIEWS & FOLDER MODES --- */}
-                    {selectedFolder === USER_MANAGEMENT_VIEW && accountType === AccountType.ADMIN ? (
+                    {selectedFolder === NOTICE_HOME_VIEW && accountType !== AccountType.ADMIN ? (
+                        <NoticeHomeView
+                            notice={noticeContent}
+                            onStart={() => setSelectedFolder(WORK_LIST_VIEW)}
+                        />
+                    ) : selectedFolder === DASHBOARD_HOME_VIEW && accountType !== AccountType.ADMIN ? (
+                        <DashboardHomeView />
+                    ) : selectedFolder === WORK_LIST_VIEW && accountType !== AccountType.ADMIN ? (
+                        <div className="h-full overflow-auto p-6">
+                            <div className="mb-4">
+                                <h2 className="text-lg font-bold text-white tracking-tight">내 배정 작업 (Work List)</h2>
+                                <p className="text-sm text-slate-400 mt-1">본인에게 배정된 작업 목록입니다. 항목을 누르면 기존 폴더 상세 화면으로 이동합니다.</p>
+                            </div>
+                            <div className="bg-slate-900/60 backdrop-blur-2xl border border-white/10 rounded-2xl overflow-hidden shadow-2xl">
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-left border-collapse">
+                                        <thead className="bg-slate-950/50 text-slate-500 text-[12px] font-bold uppercase tracking-widest border-b border-white/5">
+                                            <tr>
+                                                <th className="px-6 py-5">프로젝트명</th>
+                                                <th className="px-6 py-5">폴더 경로 (Full Path)</th>
+                                                <th className="px-6 py-5 w-1/4">진행 상태</th>
+                                                <th className="px-6 py-5 text-right">작업량 (완료/전체)</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-white/5">
+                                            {assignedWorkListFolders.length === 0 ? (
+                                                <tr>
+                                                    <td colSpan={4} className="px-6 py-16 text-center text-slate-500 text-base italic">
+                                                        현재 배정된 작업이 없습니다.
+                                                    </td>
+                                                </tr>
+                                            ) : (
+                                                assignedWorkListFolders.map((folder) => {
+                                                    const progress = folder.count > 0 ? Math.round((folder.completed / folder.count) * 100) : 0;
+
+                                                    // Resolve Project Name using mapped projectId
+                                                    const projectId = workerProjectOverview?.projectMap?.[folder.name]?.projectId;
+                                                    const project = projectId ? workerProjectOverview?.projects?.find(p => String(p.id) === String(projectId)) : null;
+                                                    const projectName = project ? project.name : getTopLevelGroup(folder.name);
+
+                                                    return (
+                                                        <tr
+                                                            key={folder.name}
+                                                            onClick={() => {
+                                                                setFolderReturnView(WORK_LIST_VIEW);
+                                                                setActiveProjectWorkflowSourceType('');
+                                                                setSelectedFolder(folder.name);
+                                                            }}
+                                                            className="hover:bg-cyan-500/5 transition-all duration-200 group cursor-pointer"
+                                                        >
+                                                            <td className="px-6 py-6 whitespace-nowrap">
+                                                                <span className="inline-flex items-center px-4 py-1.5 rounded-md bg-slate-800 text-slate-300 text-[14px] font-bold border border-white/10 group-hover:border-cyan-500/40 group-hover:text-cyan-300 transition-colors">
+                                                                    {projectName}
+                                                                </span>
+                                                            </td>
+                                                            <td className="px-6 py-6">
+                                                                <div className="text-[17px] font-bold text-slate-200 group-hover:text-white transition-colors break-all leading-relaxed">
+                                                                    {folder.name}
+                                                                </div>
+                                                            </td>
+                                                            <td className="px-6 py-6">
+                                                                <div className="flex items-center gap-4">
+                                                                    <div className="flex-1 h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                                        <div
+                                                                            className="h-full bg-gradient-to-r from-cyan-600 to-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.4)] transition-all duration-500"
+                                                                            style={{ width: `${progress}%` }}
+                                                                        />
+                                                                    </div>
+                                                                    <span className="text-[17px] font-black font-mono text-cyan-400 w-16 text-right whitespace-nowrap">{progress}%</span>
+                                                                </div>
+                                                            </td>
+                                                            <td className="px-6 py-6 text-right whitespace-nowrap">
+                                                                <div className="flex items-baseline justify-end gap-2">
+                                                                    <span className="text-[20px] font-bold text-amber-400 font-mono tracking-tighter drop-shadow-[0_0_8px_rgba(251,191,36,0.3)]">
+                                                                        {Number(folder.completed || 0).toLocaleString()}
+                                                                    </span>
+                                                                    <span className="text-[15px] text-white font-mono font-bold opacity-90">
+                                                                        / {Number(folder.count || 0).toLocaleString()}
+                                                                    </span>
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })
+                                            )}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    ) : isProjectDetailView && accountType === AccountType.ADMIN ? (
+                        <ProjectDetailView
+                            projectId={selectedProjectId}
+                            role={role}
+                            onBack={() => setSelectedFolder(PROJECT_OVERVIEW_VIEW)}
+                            onArchived={() => onRefresh()}
+                            workerNames={workers}
+                            onOpenFolder={(folderName, workflowSourceType) => {
+                                setFolderReturnView(`${PROJECT_DETAIL_VIEW_PREFIX}${selectedProjectId}`);
+                                setActiveProjectWorkflowSourceType(workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
+                                setSelectedFolder(folderName);
+                            }}
+                            tasks={tasks}
+                            onSelectTask={onSelectTask}
+                        />
+                    ) : selectedFolder === PROJECT_OVERVIEW_VIEW && accountType === AccountType.ADMIN ? (
+                        <ProjectOverviewView
+                            onSync={handleSync}
+                            isSyncing={isSyncing}
+                            onOpenProject={(projectId) => setSelectedFolder(`${PROJECT_DETAIL_VIEW_PREFIX}${projectId}`)}
+                            overviewRefreshKey={overviewRefreshKey}
+                        />
+                    ) : selectedFolder === USER_MANAGEMENT_VIEW && accountType === AccountType.ADMIN ? (
                         <UserManagementView token={token} />
                     ) : (selectedFolder === WORKER_REPORT_VIEW || selectedFolder === WEEKLY_REPORT_VIEW || selectedFolder === DAILY_REPORT_VIEW) && accountType === AccountType.ADMIN ? (
                         <UnifiedReportsView tasks={tasks} validWorkers={workers} onOpenSchedule={() => setSelectedFolder(SCHEDULE_VIEW)} />
                     ) : selectedFolder === ISSUE_REQUEST_VIEW && accountType === AccountType.ADMIN ? (
-                        <IssueRequestView currentAdmin={username} />
+                        <IssueRequestView currentAdmin={username} onSelectTask={onSelectTask} />
                     ) : selectedFolder === SCHEDULE_VIEW && accountType === AccountType.ADMIN ? (
                         <ScheduleManagementView validWorkers={workers} />
-                    ) : selectedFolder === ALL_FOLDERS_VIEW && role === UserRole.REVIEWER ? (
-                        <div className="flex flex-col h-full">
-                            <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
-                                <div className="flex items-center gap-2">
-                                    <h2 className="text-lg font-bold bg-clip-text text-transparent bg-gradient-to-r from-sky-400 to-lime-400">프로젝트 할당 및 현황</h2>
-                                    <span className="text-xs bg-purple-900/40 text-purple-300 px-2 py-0.5 rounded border border-purple-800/50">관리자용</span>
-                                </div>
-                                <button
-                                    onClick={handleSync}
-                                    disabled={isSyncing}
-                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-4 py-2 rounded-lg text-xs font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
-                                >
-                                    {isSyncing ? (
-                                        <svg className="animate-spin h-4 w-4 text-sky-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-                                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                                        </svg>
-                                    ) : (
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
-                                    )}
-                                    Sync Data
-                                </button>
-                            </div>
-                            <div className="flex-1 overflow-y-auto p-6 min-h-0 pb-32">
-                                <div className="w-full">
-                                    {/* Render Groups */}
-                                    {Object.entries(groupedSidebarFolders.groups).map(([groupName, folders]) => (
-                                        <div key={groupName} className="mb-6">
-                                            <button
-                                                onClick={() => toggleTableGroup(groupName)}
-                                                className="flex items-center gap-2 mb-2 px-2 hover:bg-slate-800/50 p-1 rounded transition-colors w-full text-left"
-                                            >
-                                                <svg className={`w-3 h-3 text-slate-500 transition-transform ${collapsedTableGroups.has(groupName) ? '-rotate-90' : 'rotate-0'}`} fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-                                                <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">{groupName}</span>
-                                                <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded">{folders.length}</span>
-                                            </button>
-
-                                            {!collapsedTableGroups.has(groupName) && (
-                                                <div className="bg-slate-800/20 border border-slate-800 rounded-xl overflow-hidden">
-                                                    <table className="w-full text-left text-sm table-fixed">
-                                                        <thead className="bg-slate-900/50 text-slate-500 text-xs font-bold uppercase tracking-wider border-b border-slate-800">
-                                                            <tr className="h-10 align-middle">
-                                                                <th className="pl-4 w-[5%] min-w-[40px]">
-                                                                    <input
-                                                                        type="checkbox"
-                                                                        checked={folders.every(f => selectedFolders.has(f.name))}
-                                                                        onChange={() => toggleSelectGroup(folders)}
-                                                                        className="rounded border-slate-700 bg-slate-800 text-sky-600 focus:ring-sky-500/50"
-                                                                    />
-                                                                </th>
-                                                                <th className="pl-2 w-[23%]">Folder Name</th>
-                                                                <th className="w-[12%]">Group</th>
-                                                                <th className="w-[23%]">Tags</th>
-                                                                <th className="w-[15%]">Progress</th>
-                                                                <th className="w-[10%] text-center">Stats</th>
-                                                                <th className="w-[12%]">Worker</th>
-                                                            </tr>
-                                                        </thead>
-                                                        <tbody className="divide-y divide-slate-800">
-                                                            {folders.map(folder => (
-                                                                <FolderRow
-                                                                    key={folder.name}
-                                                                    folder={folder}
-                                                                    groups={groups}
-                                                                    allFolderMeta={allFolderMeta}
-                                                                    onUpdateGroup={handleUpdateGroupMain}
-                                                                    onUpdateTags={handleUpdateFolderTags}
-                                                                    onAssignWorker={handleAssignWorker}
-                                                                    workers={workers}
-                                                                    onSelectFolder={setSelectedFolder}
-                                                                    isSelected={selectedFolders.has(folder.name)}
-                                                                    onToggleSelect={toggleSelectFolder}
-                                                                />
-                                                            ))}
-                                                        </tbody>
-                                                    </table>
-                                                </div>
-                                            )}
-                                        </div>
-                                    ))}
-
-                                    {/* Render Uncategorized */}
-                                    {groupedSidebarFolders.uncategorized.length > 0 && (
-                                        <div className="mb-6">
-                                            <div className="flex items-center gap-2 mb-2 px-2">
-                                                <span className="text-xs font-bold text-slate-500 uppercase tracking-widest">Uncategorized</span>
-                                                <span className="text-[10px] bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded">{groupedSidebarFolders.uncategorized.length}</span>
-                                            </div>
-                                            <div className="bg-slate-800/20 border border-slate-800 rounded-xl overflow-hidden">
-                                                <table className="w-full text-left text-sm table-fixed">
-                                                    <thead className="bg-slate-900/50 text-slate-500 text-xs font-bold uppercase tracking-wider border-b border-slate-800">
-                                                        <tr className="h-10 align-middle">
-                                                            <th className="pl-4 w-[5%] min-w-[40px]">
-                                                                <input
-                                                                    type="checkbox"
-                                                                    checked={groupedSidebarFolders.uncategorized.every(f => selectedFolders.has(f.name))}
-                                                                    onChange={() => toggleSelectGroup(groupedSidebarFolders.uncategorized)}
-                                                                    className="rounded border-slate-700 bg-slate-800 text-sky-600 focus:ring-sky-500/50"
-                                                                />
-                                                            </th>
-                                                            <th className="pl-2 w-[23%]">Folder Name</th>
-                                                            <th className="w-[12%]">Group</th>
-                                                            <th className="w-[23%]">Tags</th>
-                                                            <th className="w-[15%]">Progress</th>
-                                                            <th className="w-[10%] text-center">Stats</th>
-                                                            <th className="w-[12%]">Worker</th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody className="divide-y divide-slate-800">
-                                                        {groupedSidebarFolders.uncategorized.map(folder => (
-                                                            <FolderRow
-                                                                key={folder.name}
-                                                                folder={folder}
-                                                                groups={groups}
-                                                                allFolderMeta={allFolderMeta}
-                                                                onUpdateGroup={handleUpdateGroupMain}
-                                                                onUpdateTags={handleUpdateFolderTags}
-                                                                onAssignWorker={handleAssignWorker}
-                                                                workers={workers}
-                                                                onSelectFolder={setSelectedFolder}
-                                                                isSelected={selectedFolders.has(folder.name)}
-                                                                onToggleSelect={toggleSelectFolder}
-                                                            />
-                                                        ))}
-                                                    </tbody>
-                                                </table>
-                                            </div>
-                                        </div>
-                                    )}
-                                </div>
-                            </div>
-
-                            {/* Bulk Actions Toolbar */}
-                            {selectedFolders.size > 0 && (
-                                <div className="absolute bottom-14 left-1/2 transform -translate-x-1/2 bg-slate-900/95 backdrop-blur-sm border border-slate-700 shadow-2xl rounded-xl px-6 py-4 flex items-center gap-6 z-50 animate-in fade-in slide-in-from-bottom-4 min-w-[600px]">
-                                    <div className="flex items-center gap-2 text-white font-bold whitespace-nowrap">
-                                        <div className="w-6 h-6 rounded-full bg-sky-600 flex items-center justify-center text-xs">
-                                            {selectedFolders.size}
-                                        </div>
-                                        <span>Selected</span>
-                                    </div>
-                                    <div className="h-8 w-px bg-slate-700"></div>
-
-                                    {/* Action: Group */}
-                                    <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-500 font-bold uppercase">Assign Group</label>
-                                        <select
-                                            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white"
-                                            onChange={(e) => handleBulkUpdateGroup(e.target.value)}
-                                            value=""
-                                        >
-                                            <option value="" disabled>Select Group...</option>
-                                            {Object.keys(groupedSidebarFolders.groups).map(g => (
-                                                <option key={g} value={g}>{g}</option>
-                                            ))}
-                                            <option value="__NEW_GROUP__" className="text-sky-400">+ New Group</option>
-                                        </select>
-                                    </div>
-
-                                    {/* Action: Tag */}
-                                    <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-500 font-bold uppercase">Add Tag</label>
-                                        <input
-                                            type="text"
-                                            placeholder="Type & Enter..."
-                                            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white w-32"
-                                            onKeyDown={(e) => {
-                                                if (e.key === 'Enter') {
-                                                    handleBulkUpdateTags(e.currentTarget.value);
-                                                    e.currentTarget.value = '';
-                                                }
-                                            }}
-                                        />
-                                    </div>
-
-                                    {/* Action: Worker (Movement) */}
-                                    <div className="flex flex-col gap-1">
-                                        <label className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Transfer Folder</label>
-                                        <select
-                                            className="bg-slate-800 border border-slate-600 rounded px-2 py-1 text-xs text-white"
-                                            onChange={(e) => handleBulkAssignWorker(e.target.value)}
-                                            value=""
-                                        >
-                                            <option value="" disabled>Select Worker...</option>
-                                            <option value="Unassigned">Unassigned</option>
-                                            {workers.map(w => (
-                                                <option key={w} value={w}>{w}</option>
-                                            ))}
-                                        </select>
-                                    </div>
-
-                                    <div className="flex-1"></div>
-                                    <button
-                                        onClick={() => setSelectedFolders(new Set())}
-                                        className="text-slate-500 hover:text-white transition-colors"
-                                    >
-                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-                                    </button>
-                                </div>
-                            )}
-                        </div>
+                    ) : selectedFolder === VLM_MIGRATION_VIEW && accountType === AccountType.ADMIN ? (
+                        <VlmMigrationView onRefreshTasks={onRefresh} workers={workers} onRefreshOverview={() => setOverviewRefreshKey((k) => k + 1)} />
                     ) : (
                         // --- FOLDER DETAIL MODE ---
                         selectedFolder ? (
@@ -2594,6 +4581,14 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                 {/* Header */}
                                 <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex justify-between items-center flex-shrink-0">
                                     <div>
+                                        {folderReturnView && (
+                                            <button
+                                                onClick={() => setSelectedFolder(folderReturnView)}
+                                                className="mb-2 text-xs text-slate-400 hover:text-white transition-colors"
+                                            >
+                                                ← 프로젝트 상세로
+                                            </button>
+                                        )}
                                         <div className="flex items-center gap-3">
                                             <h2 className="text-lg font-bold text-white tracking-tight">{selectedFolder}</h2>
                                             {activeFolderStats?.assignedWorker && (
@@ -2605,206 +4600,214 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                     </div>
                                 </div>
 
-                                {/* Guidelines Panel */}
-                                <div className={`px-6 py-5 border-b border-slate-800 transition-colors ${role === UserRole.WORKER ? 'bg-sky-900/5' : ''}`}>
-                                    <div className="flex items-center justify-between mb-3">
-                                        <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Guidelines</h3>
-                                        {role === UserRole.REVIEWER && (
-                                            <button
-                                                onClick={() => setIsEditingMeta(!isEditingMeta)}
-                                                className="text-xs text-sky-400 hover:text-sky-300 font-medium"
-                                            >
-                                                {isEditingMeta ? 'Cancel' : 'Edit'}
-                                            </button>
+                                {/* Middle Split Panel */}
+                                <div className="p-6 border-b border-slate-800 grid grid-cols-1 lg:grid-cols-2 gap-4">
+                                    <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden min-h-[250px] flex items-center justify-center">
+                                        {representativeTask ? (
+                                            <img
+                                                src={representativeTask.imageUrl}
+                                                alt={representativeTask.name}
+                                                className="w-full h-full object-contain bg-black"
+                                            />
+                                        ) : (
+                                            <span className="text-sm text-slate-500 italic">No image in this folder.</span>
                                         )}
                                     </div>
 
-                                    {isEditingMeta ? (
-                                        <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-3">
-                                            <div className="grid grid-cols-2 gap-4">
-                                                <div>
-                                                    <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Tags</label>
-                                                    <input
-                                                        type="text"
-                                                        value={newTagInput}
-                                                        onChange={(e) => setNewTagInput(e.target.value)}
-                                                        onKeyDown={(e) => e.key === 'Enter' && handleAddTag()}
-                                                        placeholder="Add tags..."
-                                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:border-sky-500 outline-none mb-2"
+                                    <div className="space-y-4">
+                                        {/* Guidelines Panel */}
+                                        <div className={`p-5 border border-slate-800 rounded-xl transition-colors ${role === UserRole.WORKER ? 'bg-sky-900/5' : 'bg-slate-900/50'}`}>
+                                            <div className="flex items-center justify-between mb-3">
+                                                <h3 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Guidelines</h3>
+                                                {role === UserRole.REVIEWER && (
+                                                    <button
+                                                        onClick={() => setIsEditingMeta(!isEditingMeta)}
+                                                        className="text-xs text-sky-400 hover:text-sky-300 font-medium"
+                                                    >
+                                                        {isEditingMeta ? 'Cancel' : 'Edit'}
+                                                    </button>
+                                                )}
+                                            </div>
+
+                                            {isEditingMeta ? (
+                                                <div className="bg-slate-800 p-4 rounded-xl border border-slate-700 space-y-3">
+                                                    <div>
+                                                        <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Tags</label>
+                                                        <input
+                                                            type="text"
+                                                            value={newTagInput}
+                                                            onChange={(e) => setNewTagInput(e.target.value)}
+                                                            onKeyDown={(e) => e.key === 'Enter' && handleAddTag()}
+                                                            placeholder="Add tags..."
+                                                            className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:border-sky-500 outline-none mb-2"
+                                                        />
+                                                    </div>
+                                                    <div className="flex flex-wrap gap-2">
+                                                        {(tempMeta.tags || []).map((tag, idx) => (
+                                                            <span key={`${tag}-${idx}`} className="px-2 py-1 bg-sky-600 text-white text-xs rounded-md flex items-center gap-1">
+                                                                {tag}
+                                                                <button onClick={() => handleRemoveTag(tag)} className="hover:text-red-200">×</button>
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                    <textarea
+                                                        value={tempMeta.memo}
+                                                        onChange={(e) => setTempMeta({ ...tempMeta, memo: e.target.value })}
+                                                        className="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:border-sky-500 outline-none resize-none"
+                                                        placeholder="Instructions..."
                                                     />
+                                                    <div className="flex gap-2">
+                                                        <button
+                                                            onClick={() => {
+                                                                const folderTasks = [...tasksInFolder];
+                                                                folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+                                                                const firstTodo = folderTasks.find(t => t.status === TaskStatus.TODO);
+                                                                if (firstTodo) {
+                                                                    onSelectTask(firstTodo.id);
+                                                                } else {
+                                                                    alert("No pending tasks found in this folder!");
+                                                                }
+                                                            }}
+                                                            className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
+                                                        >
+                                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                                            작업 이어하기
+                                                        </button>
+                                                        {activeProjectWorkflowSourceType !== 'vlm-review' && (
+                                                            <>
+                                                                <button
+                                                                    onClick={() => handleAssignWorker(selectedFolder, username)}
+                                                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
+                                                                >
+                                                                    Assign to Me
+                                                                </button>
+                                                                <button
+                                                                    onClick={() => {
+                                                                        const newOwner = prompt('Enter username to assign folder to:');
+                                                                        if (newOwner) handleAssignWorker(selectedFolder, newOwner);
+                                                                    }}
+                                                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
+                                                                >
+                                                                    Assign...
+                                                                </button>
+                                                            </>
+                                                        )}
+                                                    </div>
+                                                    <div className="flex justify-end">
+                                                        <button
+                                                            onClick={handleSaveMeta}
+                                                            className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-bold"
+                                                        >
+                                                            Save
+                                                        </button>
+                                                    </div>
                                                 </div>
-                                                <div>
-                                                    <label className="block text-xs font-bold text-slate-500 uppercase mb-1">Group</label>
-                                                    <input
-                                                        type="text"
-                                                        value={tempGroup}
-                                                        onChange={(e) => setTempGroup(e.target.value)}
-                                                        placeholder="Enter group name..."
-                                                        className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:border-sky-500 outline-none"
-                                                    />
-                                                </div>
-                                            </div>
-                                            <div className="flex flex-wrap gap-2">
-                                                {(tempMeta.tags || []).map((tag, idx) => (
-                                                    <span key={`${tag}-${idx}`} className="px-2 py-1 bg-sky-600 text-white text-xs rounded-md flex items-center gap-1">
-                                                        {tag}
-                                                        <button onClick={() => handleRemoveTag(tag)} className="hover:text-red-200">×</button>
-                                                    </span>
-                                                ))}
-                                            </div>
-                                            <textarea
-                                                value={tempMeta.memo}
-                                                onChange={(e) => setTempMeta({ ...tempMeta, memo: e.target.value })}
-                                                className="w-full h-20 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:border-sky-500 outline-none resize-none"
-                                                placeholder="Instructions..."
-                                            />
-                                            <div className="flex gap-2">
-                                                <button
-                                                    onClick={() => {
-                                                        const folderTasks = tasks.filter(t => t.folder === selectedFolder);
-                                                        folderTasks.sort((a, b) => a.name.localeCompare(b.name));
-                                                        const firstTodo = folderTasks.find(t => t.status === TaskStatus.TODO);
-                                                        if (firstTodo) {
-                                                            onSelectTask(firstTodo.id);
-                                                        } else {
-                                                            alert("No pending tasks found in this folder!");
-                                                        }
-                                                    }}
-                                                    className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
-                                                >
-                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                                                    작업 이어하기
-                                                </button>
-                                                <button
-                                                    onClick={() => handleAssignWorker(selectedFolder, username)}
-                                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
-                                                >
-                                                    Assign to Me
-                                                </button>
-                                                <button
-                                                    onClick={() => {
-                                                        const newOwner = prompt('Enter username to assign folder to:');
-                                                        if (newOwner) handleAssignWorker(selectedFolder, newOwner);
-                                                    }}
-                                                    className="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white px-4 py-2 rounded-lg text-sm font-bold transition-colors"
-                                                >
-                                                    Assign...
-                                                </button>
-                                            </div>
-                                            <div className="flex justify-end">
-                                                <button
-                                                    onClick={handleSaveMeta}
-                                                    className="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-bold"
-                                                >
-                                                    Save
-                                                </button>
-                                            </div>
-                                        </div>
-                                    ) : (
-                                        <div className="space-y-2">
-                                            {(folderMeta?.tags || []).length > 0 && (
-                                                <div className="flex flex-wrap gap-2">
-                                                    {(folderMeta.tags || []).map((tag, idx) => (
-                                                        <span key={`${tag}-${idx}`} className="px-2 py-0.5 bg-sky-500/10 text-sky-300 border border-sky-500/20 text-xs font-medium rounded-full">
-                                                            #{tag}
-                                                        </span>
-                                                    ))}
+                                            ) : (
+                                                <div className="space-y-2">
+                                                    {(folderMeta?.tags || []).length > 0 && (
+                                                        <div className="flex flex-wrap gap-2">
+                                                            {(folderMeta.tags || []).map((tag, idx) => (
+                                                                <span key={`${tag}-${idx}`} className="px-2 py-0.5 bg-sky-500/10 text-sky-300 border border-sky-500/20 text-xs font-medium rounded-full">
+                                                                    #{tag}
+                                                                </span>
+                                                            ))}
+                                                        </div>
+                                                    )}
+                                                    <p className="text-sm text-slate-400 leading-relaxed whitespace-pre-wrap">
+                                                        {folderMeta.memo || <span className="italic text-slate-600">No specific guidelines.</span>}
+                                                    </p>
                                                 </div>
                                             )}
-                                            <p className="text-sm text-slate-400 leading-relaxed whitespace-pre-wrap">
-                                                {folderMeta.memo || <span className="italic text-slate-600">No specific guidelines.</span>}
-                                            </p>
                                         </div>
-                                    )}
-                                </div>
+                                        {/* Action Buttons */}
+                                        <div className="flex gap-2">
+                                            <button
+                                                onClick={() => {
+                                                    const folderTasks = [...tasksInFolder];
+                                                    folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+                                                    const firstPending = folderTasks.find(t =>
+                                                        t.status === TaskStatus.TODO ||
+                                                        t.status === TaskStatus.IN_PROGRESS ||
+                                                        t.status === TaskStatus.REJECTED
+                                                    );
+                                                    if (firstPending) {
+                                                        onSelectTask(firstPending.id);
+                                                    } else {
+                                                        alert("No pending tasks (TODO, IN_PROGRESS, REJECTED) found in this folder!");
+                                                    }
+                                                }}
+                                                className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
+                                            >
+                                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
+                                                작업 이어하기
+                                            </button>
 
-                                {/* Action Buttons */}
-                                <div className="px-6 pt-4 pb-4 flex gap-2">
-                                    <button
-                                        onClick={() => {
-                                            const folderTasks = tasks.filter(t => t.folder === selectedFolder);
-                                            folderTasks.sort((a, b) => a.name.localeCompare(b.name));
-                                            const firstPending = folderTasks.find(t =>
-                                                t.status === TaskStatus.TODO ||
-                                                t.status === TaskStatus.IN_PROGRESS ||
-                                                t.status === TaskStatus.REJECTED
-                                            );
-                                            if (firstPending) {
-                                                onSelectTask(firstPending.id);
-                                            } else {
-                                                alert("No pending tasks (TODO, IN_PROGRESS, REJECTED) found in this folder!");
-                                            }
-                                        }}
-                                        className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
-                                    >
-                                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-                                        작업 이어하기
-                                    </button>
+                                            {role === UserRole.REVIEWER && (
+                                                <button
+                                                    onClick={() => {
+                                                        const folderTasks = [...tasksInFolder];
+                                                        folderTasks.sort((a, b) => a.name.localeCompare(b.name));
+                                                        const firstPending = folderTasks.find(t =>
+                                                            t.status !== TaskStatus.APPROVED &&
+                                                            t.status !== TaskStatus.REJECTED
+                                                        );
+                                                        if (firstPending) {
+                                                            onSelectTask(firstPending.id);
+                                                        } else {
+                                                            alert("No pending review tasks found in this folder!");
+                                                        }
+                                                    }}
+                                                    className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-purple-900/20"
+                                                >
+                                                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+                                                    Pending Review
+                                                </button>
+                                            )}
+                                        </div>
 
-                                    {role === UserRole.REVIEWER && (
-                                        <button
-                                            onClick={() => {
-                                                const folderTasks = tasks.filter(t => t.folder === selectedFolder);
-                                                folderTasks.sort((a, b) => a.name.localeCompare(b.name));
-                                                const firstPending = folderTasks.find(t =>
-                                                    t.status !== TaskStatus.APPROVED &&
-                                                    t.status !== TaskStatus.REJECTED
-                                                );
-                                                if (firstPending) {
-                                                    onSelectTask(firstPending.id);
-                                                } else {
-                                                    alert("No pending review tasks found in this folder!");
-                                                }
-                                            }}
-                                            className="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-purple-900/20"
-                                        >
-                                            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-                                            Pending Review
-                                        </button>
-                                    )}
-                                </div>
-
-                                {/* Stats Row */}
-                                {activeFolderStats && activeFolderDetails && (
-                                    <div className="p-6 border-b border-slate-800 grid grid-cols-4 gap-4">
-                                        {role === UserRole.REVIEWER ? (
-                                            <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
-                                                <span className="text-xs text-slate-400 font-bold uppercase tracking-wider">검수 현황</span>
-                                                <div className="flex items-baseline gap-1 mt-1">
-                                                    <span className="text-xl font-bold text-white">{activeFolderStats.approved}</span>
-                                                    <span className="text-xs text-slate-500">/ {activeFolderStats.completed - activeFolderStats.approved}</span>
+                                        {/* Stats Row */}
+                                        {activeFolderStats && activeFolderDetails && (
+                                            <div className="grid grid-cols-2 xl:grid-cols-4 gap-3">
+                                                {role === UserRole.REVIEWER ? (
+                                                    <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
+                                                        <span className="text-xs text-slate-400 font-bold uppercase tracking-wider">검수 현황</span>
+                                                        <div className="flex items-baseline gap-1 mt-1">
+                                                            <span className="text-xl font-bold text-white">{activeFolderStats.approved}</span>
+                                                            <span className="text-xs text-slate-500">/ {activeFolderStats.completed - activeFolderStats.approved}</span>
+                                                        </div>
+                                                        <div className="text-[10px] text-slate-500 mt-0.5 font-medium">완료 / 대기</div>
+                                                        <div className="w-full bg-slate-700 h-1 mt-2 rounded-full overflow-hidden">
+                                                            <div className="bg-purple-500 h-full" style={{ width: `${activeFolderStats.completed > 0 ? (activeFolderStats.approved / activeFolderStats.completed) * 100 : 0}%` }}></div>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
+                                                        <span className="text-xs text-slate-500 font-bold uppercase">태스크</span>
+                                                        <div className="flex items-baseline gap-1 mt-1">
+                                                            <span className="text-xl font-bold text-white">{activeFolderStats.completed}</span>
+                                                            <span className="text-xs text-slate-500">/ {activeFolderStats.count}</span>
+                                                        </div>
+                                                        <div className="w-full bg-slate-700 h-1 mt-2 rounded-full overflow-hidden">
+                                                            <div className="bg-sky-500 h-full" style={{ width: `${(activeFolderStats.completed / activeFolderStats.count) * 100}%` }}></div>
+                                                        </div>
+                                                    </div>
+                                                )}
+                                                <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
+                                                    <span className="text-xs text-slate-500 font-bold uppercase">완료</span>
+                                                    <div className="mt-1 text-xl font-bold text-lime-400">{activeFolderStats.approved}</div>
                                                 </div>
-                                                <div className="text-[10px] text-slate-500 mt-0.5 font-medium">완료 / 대기</div>
-                                                <div className="w-full bg-slate-700 h-1 mt-2 rounded-full overflow-hidden">
-                                                    <div className="bg-purple-500 h-full" style={{ width: `${activeFolderStats.completed > 0 ? (activeFolderStats.approved / activeFolderStats.completed) * 100 : 0}%` }}></div>
+                                                <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
+                                                    <span className="text-xs text-slate-500 font-bold uppercase">반려</span>
+                                                    <div className="mt-1 text-xl font-bold text-red-400">{activeFolderStats.rejected}</div>
                                                 </div>
-                                            </div>
-                                        ) : (
-                                            <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
-                                                <span className="text-xs text-slate-500 font-bold uppercase">태스크</span>
-                                                <div className="flex items-baseline gap-1 mt-1">
-                                                    <span className="text-xl font-bold text-white">{activeFolderStats.completed}</span>
-                                                    <span className="text-xs text-slate-500">/ {activeFolderStats.count}</span>
-                                                </div>
-                                                <div className="w-full bg-slate-700 h-1 mt-2 rounded-full overflow-hidden">
-                                                    <div className="bg-sky-500 h-full" style={{ width: `${(activeFolderStats.completed / activeFolderStats.count) * 100}%` }}></div>
+                                                <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
+                                                    <span className="text-xs text-slate-500 font-bold uppercase">수정된 이미지</span>
+                                                    <div className="mt-1 text-xl font-bold text-purple-400">{activeFolderDetails.modifiedCount}</div>
                                                 </div>
                                             </div>
                                         )}
-                                        <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
-                                            <span className="text-xs text-slate-500 font-bold uppercase">완료</span>
-                                            <div className="mt-1 text-xl font-bold text-lime-400">{activeFolderStats.approved}</div>
-                                        </div>
-                                        <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
-                                            <span className="text-xs text-slate-500 font-bold uppercase">반려</span>
-                                            <div className="mt-1 text-xl font-bold text-red-400">{activeFolderStats.rejected}</div>
-                                        </div>
-                                        <div className="bg-slate-800/50 rounded-xl p-3 border border-slate-800">
-                                            <span className="text-xs text-slate-500 font-bold uppercase">수정된 이미지</span>
-                                            <div className="mt-1 text-xl font-bold text-purple-400">{activeFolderDetails.modifiedCount}</div>
-                                        </div>
                                     </div>
-                                )}
+                                </div>
 
                                 {/* Task Grid */}
                                 <div className="flex-1 overflow-y-auto p-6 bg-slate-900/50">
@@ -2823,25 +4826,18 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                             renderedTasks.map((task, idx) => (
                                                 <div key={`${task.id}-${idx}`} className="group bg-slate-900 border border-slate-800 rounded-xl p-3 flex items-center justify-between hover:border-slate-600 transition-all shadow-sm">
                                                     <div className="flex items-center gap-4">
-                                                        <div className="w-14 h-14 bg-black rounded-lg overflow-hidden flex-shrink-0 relative border border-slate-800 group-hover:border-slate-600 transition-colors">
-                                                            <img src={task.imageUrl} alt="" className="w-full h-full object-cover opacity-80 group-hover:opacity-100 transition-opacity" />
-                                                            {(task.annotations || []).length > 0 && (
-                                                                <div className="absolute bottom-0 right-0 bg-black/80 text-[10px] font-bold text-white px-1.5 py-0.5 rounded-tl">
-                                                                    {(task.annotations || []).length}
-                                                                </div>
-                                                            )}
-                                                        </div>
                                                         <div>
                                                             <h3 className="text-slate-200 font-bold text-sm group-hover:text-sky-400 transition-colors">{task.name}</h3>
                                                             <div className="flex items-center gap-2 mt-1">
-                                                                <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide font-bold
-                                                            ${task.status === TaskStatus.TODO ? 'bg-slate-800 text-slate-400' : ''}
+                                                                <span className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wide font-bold border
+                                                            ${task.status === TaskStatus.TODO ? 'bg-slate-800 text-slate-400 border-slate-700' : ''}
                                                             ${task.status === TaskStatus.IN_PROGRESS ? 'bg-sky-900/30 text-sky-300 border border-sky-800/50' : ''}
-                                                            ${task.status === TaskStatus.SUBMITTED ? 'bg-yellow-900/30 text-yellow-300 border border-yellow-800/50' : ''}
+                                                            ${task.status === TaskStatus.SUBMITTED ? 'bg-amber-900/30 text-amber-300 border border-amber-800/50' : ''}
                                                             ${task.status === TaskStatus.APPROVED ? 'bg-lime-900/30 text-lime-300 border border-lime-800/50' : ''}
-                                                            ${task.status === TaskStatus.REJECTED ? 'bg-red-900/30 text-red-300 border border-red-800/50' : ''}
+                                                            ${task.status === TaskStatus.REJECTED ? 'bg-rose-900/30 text-rose-300 border border-rose-800/50' : ''}
+                                                            ${task.status === TaskStatus.ISSUE_PENDING ? 'bg-purple-900/30 text-purple-300 border border-purple-800/50' : ''}
                                                         `}>
-                                                                    {TaskStatusLabels[task.status]}
+                                                                    {TaskStatusLabels[task.status] || task.status}
                                                                 </span>
                                                                 <span className="text-xs text-slate-600">Updated {new Date(task.lastUpdated).toLocaleDateString()}</span>
                                                             </div>
@@ -2872,42 +4868,87 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                         )
                     )}
                 </div>
-                {/* Right Panel: Notice Board */}
-                <div className="w-[400px] flex-shrink-0 flex flex-col bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden">
-                    <div className="p-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
-                        <h3 className="font-bold text-red-400 text-sm uppercase tracking-wide">Notice</h3>
-                        {accountType === AccountType.ADMIN && (
-                            <button
-                                onClick={() => setIsEditingNotice(!isEditingNotice)}
-                                className="text-xs text-sky-400 hover:text-sky-300"
-                            >
-                                {isEditingNotice ? 'Cancel' : 'Edit'}
-                            </button>
-                        )}
-                    </div>
-                    <div className="flex-1 p-4 overflow-y-auto">
-                        {isEditingNotice ? (
-                            <div className="flex flex-col gap-2 h-full">
-                                <textarea
-                                    className="flex-1 w-full bg-slate-800 border border-slate-700 rounded-lg p-3 text-sm text-slate-200 outline-none focus:border-sky-500 resize-none"
-                                    value={tempNotice}
-                                    onChange={(e) => setTempNotice(e.target.value)}
-                                    placeholder="Write a notice..."
-                                />
+                {accountType === AccountType.ADMIN && (
+                    <div className="w-[400px] flex-shrink-0 flex flex-col bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden">
+                        <div className="p-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
+                            <h3 className="font-bold text-red-400 text-sm uppercase tracking-wide">Notice</h3>
+                            {accountType === AccountType.ADMIN && (
                                 <button
-                                    onClick={handleSaveNotice}
-                                    className="w-full bg-sky-600 text-white font-bold py-2 rounded-lg hover:bg-sky-500"
+                                    onClick={() => setIsEditingNotice(!isEditingNotice)}
+                                    className="text-xs text-sky-400 hover:text-sky-300"
                                 >
-                                    Save Notice
+                                    {isEditingNotice ? 'Cancel' : 'Edit'}
                                 </button>
-                            </div>
-                        ) : (
-                            <div className="text-sm text-slate-300 whitespace-pre-wrap leading-relaxed">
-                                {noticeContent || <span className="text-slate-500 italic">No notices posted.</span>}
-                            </div>
-                        )}
+                            )}
+                        </div>
+                        <div className="flex-1 p-4 overflow-y-auto custom-quill-container">
+                            {isEditingNotice ? (
+                                <div className="flex flex-col gap-4 h-full">
+                                    <style>{`
+                                        .custom-quill-container .quill {
+                                            height: 100%;
+                                            display: flex;
+                                            flex-direction: column;
+                                            background: #1e293b;
+                                            border-radius: 0.75rem;
+                                            border: 1px solid #334155;
+                                            overflow: hidden;
+                                        }
+                                        .custom-quill-container .ql-toolbar {
+                                            background: #334155;
+                                            border: none !important;
+                                            border-bottom: 1px solid #475569 !important;
+                                        }
+                                        .custom-quill-container .ql-container {
+                                            flex: 1;
+                                            border: none !important;
+                                            font-family: inherit;
+                                            font-size: 0.875rem;
+                                            color: #e2e8f0;
+                                        }
+                                        .custom-quill-container .ql-editor {
+                                            min-height: 200px;
+                                        }
+                                        .custom-quill-container .ql-stroke {
+                                            stroke: #94a3b8 !important;
+                                        }
+                                        .custom-quill-container .ql-fill {
+                                            fill: #94a3b8 !important;
+                                        }
+                                         .custom-quill-container .ql-picker {
+                                             color: #94a3b8 !important;
+                                         }
+                                         .custom-quill-container .ql-editor img {
+                                             max-width: 100%;
+                                             height: auto;
+                                             border-radius: 0.5rem;
+                                             margin: 8px 0;
+                                         }
+                                    `}</style>
+                                    <ReactQuill
+                                        ref={quillRef}
+                                        theme="snow"
+                                        value={tempNotice}
+                                        onChange={setTempNotice}
+                                        modules={quillModules}
+                                        className="flex-1"
+                                    />
+                                    <button
+                                        onClick={handleSaveNotice}
+                                        className="w-full bg-sky-600 text-white font-bold py-3 rounded-xl hover:bg-sky-500 transition-colors shadow-lg shadow-sky-900/20 flex-shrink-0"
+                                    >
+                                        Save Notice
+                                    </button>
+                                </div>
+                            ) : (
+                                <div
+                                    className="text-sm text-slate-300 leading-relaxed prose prose-invert prose-sm max-w-none"
+                                    dangerouslySetInnerHTML={{ __html: DOMPurify.sanitize(noticeContent || '<span class="text-slate-500 italic">No notices posted.</span>') }}
+                                />
+                            )}
+                        </div>
                     </div>
-                </div>
+                )}
             </div>
 
         </div>

@@ -42,81 +42,122 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-950 flex items-center justify-center p-4">
-      <div className="w-full max-w-md bg-gray-900 border border-gray-800 rounded-2xl shadow-2xl overflow-hidden">
-        <div className="p-8 pb-6 text-center border-b border-gray-800 bg-gray-900/50">
-          <div className="w-16 h-16 bg-blue-600 rounded-xl mx-auto flex items-center justify-center font-bold text-2xl text-white shadow-lg mb-4">
-            Y7
-          </div>
-          <h1 className="text-2xl font-bold text-white tracking-tight">Intellivix Data Studio</h1>
-          <p className="text-gray-400 text-sm mt-2">Sign in to continue annotation</p>
-        </div>
+    <div className="min-h-screen relative flex items-center justify-center p-4 overflow-hidden bg-[#0B0F19]">
+      {/* Dynamic Background Effects */}
+      <div className="absolute inset-0 z-0">
+        <div className="absolute top-0 -left-1/4 w-[150%] h-[150%] bg-[radial-gradient(circle_at_50%_0%,rgba(56,189,248,0.08)_0%,transparent_50%)]"></div>
+        <div className="absolute bottom-0 -right-1/4 w-[150%] h-[150%] bg-[radial-gradient(circle_at_50%_100%,rgba(16,185,129,0.05)_0%,transparent_50%)]"></div>
+        <div className="absolute top-1/4 left-1/4 w-96 h-96 bg-blue-500/10 rounded-full blur-3xl animate-pulse"></div>
+        <div className="absolute bottom-1/4 right-1/4 w-96 h-96 bg-emerald-500/10 rounded-full blur-3xl animate-[pulse_4s_ease-in-out_infinite]"></div>
+        {/* Subtle grid pattern */}
+        <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNDAiIGhlaWdodD0iNDAiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+DQogIDxwYXRoIGQ9Ik0wIDBoNDB2NDBIMHoiIGZpbGw9Im5vbmUiIC8+DQogIDxwYXRoIGQ9Ik0wIDBoMHY0MEgwem00MCAwaDB2NDBIMHptMCA0MEgwdjB6TTAgMGg0MHYwaC00MHoiIGZpbGw9InJnYmEoMjU1LDI1NSwyNTUsMC4wMykiIC8+DQo8L3N2Zz4=')] opacity-30"></div>
+      </div>
 
-        <form onSubmit={handleSubmit} className="p-8 space-y-6">
-          {error && (
-            <div className="bg-red-900/20 border border-red-900/50 text-red-200 px-4 py-3 rounded-lg text-sm flex items-center gap-2">
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-              {error}
+      <div className="w-full max-w-[420px] relative z-10 animate-in fade-in slide-in-from-bottom-4 duration-700">
+        {/* Glassmorphic Card */}
+        <div className="bg-slate-900/40 backdrop-blur-xl border border-white/[0.08] rounded-3xl shadow-[0_0_40px_-10px_rgba(0,0,0,0.5)] overflow-hidden transition-all duration-300 hover:border-white/[0.12] hover:shadow-[0_0_50px_-10px_rgba(56,189,248,0.1)]">
+
+          <div className="p-10 pb-8 text-center border-b border-white/[0.05] bg-gradient-to-b from-white/[0.03] to-transparent">
+            <div className="mx-auto flex items-center justify-center mb-6 transform transition-transform hover:scale-105 duration-300">
+              <img src="/logo.ico" alt="Logo" className="w-16 h-16 object-contain drop-shadow-md" />
             </div>
-          )}
-
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1.5">Username</label>
-            <input
-              type="text"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              disabled={isLoggingIn}
-              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600 disabled:opacity-50"
-              placeholder="Enter your username"
-            />
+            <h1 className="text-3xl font-heading font-bold text-white tracking-tight leading-tight">Intellivix<br /><span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-sky-300">Data Studio</span></h1>
+            <p className="text-slate-400 text-sm mt-3 font-medium">Log in to enter the workspace</p>
           </div>
 
-          <div>
-            <label className="block text-sm font-medium text-gray-400 mb-1.5">Password</label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={isLoggingIn}
-              className="w-full bg-gray-950 border border-gray-800 rounded-lg px-4 py-3 text-white focus:ring-2 focus:ring-blue-600 focus:border-transparent outline-none transition-all placeholder-gray-600 disabled:opacity-50"
-              placeholder="Enter your password"
-            />
-          </div>
-
-          <button
-            type="submit"
-            disabled={isLoggingIn}
-            className="w-full bg-blue-600 hover:bg-blue-500 text-white font-bold py-3 rounded-lg shadow-lg transition-transform active:scale-[0.98] flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
-          >
-            {isLoggingIn ? (
-              <>
-                <svg className="animate-spin h-5 w-5 text-white" fill="none" viewBox="0 0 24 24">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
-                </svg>
-                <span>Signing in...</span>
-              </>
-            ) : (
-              <>
-                Sign In
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
-              </>
+          <form onSubmit={handleSubmit} className="p-10 space-y-6">
+            {error && (
+              <div className="bg-red-500/10 border border-red-500/20 text-red-200 px-4 py-3 rounded-xl text-sm flex items-start gap-3 animate-in fade-in slide-in-from-top-2">
+                <svg className="w-5 h-5 flex-shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg>
+                <span className="leading-snug">{error}</span>
+              </div>
             )}
-          </button>
-        </form>
 
-        <div className="px-8 py-4 bg-gray-950/50 border-t border-gray-800">
-          <div className="text-center space-y-2">
-            <div className="text-xs text-gray-500 bg-gray-800/50 p-2 rounded border border-gray-800">
-              <p className="mb-1 font-bold">Automatic Dataset Loading</p>
-              <p>Place your folders and images in <code className="text-blue-400">/dataset</code> folder in project root.</p>
+            <div className="space-y-5">
+              <div className="group">
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 transition-colors group-focus-within:text-blue-400">Username</label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-500 group-focus-within:text-blue-400 transition-colors">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
+                  </div>
+                  <input
+                    type="text"
+                    value={username}
+                    onChange={(e) => setUsername(e.target.value)}
+                    disabled={isLoggingIn}
+                    className="w-full bg-slate-950/50 border border-slate-800 rounded-xl pl-11 pr-4 py-3.5 text-slate-100 placeholder-slate-600 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 outline-none transition-all duration-300 disabled:opacity-50"
+                    placeholder="Enter your worker ID"
+                  />
+                </div>
+              </div>
+
+              <div className="group">
+                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider mb-2 transition-colors group-focus-within:text-blue-400">Password</label>
+                <div className="relative">
+                  <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none text-slate-500 group-focus-within:text-blue-400 transition-colors">
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
+                  </div>
+                  <input
+                    type="password"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    disabled={isLoggingIn}
+                    className="w-full bg-slate-950/50 border border-slate-800 rounded-xl pl-11 pr-4 py-3.5 text-slate-100 placeholder-slate-600 focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500/50 outline-none transition-all duration-300 disabled:opacity-50 tracking-widest"
+                    placeholder="••••••••"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <button
+              type="submit"
+              disabled={isLoggingIn || !username || !password}
+              className="w-full relative group overflow-hidden bg-white text-slate-900 font-bold py-4 rounded-xl shadow-lg transition-all duration-300 hover:shadow-[0_0_20px_rgba(255,255,255,0.3)] active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:shadow-none mt-4"
+            >
+              <div className="absolute inset-0 w-full h-full bg-gradient-to-r from-transparent via-white/50 to-transparent -translate-x-full group-hover:animate-[shimmer_1.5s_infinite]"></div>
+
+              <div className="relative flex items-center justify-center gap-2">
+                {isLoggingIn ? (
+                  <>
+                    <svg className="animate-spin -ml-1 mr-2 h-5 w-5 text-slate-900" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <span>Authenticating...</span>
+                  </>
+                ) : (
+                  <>
+                    <span>Enter Workspace</span>
+                    <svg className="w-5 h-5 transition-transform group-hover:translate-x-1" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" /></svg>
+                  </>
+                )}
+              </div>
+            </button>
+          </form>
+
+          <div className="px-10 py-5 bg-slate-950/40 border-t border-white/[0.05]">
+            <div className="flex items-start gap-3 p-3 rounded-xl bg-blue-500/5 border border-blue-500/10 transition-colors hover:bg-blue-500/10">
+              <div className="mt-0.5 text-blue-400">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
+              </div>
+              <div className="text-xs text-slate-400 leading-relaxed">
+                <strong className="text-slate-300 block mb-0.5">Automated Sync</strong>
+                Place folders in <code className="text-blue-400 bg-blue-400/10 px-1 py-0.5 rounded font-mono">/dataset</code> root to load.
+              </div>
             </div>
           </div>
         </div>
+
+        {/* Global Shimmer Animation Definition */}
+        <style>{`
+          @keyframes shimmer {
+            100% { transform: translateX(100%); }
+          }
+        `}</style>
       </div>
     </div>
   );
 };
+
 
 export default Login;

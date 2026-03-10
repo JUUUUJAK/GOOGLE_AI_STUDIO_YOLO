@@ -11,6 +11,8 @@ interface AnnotationCanvasProps {
   hiddenClassIds?: number[];
   customClassColors?: Record<number, string>;
   taskId?: string;
+  undoSignal?: number;
+  redoSignal?: number;
 }
 
 type ResizeHandle = 'tl' | 'tr' | 'bl' | 'br';
@@ -20,10 +22,10 @@ const MIN_BOX_SIZE = 0.002; // Roughly 2-4 pixels on common image sizes, allows 
 
 const Tooltip = ({ text, children, position = 'right' }: { text: string; children: React.ReactNode; position?: 'right' | 'left' }) => (
   <div className="group relative flex items-center">
-    <div className={`absolute ${position === 'right' ? 'left-full ml-3' : 'right-full mr-3'} px-2.5 py-1.5 bg-gray-900/95 backdrop-blur-md border border-gray-700 text-white text-[11px] font-bold rounded-lg shadow-2xl whitespace-nowrap pointer-events-none opacity-0 group-hover:opacity-100 ${position === 'right' ? '-translate-x-1' : 'translate-x-1'} group-hover:translate-x-0 transition-all duration-150 z-[100] flex items-center gap-1.5`}>
+    <div className={`absolute ${position === 'right' ? 'left-full ml-4' : 'right-full mr-4'} px-3 py-2 bg-slate-900/95 backdrop-blur-xl border border-white/10 text-white text-[11px] font-bold tracking-wide rounded-xl shadow-[0_8px_30px_rgb(0,0,0,0.5)] whitespace-nowrap pointer-events-none opacity-0 group-hover:opacity-100 ${position === 'right' ? '-translate-x-2' : 'translate-x-2'} group-hover:translate-x-0 transition-all duration-300 z-[100] flex items-center gap-2`}>
       {text}
-      <div className={`absolute ${position === 'right' ? 'right-full' : 'left-full'} border-[5px] border-transparent ${position === 'right' ? 'border-r-gray-700' : 'border-l-gray-700'}`}></div>
-      <div className={`absolute ${position === 'right' ? 'right-full mr-[-9px]' : 'left-full ml-[-9px]'} border-[4px] border-transparent ${position === 'right' ? 'border-r-gray-900/95' : 'border-l-gray-900/95'}`}></div>
+      <div className={`absolute top-1/2 -translate-y-1/2 ${position === 'right' ? 'right-full border-[6px]' : 'left-full border-[6px]'} border-transparent ${position === 'right' ? 'border-r-white/10' : 'border-l-white/10'}`}></div>
+      <div className={`absolute top-1/2 -translate-y-1/2 ${position === 'right' ? 'right-full mr-[-10px] border-[5px]' : 'left-full ml-[-10px] border-[5px]'} border-transparent ${position === 'right' ? 'border-r-slate-900' : 'border-l-slate-900'}`}></div>
     </div>
     {children}
   </div>
@@ -39,6 +41,8 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
   hiddenClassIds = [],
   customClassColors = {},
   taskId,
+  undoSignal,
+  redoSignal,
 }) => {
   // Fix for special characters in filenames (e.g., #, [], spaces)
   // Fix for special characters in filenames (e.g., #, [], spaces)
@@ -117,14 +121,47 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
   const [localAnnotations, setLocalAnnotations] = useState<BoundingBox[]>(annotations);
   const [recentlyPastedBoxIds, setRecentlyPastedBoxIds] = useState<string[]>([]);
   const [hoveredBoxId, setHoveredBoxId] = useState<string | null>(null);
+  const localAnnotationsRef = useRef<BoundingBox[]>(annotations);
+  const onUpdateRef = useRef(onUpdateAnnotations);
+  const readOnlyRef = useRef(readOnly);
 
   // Undo/Redo & Clipboard
   const [undoStack, setUndoStack] = useState<BoundingBox[][]>([]);
+  const [redoStack, setRedoStack] = useState<BoundingBox[][]>([]);
   const clipboardRef = useRef<BoundingBox[]>([]);
 
   const saveHistory = useCallback(() => {
     setUndoStack(prev => [...prev, localAnnotations]);
+    setRedoStack([]);
   }, [localAnnotations]);
+  const applyRedo = useCallback(() => {
+    if (readOnlyRef.current) return;
+    setRedoStack(prev => {
+      if (prev.length === 0) return prev;
+      const newStack = [...prev];
+      const nextState = newStack.pop();
+      if (nextState) {
+        setUndoStack(uprev => [...uprev, localAnnotationsRef.current]);
+        setLocalAnnotations(nextState);
+        onUpdateRef.current(nextState);
+      }
+      return newStack;
+    });
+  }, []);
+  const applyUndo = useCallback(() => {
+    if (readOnlyRef.current) return;
+    setUndoStack(prev => {
+      if (prev.length === 0) return prev;
+      const newStack = [...prev];
+      const lastState = newStack.pop();
+      if (lastState) {
+        setRedoStack(rprev => [...rprev, localAnnotationsRef.current]);
+        setLocalAnnotations(lastState);
+        onUpdateRef.current(lastState);
+      }
+      return newStack;
+    });
+  }, []);
   const handleDelete = useCallback((ids: string[]) => {
     if (readOnly || ids.length === 0) return;
     saveHistory(); // Save before delete
@@ -149,6 +186,33 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       setLocalAnnotations(annotations);
     }
   }, [annotations, isDrawing, dragStartPos, isPanning]);
+  useEffect(() => {
+    localAnnotationsRef.current = localAnnotations;
+  }, [localAnnotations]);
+  useEffect(() => {
+    onUpdateRef.current = onUpdateAnnotations;
+  }, [onUpdateAnnotations]);
+  useEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
+
+  // Reset history when switching tasks/images
+  useEffect(() => {
+    setUndoStack([]);
+    setRedoStack([]);
+    setSelectedBoxIds([]);
+    setHoveredBoxId(null);
+    setRecentlyPastedBoxIds([]);
+  }, [taskId, imageUrl]);
+
+  useEffect(() => {
+    if (!redoSignal) return;
+    applyRedo();
+  }, [redoSignal, applyRedo]);
+  useEffect(() => {
+    if (!undoSignal) return;
+    applyUndo();
+  }, [undoSignal, applyUndo]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -160,26 +224,29 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
       if (isCtrl) {
         // Undo: Ctrl + Z
-        if (key === 'z') {
+        if (key === 'z' && !e.shiftKey) {
           e.preventDefault();
-          setUndoStack(prev => {
-            if (prev.length === 0) return prev;
-            const newStack = [...prev];
-            const lastState = newStack.pop();
-            if (lastState) {
-              setLocalAnnotations(lastState);
-              onUpdateAnnotations(lastState);
-            }
-            return newStack;
-          });
+          applyUndo();
           return;
         }
 
-        // Copy: Ctrl + C or Shift + Ctrl + C (for multi-selection as per user doc)
+        // Redo: Ctrl + Y or Ctrl + Shift + Z
+        if (key === 'y' || (key === 'z' && e.shiftKey)) {
+          e.preventDefault();
+          applyRedo();
+          return;
+        }
+
+        // Copy: Ctrl + C (selected) or Ctrl + X (all boxes)
         if (key === 'c' && selectedBoxIds.length > 0) {
           e.preventDefault();
           const boxes = localAnnotations.filter(b => selectedBoxIds.includes(b.id));
           if (boxes.length > 0) clipboardRef.current = boxes;
+          return;
+        }
+        if (key === 'x') {
+          e.preventDefault();
+          if (localAnnotations.length > 0) clipboardRef.current = [...localAnnotations];
           return;
         }
 
@@ -254,9 +321,17 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
         setActiveTool('PAN');
       }
 
-      // Box Visibility Shortcut
+      // Box Visibility Shortcut (B: dim; backtick is handled by parent for all hide/show)
       if (key === 'b') {
         setDimBoxes(prev => !prev);
+      }
+
+      // Hover Select Shortcut: X
+      // Useful for quickly building multi-selection while moving cursor across boxes.
+      if (key === 'x' && hoveredBoxId) {
+        e.preventDefault();
+        setSelectedBoxIds(prev => (prev.includes(hoveredBoxId) ? prev : [...prev, hoveredBoxId]));
+        return;
       }
 
       if (key === 'v') {
@@ -265,7 +340,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [selectedBoxIds, hoveredBoxId, handleDelete, readOnly, currentClass, localAnnotations, onUpdateAnnotations, isHelpOpen, saveHistory]);
+  }, [selectedBoxIds, hoveredBoxId, handleDelete, readOnly, currentClass, localAnnotations, onUpdateAnnotations, isHelpOpen, saveHistory, applyRedo, applyUndo]);
 
   // --- Zoom Logic ---
   const handleWheel = (e: React.WheelEvent) => {
@@ -617,6 +692,12 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
         ref={containerRef}
         className="relative w-full h-full bg-gray-950 overflow-hidden select-none"
         onMouseDown={handleMouseDown}
+        onMouseMove={(e) => {
+          if (showCrosshair) setMouseCanvasPos(getNormalizedPos(e));
+        }}
+        onMouseLeave={() => {
+          if (showCrosshair) setMouseCanvasPos(null);
+        }}
         onWheel={handleWheel}
         onContextMenu={(e) => e.preventDefault()}
         style={{ cursor: activeTool === 'PAN' || isPanning ? 'grab' : (readOnly ? 'default' : 'crosshair') }}
@@ -707,7 +788,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                   width: `${box.w * 100}%`,
                   height: `${box.h * 100}%`,
                   boxShadow: isSelected
-                    ? `0 0 0 ${(boxThickness) / scale}px ${color}, 0 0 0 ${(boxThickness + 2) / scale}px white`
+                    ? `inset 0 0 0 ${(boxThickness) / scale}px ${color}, 0 0 0 ${(boxThickness + 2) / scale}px white`
                     : `inset 0 0 0 ${(boxThickness) / scale}px ${color}`,
                   border: `${(boxThickness / 2) / scale}px ${borderStyle} ${color}`,
                   backgroundColor: fillColor,
@@ -850,13 +931,13 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
 
         {/* Floating Toolbar (Tools & Zoom) */}
-        <div className="absolute top-4 left-4 flex flex-col gap-2 z-50">
+        <div className="absolute top-6 left-6 flex flex-col gap-3 z-50">
           <Tooltip text={activeTool === 'PAN' ? "이미지 조절 (V)" : "박스 생성 (V)"}>
             <button
               onClick={() => setActiveTool(activeTool === 'PAN' ? 'SELECT' : 'PAN')}
-              className={`p-2.5 rounded-lg shadow-lg border transition-all ${activeTool === 'PAN'
-                ? 'bg-blue-600 text-white border-blue-500'
-                : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+              className={`p-3 rounded-xl shadow-2xl backdrop-blur-md border transition-all duration-300 ${activeTool === 'PAN'
+                ? 'bg-blue-600/90 text-white border-blue-500/50 shadow-blue-500/20'
+                : 'bg-slate-900/60 text-slate-300 border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 hover:scale-105'
                 }`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -868,9 +949,9 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           <Tooltip text="레이블 표시 켜기/끄기">
             <button
               onClick={() => setShowLabels(!showLabels)}
-              className={`p-2.5 rounded-lg shadow-lg border transition-all ${showLabels
-                ? 'bg-blue-600 text-white border-blue-500'
-                : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+              className={`p-3 rounded-xl shadow-2xl backdrop-blur-md border transition-all duration-300 ${showLabels
+                ? 'bg-blue-600/90 text-white border-blue-500/50 shadow-blue-500/20'
+                : 'bg-slate-900/60 text-slate-300 border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 hover:scale-105'
                 }`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" /></svg>
@@ -880,9 +961,9 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           <Tooltip text="객체 크기(px) 표시 켜기/끄기">
             <button
               onClick={() => setShowPixelSizes(!showPixelSizes)}
-              className={`p-2.5 rounded-lg shadow-lg border transition-all ${showPixelSizes
-                ? 'bg-blue-600 text-white border-blue-500'
-                : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+              className={`p-3 rounded-xl shadow-2xl backdrop-blur-md border transition-all duration-300 ${showPixelSizes
+                ? 'bg-blue-600/90 text-white border-blue-500/50 shadow-blue-500/20'
+                : 'bg-slate-900/60 text-slate-300 border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 hover:scale-105'
                 }`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -891,22 +972,25 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
               </svg>
             </button>
           </Tooltip>
+
           <Tooltip text="박스 표시 켜기/끄기 (B)">
             <button
               onClick={() => setDimBoxes(!dimBoxes)}
-              className={`p-2.5 rounded-lg shadow-lg border transition-all ${dimBoxes
-                ? 'bg-blue-600 text-white border-blue-500'
-                : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+              className={`p-3 rounded-xl shadow-2xl backdrop-blur-md border transition-all duration-300 ${dimBoxes
+                ? 'bg-blue-600/90 text-white border-blue-500/50 shadow-blue-500/20'
+                : 'bg-slate-900/60 text-slate-300 border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 hover:scale-105'
                 }`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z" /></svg>
             </button>
           </Tooltip>
 
+          <div className="h-px bg-white/10 w-8 mx-auto my-1 rounded-full"></div>
+
           <Tooltip text="이미지 크기 재조정">
             <button
               onClick={() => { setScale(1); setPan({ x: 0, y: 0 }); }}
-              className="p-2.5 bg-gray-800 text-gray-300 rounded-lg shadow-lg border border-gray-700 hover:bg-gray-700 hover:text-white transition-colors"
+              className="p-3 bg-slate-900/60 text-slate-300 rounded-xl shadow-2xl backdrop-blur-md border border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 transition-all duration-300 hover:scale-105"
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" /></svg>
             </button>
@@ -915,9 +999,9 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           <Tooltip text="캔버스 설정">
             <button
               onClick={() => setIsSettingsOpen(!isSettingsOpen)}
-              className={`p-2.5 rounded-lg shadow-lg border transition-all ${isSettingsOpen
-                ? 'bg-blue-600 text-white border-blue-500'
-                : 'bg-gray-800 text-gray-300 border-gray-700 hover:bg-gray-700 hover:text-white'
+              className={`p-3 rounded-xl shadow-2xl backdrop-blur-md border transition-all duration-300 ${isSettingsOpen
+                ? 'bg-blue-600/90 text-white border-blue-500/50 shadow-blue-500/20'
+                : 'bg-slate-900/60 text-slate-300 border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 hover:scale-105'
                 }`}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -927,17 +1011,19 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           <Tooltip text="모든 박스 삭제">
             <button
               onClick={() => setIsDeleteAllConfirmOpen(true)}
-              className="p-2.5 bg-gray-800 text-red-400 rounded-lg shadow-lg border border-gray-700 hover:bg-red-900/40 hover:text-red-300 hover:border-red-900/50 transition-all"
+              className="p-3 bg-slate-900/60 text-red-400 rounded-xl shadow-2xl backdrop-blur-md border border-white/10 hover:bg-red-500 hover:text-white hover:border-red-400 transition-all duration-300 hover:scale-105 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 disabled:hover:bg-slate-900/60 disabled:hover:text-red-400 disabled:hover:border-white/10"
               disabled={localAnnotations.length === 0}
             >
               <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
             </button>
           </Tooltip>
 
+          <div className="flex-1 min-h-[4rem]"></div>
+
           <Tooltip text="단축키 & 안내">
             <button
               onClick={() => setIsHelpOpen(true)}
-              className="p-2.5 bg-gray-800 text-gray-300 rounded-lg shadow-lg border border-gray-700 hover:bg-gray-700 hover:text-white transition-colors font-bold font-mono"
+              className="p-3 bg-slate-900/60 text-slate-300 rounded-xl shadow-2xl backdrop-blur-md border border-white/10 hover:bg-slate-800/80 hover:text-white hover:border-white/20 transition-all duration-300 hover:scale-105 font-bold font-mono"
             >
               ?
             </button>
@@ -946,14 +1032,14 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
         {/* Settings Overlay */}
         {isSettingsOpen && (
-          <div className="absolute bottom-16 right-4 w-72 bg-gray-900/95 backdrop-blur-md border border-gray-700 rounded-xl shadow-2xl p-4 z-50 animate-in slide-in-from-bottom-2 duration-200">
-            <div className="flex justify-between items-center mb-5">
+          <div className="absolute bottom-16 left-24 w-[320px] bg-slate-900/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl p-6 z-50 animate-in slide-in-from-bottom-2 duration-300">
+            <div className="flex justify-between items-center mb-6">
               <h3 className="text-white font-bold flex items-center gap-2">
                 <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
                 캔버스 시각 설정
               </h3>
-              <button onClick={() => setIsSettingsOpen(false)} className="text-gray-500 hover:text-white transition-colors">
-                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l18 18" /></svg>
+              <button onClick={() => setIsSettingsOpen(false)} className="p-1 rounded-lg text-slate-500 hover:text-white hover:bg-white/10 transition-colors">
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l18 18" /></svg>
               </button>
             </div>
             <div className="space-y-6">
@@ -1014,64 +1100,71 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
         {/* Help Modal */}
         {isHelpOpen && (
-          <div className="absolute inset-0 z-[60] bg-black/60 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200" onClick={() => setIsHelpOpen(false)}>
-            <div className="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl max-w-md w-full overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-5 border-b border-gray-800 flex justify-between items-center">
-                <h3 className="font-bold text-lg text-white">단축키 안내</h3>
-                <button onClick={() => setIsHelpOpen(false)} className="text-gray-500 hover:text-white"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
+          <div className="absolute inset-0 z-[60] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-300" onClick={() => setIsHelpOpen(false)}>
+            <div className="bg-slate-900 border border-white/10 rounded-3xl shadow-2xl max-w-md w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="p-6 border-b border-white/5 flex justify-between items-center bg-slate-800/20">
+                <h3 className="font-bold text-xl text-white">단축키 안내</h3>
+                <button onClick={() => setIsHelpOpen(false)} className="p-2 rounded-xl text-slate-500 hover:text-white hover:bg-white/10 transition-colors"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg></button>
               </div>
-              <div className="p-5 space-y-4">
-                <div className="space-y-2">
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">확대</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">마우스 휠</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">이미지 이동</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">스페이스바 or 마우스 가운데 버튼 + 드래그</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">이미지 이동 토글</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">V or 손 아이콘(왼쪽 상단)</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">박스 생성</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">클릭 + 드래그</span></div>
-                  <div className="flex justify-between text-sm">
-                    <span className="text-gray-400">박스 선택/이동/크기조절</span>
+              <div className="p-6 space-y-5">
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">확대</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">마우스 휠</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">이미지 이동</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm text-xs">스페이스바 or 가운데 버튼 + 드래그</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">이미지 이동 토글</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">V or 상단 아이콘</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">박스 생성</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">클릭 + 드래그</span></div>
+                  <div className="flex justify-between text-sm mt-4">
+                    <span className="text-slate-400 font-medium pt-1">박스 선택/이동/크기조절</span>
                     <div className="text-right">
-                      <div className="text-white font-mono bg-blue-900/40 text-blue-300 px-1.5 rounded border border-blue-800/50 inline-block mb-1">F 키 (패스트 모드)</div>
-                      <div className="text-gray-500 text-[10px] italic">클래식 모드에서는 바로 클릭/호버 가능</div>
+                      <div className="text-blue-300 font-mono bg-blue-900/40 px-2 py-1 rounded-lg border border-blue-800/50 inline-block mb-1 shadow-sm font-bold">F 키 (패스트 모드)</div>
+                      <div className="text-slate-500 text-xs mt-1">클래식 모드: 바로 조작 가능</div>
                     </div>
                   </div>
                 </div>
-                <div className="h-px bg-gray-800 my-2"></div>
-                <div className="space-y-2">
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">박스 삭제 (우클릭 / R키 시 바로 삭제)</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">Del / Bksp / R / Right Click</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">클래스 변경</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">E (선택된 클래스로 변경)</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">클래스 선택</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">1 - 9</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">박스 표시 켜기/끄기</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">B</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">제출&다음 이미지</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">D</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">제출& 이전 이미지</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">A</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">되돌리기</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">Ctrl+Z</span></div>
-                  <div className="flex justify-between text-sm"><span className="text-gray-400">다중 선택 Box 복사/붙여넣기</span><span className="text-white font-mono bg-gray-800 px-1.5 rounded">Shift + Ctrl+C / Ctrl+V</span></div>
+                <div className="h-px bg-white/5 my-4"></div>
+                <div className="space-y-3">
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">단일 박스 삭제</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">Del / Bksp / R / 우클릭</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">클래스 변경 (선택된/호버 객체)</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">E</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">클래스 숫자 단축키</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">1 - 9</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">Active class 이전/다음</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">W / S</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">다중 선택 추가 (호버 객체)</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">X</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">박스 표시 토글 (흐리게)</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">B</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">모든 객체 표시/숨김 토글</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">` (백틱)</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">제출 & 다음 이미지</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">D</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">제출 & 이전 이미지</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">A</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">작업 되돌리기/재실행</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">Ctrl+Z / Ctrl+Y</span></div>
+                  <div className="flex justify-between items-center text-sm mt-2 pt-2 border-t border-white/5"><span className="text-slate-400 font-medium">선택 박스 복사/붙여넣기</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm text-xs">Ctrl+C / Ctrl+V</span></div>
+                  <div className="flex justify-between items-center text-sm"><span className="text-slate-400 font-medium">모든 박스 복사</span><span className="text-white font-mono bg-slate-800 px-2 py-1 rounded-lg border border-slate-700 shadow-sm">Ctrl+X</span></div>
                 </div>
               </div>
             </div>
           </div>
         )}
+
         {/* Delete All Confirmation Modal */}
         {isDeleteAllConfirmOpen && (
-          <div className="absolute inset-0 z-[100] bg-black/70 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-200" onClick={() => setIsDeleteAllConfirmOpen(false)}>
-            <div className="bg-gray-900 border border-red-900/30 rounded-2xl shadow-2xl max-w-sm w-full overflow-hidden" onClick={e => e.stopPropagation()}>
-              <div className="p-6 text-center">
-                <div className="w-16 h-16 bg-red-900/20 rounded-full flex items-center justify-center mx-auto mb-4 border border-red-900/30">
-                  <svg className="w-8 h-8 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+          <div className="absolute inset-0 z-[100] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-300" onClick={() => setIsDeleteAllConfirmOpen(false)}>
+            <div className="bg-slate-900 border border-white/5 rounded-3xl shadow-2xl max-w-sm w-full overflow-hidden" onClick={e => e.stopPropagation()}>
+              <div className="p-8 text-center relative overflow-hidden">
+                <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-red-600 to-rose-500"></div>
+                <div className="w-20 h-20 bg-red-900/20 rounded-full flex items-center justify-center mx-auto mb-6 border border-red-500/20 shadow-[0_0_30px_rgba(239,68,68,0.15)] relative">
+                  <div className="absolute inset-0 rounded-full border border-red-500/10 animate-ping"></div>
+                  <svg className="w-10 h-10 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
                 </div>
-                <h3 className="text-xl font-bold text-white mb-2">모든 박스 삭제</h3>
-                <p className="text-gray-400 text-sm leading-relaxed mb-6">
-                  현재 이미지에 있는 모든 어노테이션 박스를 삭제하시겠습니까?<br />
-                  <span className="text-red-400 font-medium">이 작업은 Ctrl+Z로 되돌릴 수 있습니다.</span>
+                <h3 className="text-2xl font-bold text-white mb-3 tracking-wide">모든 박스 삭제</h3>
+                <p className="text-slate-400 text-sm leading-relaxed mb-8">
+                  현재 이미지에 있는 <strong className="text-white font-semibold">모든 어노테이션 박스</strong>를<br />삭제하시겠습니까?<br />
+                  <span className="text-red-400 font-medium text-xs mt-2 inline-block px-3 py-1 bg-red-900/20 rounded-lg">이 작업은 Ctrl+Z로 되돌릴 수 있습니다.</span>
                 </p>
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-2 gap-4">
                   <button
                     onClick={() => setIsDeleteAllConfirmOpen(false)}
-                    className="py-3 bg-gray-800 hover:bg-gray-700 text-gray-300 font-medium rounded-xl transition-colors border border-gray-700"
+                    className="py-3.5 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-xl transition-all border border-slate-700 hover:border-slate-600 shadow-sm"
                   >
                     취소
                   </button>
                   <button
                     onClick={handleDeleteAll}
-                    className="py-3 bg-red-600 hover:bg-red-500 text-white font-bold rounded-xl shadow-lg shadow-red-900/20 transition-all active:scale-95"
+                    className="py-3.5 bg-gradient-to-r from-red-600 to-rose-600 hover:from-red-500 hover:to-rose-500 text-white font-bold rounded-xl shadow-[0_0_20px_rgba(239,68,68,0.3)] hover:shadow-[0_0_25px_rgba(239,68,68,0.4)] transition-all active:scale-[0.98]"
                   >
                     모두 삭제
                   </button>

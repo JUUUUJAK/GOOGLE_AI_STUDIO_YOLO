@@ -2,12 +2,184 @@ import { Task, TaskStatus, WorkLog, UserRole, BoundingBox, TaskIssue, TaskIssueR
 import JSZip from 'jszip';
 import localforage from 'localforage';
 
-const TASKS_KEY = 'yolo_tasks';
+export interface ProjectDefinition {
+  id: string;
+  name: string;
+  targetTotal: number;
+  workflowSourceType: 'native-yolo' | 'vlm-review';
+  vlmSourceFile?: string;
+  visibleToWorkers?: boolean;
+  status?: 'ACTIVE' | 'ARCHIVED';
+  archivedAt?: number;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ProjectOverviewRow extends ProjectDefinition {
+  allocated: number;
+  completed: number;
+  folderCount: number;
+  progress: number;
+}
+
+export interface ProjectOverviewPayload {
+  projects: ProjectOverviewRow[];
+  projectMap: Record<string, { projectId: string; updatedAt: number }>;
+  unassigned: { folderCount: number; allocated: number; completed: number };
+  folders: Array<{
+    folder: string;
+    taskCount: number;
+    completedCount: number;
+    lastUpdated: number;
+    assignedWorker: string;
+    projectId: string;
+    nativeTaskCount?: number;
+    vlmTaskCount?: number;
+  }>;
+}
+
+export interface ProjectDetailPayload {
+  project: {
+    id: string;
+    name: string;
+    targetTotal: number;
+    workflowSourceType: 'native-yolo' | 'vlm-review';
+    vlmSourceFile?: string;
+    visibleToWorkers?: boolean;
+    status?: 'ACTIVE' | 'ARCHIVED';
+    allocated: number;
+    completed: number;
+    progress: number;
+    folderCount: number;
+  };
+  workers: Array<{
+    userId: string;
+    allocated: number;
+    completed: number;
+    progress: number;
+    submissions?: number;
+    totalTimeSeconds?: number;
+    workTimeHours?: number;
+    workingDays?: number;
+    vacationDays?: number;
+    foldersWorked?: string[];
+    lastTimestamp?: number;
+    isDummy?: boolean;
+  }>;
+  folders: Array<{
+    folder: string;
+    taskCount: number;
+    completedCount: number;
+    submittedCount?: number;
+    approvedCount?: number;
+    rejectedCount?: number;
+    lastUpdated: number;
+    assignedWorker: string;
+  }>;
+  trends: Array<{
+    date: string;
+    submissions: number;
+    workTimeSeconds: number;
+    workTimeHours: number;
+    dummySubmissions?: number;
+    dummyWorkTimeSeconds?: number;
+    dummyWorkTimeHours?: number;
+  }>;
+  isArchived?: boolean;
+  archivedAt?: number;
+}
+
+export interface PluginDescriptor {
+  sourceType: 'native-yolo' | 'vlm-review';
+  label: string;
+  supportsWorkflow: boolean;
+  supportsMigration: boolean;
+}
+
+export interface VlmMigrationDryRunResult {
+  total: number;
+  limit: number;
+  offset: number;
+  sampleCount: number;
+  sample: Array<{
+    taskId: string;
+    sourceFile: string;
+    sourceRefId: string;
+    image: string | null;
+    mappedFolder: string;
+    mappedStatus: string;
+    assignedWorker: string | null;
+    completedAt: number;
+    validatedAt: number;
+  }>;
+}
+
+export interface VlmImportJsonFileInfo {
+  fileName: string;
+  relativePath: string;
+  size: number;
+  modifiedAt: number;
+  totalRows: number;
+  parseError?: string;
+  alreadyImportedCount?: number;
+}
+
+export interface VlmJsonImportResult {
+  success: boolean;
+  commit: boolean;
+  total: number;
+  assignedCount: number;
+  unassignedCount: number;
+  missingImages: number;
+  sourceFiles: string[];
+  skippedAlreadyAssigned?: number;
+  assignedPreview: Array<{
+    taskId: string;
+    sourceRefId: string;
+    assignedWorker: string | null;
+    imageExists: boolean;
+  }>;
+}
+
+export interface VlmExportJsonFileInfo {
+  sourceFile: string;
+  totalTasks: number;
+  submittedTasks: number;
+  lastUpdated: number;
+}
+
+export interface VlmExportJsonResult {
+  success: boolean;
+  onlySubmitted: boolean;
+  savedFiles: Array<{
+    sourceFile: string;
+    outputPath: string;
+    count: number;
+  }>;
+}
+
 const LOGS_KEY = 'yolo_logs';
 const FOLDER_META_KEY = 'yolo_folder_meta';
 const INITIAL_TASK_FETCH_LIMIT = 5000;
-const TASK_PERSIST_DEBOUNCE_MS = 250;
 const LOG_PULL_MIN_INTERVAL_MS = 15000;
+
+let _workerScope: string | null = null;
+
+export const setWorkerScope = (worker: string | null) => {
+  _workerScope = worker;
+};
+
+const buildDatasetsUrl = (limit: number, offset: number, lastUpdated?: number, lastId?: string): string => {
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (lastUpdated != null && lastUpdated !== -1 && lastId) {
+    params.set('lastUpdated', String(lastUpdated));
+    params.set('lastId', lastId);
+  } else {
+    params.set('offset', String(offset));
+  }
+  if (_workerScope) params.set('worker', _workerScope);
+  return `/api/datasets?${params.toString()}`;
+};
 
 // Configure localforage
 localforage.config({
@@ -65,8 +237,6 @@ let cachedTasks: Task[] = [];
 let cachedLogs: WorkLog[] = [];
 let cachedFolderMeta: Record<string, any> = {};
 let isInitialized = false;
-let pendingTaskPersistMap = new Map<string, any>();
-let taskPersistTimer: ReturnType<typeof setTimeout> | null = null;
 let lastCommittedTaskSignature = new Map<string, string>();
 let lastLogPullAt = 0;
 
@@ -100,38 +270,14 @@ const normalizeServerTask = (serverTask: any, existing?: any): Task => {
   } as Task;
 };
 
-const toStorableTask = (task: Task) => {
-  const { annotations, ...taskWithoutAnnotations } = task;
-  return taskWithoutAnnotations;
-};
-
-const flushPendingTaskPersist = async () => {
-  if (pendingTaskPersistMap.size === 0) return;
-
-  const pendingUpdates = pendingTaskPersistMap;
-  pendingTaskPersistMap = new Map();
-
-  try {
-    const storedTasks = await localforage.getItem<any[]>(TASKS_KEY) || [];
-    const storedMap = new Map(storedTasks.map(t => [t.id, t]));
-    pendingUpdates.forEach((value, key) => storedMap.set(key, value));
-    await localforage.setItem(TASKS_KEY, Array.from(storedMap.values()));
-  } catch (error) {
-    console.error("Failed to persist local tasks:", error);
-  }
-};
-
-const queueTaskPersist = (task: Task): void => {
-  pendingTaskPersistMap.set(task.id, toStorableTask(task));
-  if (taskPersistTimer) clearTimeout(taskPersistTimer);
-  taskPersistTimer = setTimeout(async () => {
-    taskPersistTimer = null;
-    await flushPendingTaskPersist();
-  }, TASK_PERSIST_DEBOUNCE_MS);
+const queueTaskPersist = (_task: Task): void => {
+  // Intentionally no-op:
+  // task data must not be persisted to local storage.
 };
 
 const persistCachedTasks = async () => {
-  await localforage.setItem(TASKS_KEY, cachedTasks.map(toStorableTask));
+  // Intentionally no-op:
+  // task list/state must be sourced from server only.
 };
 
 const getTaskCommitSignature = (task: Task): string => {
@@ -156,15 +302,13 @@ const refreshCommittedTaskSignatures = () => {
 
 // Helper to migrate from localStorage to localforage
 const migrateFromLocalStorage = async () => {
-  const tasks = localStorage.getItem(TASKS_KEY);
   const logs = localStorage.getItem(LOGS_KEY);
   const meta = localStorage.getItem(FOLDER_META_KEY);
 
-  if (tasks) await localforage.setItem(TASKS_KEY, JSON.parse(tasks));
   if (logs) await localforage.setItem(LOGS_KEY, JSON.parse(logs));
   if (meta) await localforage.setItem(FOLDER_META_KEY, JSON.parse(meta));
 
-  if (tasks || logs || meta) {
+  if (logs || meta) {
     console.log("Migration from localStorage to IndexedDB complete.");
     // We don't clear immediately to be safe, but we could.
     // localStorage.clear(); 
@@ -174,36 +318,12 @@ const migrateFromLocalStorage = async () => {
 // 1. Initialize: Fetch first page of data from server
 export const initStorage = async () => {
   try {
-    // Initial fetch: first page only (additional pages can be loaded on demand)
-    const res = await fetch(`/api/datasets?limit=${INITIAL_TASK_FETCH_LIMIT}&offset=0`);
-    if (!res.ok) throw new Error('Failed to fetch datasets');
-    const files = await res.json();
-
-    // Try to get from localforage first
-    let storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
-
-    // If empty, try migration
-    if (!storedTasks) {
-      await migrateFromLocalStorage();
-      storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
-    }
-
-    const existingTasks: any[] = storedTasks || [];
+    await migrateFromLocalStorage();
     cachedLogs = await localforage.getItem<WorkLog[]>(LOGS_KEY) || [];
     cachedFolderMeta = await localforage.getItem<Record<string, any>>(FOLDER_META_KEY) || {};
 
-    // Keep previously cached items, then merge first page for fast startup.
-    const taskMap = new Map(existingTasks.map(t => [t.id, { ...t, annotations: t.annotations || [] }]));
-    files.forEach((f: any) => {
-      const existing = taskMap.get(f.id);
-      taskMap.set(f.id, normalizeServerTask(f, existing));
-    });
-    cachedTasks = Array.from(taskMap.values()) as Task[];
-    await persistCachedTasks();
-    refreshCommittedTaskSignatures();
-
-    // Sync Logs
-    await syncLogs();
+    // Initial sync
+    await syncTasksDelta();
 
     isInitialized = true;
   } catch (e) {
@@ -383,7 +503,15 @@ export const getProjectSummary = async () => {
  */
 export const loadMoreTasks = async (offset: number, limit: number = 5000) => {
   try {
-    const res = await fetch(`/api/datasets?limit=${limit}&offset=${offset}`);
+    let url = '';
+    if (cachedTasks.length > 0) {
+      const last = cachedTasks[cachedTasks.length - 1];
+      url = buildDatasetsUrl(limit, 0, last.lastUpdated, last.id);
+    } else {
+      url = buildDatasetsUrl(limit, offset);
+    }
+
+    const res = await fetch(url);
     if (!res.ok) throw new Error('Failed to fetch more datasets');
     const files = await res.json();
 
@@ -400,38 +528,70 @@ export const loadMoreTasks = async (offset: number, limit: number = 5000) => {
   }
 };
 
-export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT) => {
+export const syncTasksDelta = async () => {
   try {
+    const maxTimestamp = cachedTasks.length > 0
+      ? Math.max(...cachedTasks.map(t => t.lastUpdated || 0))
+      : 0;
+
+    const params = new URLSearchParams({ since: String(maxTimestamp) });
+    if (_workerScope) params.set('worker', _workerScope);
+
+    // 1. Fetch Deltas
+    const res = await fetch(`/api/sync/delta?${params.toString()}`);
+    if (!res.ok) throw new Error('Failed to fetch delta sync');
+    const { updated, deleted } = await res.json();
+
     const baseMap = new Map(cachedTasks.map(t => [t.id, t]));
-    const seenIds = new Set<string>();
-    let offset = 0;
 
-    while (true) {
-      const res = await fetch(`/api/datasets?limit=${limit}&offset=${offset}`);
-      if (!res.ok) throw new Error('Failed to fetch datasets');
-      const batch = await res.json();
-      if (!Array.isArray(batch) || batch.length === 0) break;
+    // 2. Handle Deletions
+    if (deleted && deleted.length > 0) {
+      const deletedSet = new Set(deleted);
+      cachedTasks = cachedTasks.filter(t => !deletedSet.has(t.id));
+      deleted.forEach((id: string) => baseMap.delete(id));
+    }
 
-      batch.forEach((f: any) => {
-        seenIds.add(f.id);
+    // 3. Handle Updates/New Tasks
+    if (updated && updated.length > 0) {
+      updated.forEach((f: any) => {
         const existing = baseMap.get(f.id);
         baseMap.set(f.id, normalizeServerTask(f, existing));
       });
-
-      offset += batch.length;
-      if (batch.length < limit) break;
+      cachedTasks = Array.from(baseMap.values())
+        .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
     }
 
-    // Full sync path: remove tasks that no longer exist on server.
-    const merged = Array.from(baseMap.values()).filter((task: Task) => seenIds.has(task.id));
-    cachedTasks = merged;
+    // 4. Initial Load if empty (or for some reason we need a clean start)
+    if (cachedTasks.length === 0) {
+      let offset = 0;
+      while (true) {
+        const res = await fetch(buildDatasetsUrl(INITIAL_TASK_FETCH_LIMIT, offset));
+        if (!res.ok) break;
+        const batch = await res.json();
+        if (!batch || batch.length === 0) break;
+        batch.forEach((f: any) => {
+          if (!baseMap.has(f.id)) {
+            baseMap.set(f.id, normalizeServerTask(f));
+          }
+        });
+        offset += batch.length;
+        if (batch.length < INITIAL_TASK_FETCH_LIMIT) break;
+      }
+      cachedTasks = Array.from(baseMap.values())
+        .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+    }
+
     await persistCachedTasks();
     refreshCommittedTaskSignatures();
     return cachedTasks.length;
   } catch (e) {
-    console.error("Full task sync failed:", e);
+    console.error("Delta task sync failed:", e);
     return cachedTasks.length;
   }
+};
+
+export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT) => {
+  return await syncTasksDelta();
 };
 
 export const getTasks = (): Task[] => {
@@ -439,8 +599,28 @@ export const getTasks = (): Task[] => {
 };
 
 export const getTaskById = async (id: string): Promise<Task | undefined> => {
-  const task = cachedTasks.find(t => t.id === id);
+  let task = cachedTasks.find(t => t.id === id);
   if (!task) return undefined;
+
+  // List API omits sourceData; fetch full task when needed (e.g. VLM review)
+  if (task.sourceType === 'vlm-review' && task.sourceData == null) {
+    try {
+      const res = await fetch(`/api/task?id=${encodeURIComponent(id)}`);
+      if (res.ok) {
+        const full = await res.json();
+        task = {
+          ...task,
+          ...full,
+          annotations: task.annotations ?? full.annotations,
+          isModified: full.isModified === 1 || full.isModified === true
+        } as Task;
+        const idx = cachedTasks.findIndex(t => t.id === id);
+        if (idx !== -1) cachedTasks[idx] = task;
+      }
+    } catch (e) {
+      console.error("Failed to load full task", id, e);
+    }
+  }
 
   // If annotations are still empty, try to load from labels
   if ((!task.annotations || task.annotations.length === 0) && task.txtPath) {
@@ -458,16 +638,18 @@ export const getTaskById = async (id: string): Promise<Task | undefined> => {
   return task;
 };
 
-const updateTaskInCache = async (task: Task) => {
+const updateTaskInCache = async (task: Task, persistLocally: boolean = false) => {
   const index = cachedTasks.findIndex(t => t.id === task.id);
   if (index !== -1) {
     cachedTasks[index] = task;
-    queueTaskPersist(task);
+    if (persistLocally) {
+      queueTaskPersist(task);
+    }
   }
 }
 
 /**
- * Updates task in memory and IndexedDB only.
+ * Updates task in memory only.
  * Sets isDirty flag to true for manual modifications.
  */
 export const updateTaskLocally = async (taskId: string, updates: Partial<Task>): Promise<Task> => {
@@ -481,7 +663,7 @@ export const updateTaskLocally = async (taskId: string, updates: Partial<Task>):
     lastUpdated: Date.now()
   };
 
-  await updateTaskInCache(updatedTask);
+  await updateTaskInCache(updatedTask, false);
   return updatedTask;
 };
 
@@ -502,7 +684,8 @@ export const syncTaskToServer = async (taskId: string): Promise<void> => {
     const key = task.imageUrl.startsWith('/datasets/')
       ? task.imageUrl.substring('/datasets/'.length)
       : (task.folder === 'Unsorted' ? task.name : `${task.folder}/${task.name}`);
-    const shouldPersistLabel = task.isModified || task.status === TaskStatus.SUBMITTED;
+    const isVlmTask = task.sourceType === 'vlm-review';
+    const shouldPersistLabel = !isVlmTask && (task.isModified || task.status === TaskStatus.SUBMITTED);
     const labelPayload = shouldPersistLabel
       ? (() => {
         if (!task.txtPath) {
@@ -530,6 +713,10 @@ export const syncTaskToServer = async (taskId: string): Promise<void> => {
             isModified: task.isModified ? 1 : 0,
             assignedWorker: task.assignedWorker,
             reviewerNotes: task.reviewerNotes,
+            sourceType: task.sourceType || 'native-yolo',
+            sourceRefId: task.sourceRefId,
+            sourceFile: task.sourceFile,
+            sourceData: task.sourceData,
             lastUpdated: task.lastUpdated
           }
         }
@@ -539,6 +726,7 @@ export const syncTaskToServer = async (taskId: string): Promise<void> => {
     markTaskAsCommitted(task);
   } catch (e) {
     console.error("Failed to sync task commit", e);
+    throw e;
   }
 };
 
@@ -561,18 +749,6 @@ export const assignFolderToWorker = async (folderName: string, workerName: strin
     }
     return t;
   });
-
-  // Update IndexedDB WITHOUT annotations
-  const storedTasks = await localforage.getItem<any[]>(TASKS_KEY);
-  if (storedTasks) {
-    const updatedTasks = storedTasks.map(t => {
-      if (t.folder === folderName) {
-        return { ...t, assignedWorker: workerName, lastUpdated: timestamp };
-      }
-      return t;
-    });
-    await localforage.setItem(TASKS_KEY, updatedTasks);
-  }
 
   // 2. Persist to Server (Physical Move)
   try {
@@ -607,6 +783,7 @@ export const logAction = async (
   isModifiedOverride?: boolean
 ) => {
   const task = cachedTasks.find(t => t.id === taskId);
+  const cappedDurationSeconds = Math.min(300, Math.max(0, Number(durationSeconds || 0)));
   let stats = undefined;
   if (task && (action === 'SUBMIT' || action === 'APPROVE' || action === 'SAVE')) {
     stats = {
@@ -615,20 +792,40 @@ export const logAction = async (
     };
   }
 
+  const normalizedUserId = userId.trim();
+  const deterministicSubmitId = `submit:${taskId}:${normalizedUserId}`;
+  const logId = action === 'SUBMIT'
+    ? deterministicSubmitId
+    : Math.random().toString(36).substr(2, 9);
+
   const newLog: WorkLog = {
-    id: Math.random().toString(36).substr(2, 9),
+    id: logId,
     taskId,
-    userId: userId.trim(),
+    userId: normalizedUserId,
     role,
     folder: task?.folder || 'Unknown',
     action,
     timestamp: Date.now(),
-    durationSeconds,
+    durationSeconds: cappedDurationSeconds,
     isModified: isModifiedOverride !== undefined ? isModifiedOverride : task?.isModified,
-    stats
+    stats,
+    sourceType: task?.sourceType || 'native-yolo'
   };
-
-  cachedLogs.push(newLog);
+  if (action === 'SUBMIT') {
+    const existingIndex = cachedLogs.findIndex(l => l.id === logId);
+    if (existingIndex >= 0) {
+      const existing = cachedLogs[existingIndex];
+      cachedLogs[existingIndex] = {
+        ...existing,
+        ...newLog,
+        durationSeconds: cappedDurationSeconds
+      };
+    } else {
+      cachedLogs.push(newLog);
+    }
+  } else {
+    cachedLogs.push(newLog);
+  }
   await localforage.setItem(LOGS_KEY, cachedLogs);
 
   // Push unsynced logs immediately, but avoid frequent pull requests while navigating.
@@ -709,7 +906,10 @@ export const createTaskIssue = async (payload: {
       })
     });
     if (!res.ok) throw new Error('Failed to create issue');
-    return await res.json();
+    const data = await res.json();
+    // Locallly update the task status to ISSUE_PENDING to lock it immediately
+    await updateTaskLocally(payload.taskId, { status: TaskStatus.ISSUE_PENDING });
+    return data;
   } catch (e) {
     console.error("Failed to create task issue:", e);
     throw e;
@@ -752,8 +952,11 @@ export const updateTaskIssueStatus = async (
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id, status, resolvedBy, resolutionNote })
     });
-    if (!res.ok) throw new Error('Failed to update issue status');
-    return await res.json();
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.error || 'Failed to update issue status');
+    }
+    return data;
   } catch (e) {
     console.error("Failed to update task issue status:", e);
     throw e;
@@ -813,6 +1016,267 @@ export const getScheduleBoard = async (startDate: string, endDate: string): Prom
   } catch (e) {
     console.error("Failed to fetch schedule board:", e);
     return {};
+  }
+};
+
+export const getProjects = async (): Promise<ProjectDefinition[]> => {
+  try {
+    const res = await fetch('/api/projects');
+    if (!res.ok) throw new Error('Failed to fetch projects');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch projects:", e);
+    return [];
+  }
+};
+
+export const saveProject = async (payload: {
+  id?: string;
+  name: string;
+  targetTotal: number;
+  workflowSourceType?: 'native-yolo' | 'vlm-review';
+  vlmSourceFile?: string;
+  visibleToWorkers?: boolean;
+}) => {
+  try {
+    const res = await fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to save project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to save project:", e);
+    throw e;
+  }
+};
+
+export const archiveProject = async (payload: { projectId: string; snapshot?: ProjectDetailPayload | null }) => {
+  try {
+    const res = await fetch('/api/projects/archive', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to archive project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to archive project:", e);
+    throw e;
+  }
+};
+
+export const restoreProject = async (payload: { projectId: string }) => {
+  try {
+    const res = await fetch('/api/projects/restore', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to restore project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to restore project:", e);
+    throw e;
+  }
+};
+
+export const mapFolderToProject = async (folder: string, projectId: string | null) => {
+  try {
+    const res = await fetch('/api/projects/map', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ folder, projectId })
+    });
+    if (!res.ok) throw new Error('Failed to map folder to project');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to map folder to project:", e);
+    throw e;
+  }
+};
+
+export const getProjectOverview = async (): Promise<ProjectOverviewPayload> => {
+  try {
+    const res = await fetch('/api/projects/overview');
+    if (!res.ok) throw new Error('Failed to fetch project overview');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch project overview:", e);
+    return {
+      projects: [],
+      projectMap: {},
+      unassigned: { folderCount: 0, allocated: 0, completed: 0 },
+      folders: []
+    };
+  }
+};
+
+export const getProjectDetail = async (projectId: string, days: number = 30): Promise<ProjectDetailPayload | null> => {
+  try {
+    const query = `?projectId=${encodeURIComponent(projectId)}&days=${encodeURIComponent(String(days))}`;
+    const res = await fetch(`/api/projects/detail${query}`);
+    if (!res.ok) throw new Error('Failed to fetch project detail');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to fetch project detail:", e);
+    return null;
+  }
+};
+
+export const listPlugins = async (): Promise<PluginDescriptor[]> => {
+  try {
+    const res = await fetch('/api/plugins');
+    if (!res.ok) throw new Error('Failed to fetch plugins');
+    const payload = await res.json();
+    return Array.isArray(payload?.plugins) ? payload.plugins : [];
+  } catch (e) {
+    console.error("Failed to fetch plugins:", e);
+    return [];
+  }
+};
+
+export const getVlmMigrationDryRun = async (limit: number = 100, offset: number = 0): Promise<VlmMigrationDryRunResult | null> => {
+  try {
+    const query = `?limit=${encodeURIComponent(String(limit))}&offset=${encodeURIComponent(String(offset))}`;
+    const res = await fetch(`/api/plugins/vlm/dry-run${query}`);
+    if (!res.ok) throw new Error('Failed to run VLM dry-run');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to run VLM dry-run:", e);
+    return null;
+  }
+};
+
+export const migrateVlmData = async (payload?: { commit?: boolean; limit?: number; offset?: number }) => {
+  try {
+    const res = await fetch('/api/plugins/vlm/migrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || { commit: false, limit: 10000, offset: 0 })
+    });
+    if (!res.ok) throw new Error('Failed to migrate VLM data');
+    return await res.json();
+  } catch (e) {
+    console.error("Failed to migrate VLM data:", e);
+    throw e;
+  }
+};
+
+export const listVlmImportJsonFiles = async (): Promise<VlmImportJsonFileInfo[]> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/import-json/files');
+    if (!res.ok) throw new Error('Failed to fetch VLM import json files');
+    const payload = await res.json();
+    return Array.isArray(payload?.files) ? payload.files : [];
+  } catch (e) {
+    console.error('Failed to fetch VLM import json files:', e);
+    return [];
+  }
+};
+
+export const importVlmJsonData = async (payload: {
+  sourceFiles: string[];
+  commit?: boolean;
+  assignees?: string[];
+  assignCount?: number;
+  keepUnassigned?: boolean;
+  imagePathMappings?: Array<{ from: string; to: string }>;
+}): Promise<VlmJsonImportResult> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/import-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to import VLM json data';
+      throw new Error(msg);
+    }
+    return data;
+  } catch (e) {
+    console.error('Failed to import VLM json data:', e);
+    throw e;
+  }
+};
+
+export interface VlmAssignSourceFileInfo {
+  sourceFile: string;
+  total: number;
+  unassigned: number;
+}
+
+export const getVlmAssignSourceFiles = async (projectId: string): Promise<VlmAssignSourceFileInfo[]> => {
+  const res = await fetch(`/api/plugins/vlm/assign/source-files?projectId=${encodeURIComponent(projectId)}`);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return [];
+  return Array.isArray(data?.sourceFiles) ? data.sourceFiles : [];
+};
+
+export const assignVlmTasks = async (payload: {
+  workerName: string;
+  count: number;
+  projectId?: string;
+  sourceFiles?: string[];
+}): Promise<{ assigned: number }> => {
+  const res = await fetch('/api/plugins/vlm/assign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to assign VLM tasks';
+    throw new Error(msg);
+  }
+  return data;
+};
+
+export const unassignVlmTasks = async (payload: {
+  workerName: string;
+  count: number;
+  projectId?: string;
+  sourceFiles?: string[];
+}): Promise<{ unassigned: number }> => {
+  const res = await fetch('/api/plugins/vlm/unassign', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload)
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to unassign VLM tasks';
+    throw new Error(msg);
+  }
+  return data;
+};
+
+export const listVlmExportJsonFiles = async (): Promise<VlmExportJsonFileInfo[]> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/export-json/files');
+    if (!res.ok) throw new Error('Failed to fetch VLM export files');
+    const payload = await res.json();
+    return Array.isArray(payload?.files) ? payload.files : [];
+  } catch (e) {
+    console.error('Failed to fetch VLM export files:', e);
+    return [];
+  }
+};
+
+export const exportVlmJsonData = async (payload: { sourceFiles: string[]; onlySubmitted?: boolean; includeResult?: boolean }): Promise<VlmExportJsonResult> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/export-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    if (!res.ok) throw new Error('Failed to export VLM json data');
+    return await res.json();
+  } catch (e) {
+    console.error('Failed to export VLM json data:', e);
+    throw e;
   }
 };
 

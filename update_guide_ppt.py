@@ -36,9 +36,10 @@ def convert_ppt_to_pdf(input_path, output_path):
 
     except Exception as e:
         error_msg = str(e)
-        if "Invalid class string" in error_msg or "-2147221005" in error_msg:
-            print(f"  -> Error: Microsoft PowerPoint is not installed or not registered.")
-            print(f"     (This script requires PowerPoint to be installed on the machine running it)")
+        # Check for both English and Korean localized "Invalid class string" error messages
+        if "Invalid class string" in error_msg or "잘못된 클래스 문자열입니다" in error_msg or "-2147221005" in error_msg:
+            print(f"  -> 오류: Microsoft PowerPoint가 설치되어 있지 않거나 등록되지 않았습니다.")
+            print(f"     (이 스크립트는 PowerPoint 정품이 설치된 환경에서만 작동합니다.)")
         else:
             print(f"Error during conversion of {os.path.basename(input_path)}: {e}")
         return False
@@ -101,10 +102,15 @@ if __name__ == "__main__":
         
         # Convert
         success = True
+        skip_conversion = False
         if should_convert:
             success = convert_ppt_to_pdf(source_file, target_file)
+            if not success and os.path.exists(target_file):
+                print(f"  -> 경고: 변환 실패했으나 기존 PDF가 있어 목록에 포함합니다.")
+                success = True
+                skip_conversion = True
         
-        if success:
+        if success or (not should_convert and os.path.exists(target_file)):
             guide_list.append({
                 "title": name_without_ext,
                 "filename": pdf_filename
