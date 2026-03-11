@@ -588,7 +588,13 @@ const fileSystemMiddleware = () => {
           assignedWorker: normalizedRow.assignedWorker || merged.assignedWorker || ''
         });
       });
-      const folderStats = Array.from(folderStatsMergedMap.values());
+      const isHiddenFromMapping = (folder: string) => {
+        const f = String(folder || '').trim();
+        return f === 'images_vlm' || f.startsWith('images_vlm/') ||
+          f === '_trash' || f.startsWith('_trash/') ||
+          f === 'test' || f.startsWith('test/');
+      };
+      const folderStats = Array.from(folderStatsMergedMap.values()).filter((row: any) => !isHiddenFromMapping(row.folder));
 
       const existingFolders = new Set(folderStats.map((row: any) => row.folder));
       const projectMap: Record<string, { projectId: string; updatedAt: number }> = {};
@@ -599,6 +605,20 @@ const fileSystemMiddleware = () => {
             updatedAt: Number(mapping.updatedAt || 0)
           };
         }
+      });
+      // VLM projects: add virtual folders (e.g. VLM_filename) to projectMap so workers see assigned tasks
+      Object.values(projects).forEach((project: any) => {
+        if (normalizeWorkflowSourceType(project?.workflowSourceType) !== 'vlm-review' || !project?.vlmSourceFile) return;
+        try {
+          const rows = db.prepare('SELECT DISTINCT folder FROM vlm_tasks WHERE sourceFile = ?').all(project.vlmSourceFile) as Array<{ folder: string }>;
+          const now = Number(project.updatedAt || Date.now());
+          rows.forEach((r: any) => {
+            const folder = String(r.folder || '').trim();
+            if (folder) {
+              projectMap[folder] = { projectId: project.id, updatedAt: now };
+            }
+          });
+        } catch (_) {}
       });
 
       const statsByProject = new Map<string, { allocated: number; completed: number; folderCount: number }>();
@@ -1441,9 +1461,36 @@ const fileSystemMiddleware = () => {
                 imageExists: t.imageExists
               }))
             }));
-          } catch (e) {
+          } catch (e: any) {
             res.statusCode = 500;
-            res.end(JSON.stringify({ error: e.message }));
+            res.end(JSON.stringify({ error: e.message || String(e) }));
+          }
+        });
+      } else if (req.url.startsWith('/api/plugins/vlm/import-json') && req.method === 'DELETE') {
+        req.setEncoding('utf8');
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', () => {
+          try {
+            const payload = body ? JSON.parse(body) : {};
+            const sourceFiles = Array.isArray(payload.sourceFiles)
+              ? payload.sourceFiles.map((v: any) => String(v || '').trim()).filter(Boolean)
+              : [];
+            
+            if (sourceFiles.length === 0) {
+              res.statusCode = 400;
+              res.end(JSON.stringify({ error: 'sourceFiles is required' }));
+              return;
+            }
+
+            const placeholders = sourceFiles.map(() => '?').join(',');
+            const result = db.prepare(`DELETE FROM vlm_tasks WHERE sourceFile IN (${placeholders})`).run(...sourceFiles);
+            
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ success: true, deletedCount: result.changes }));
+          } catch (e: any) {
+            res.statusCode = 500;
+            res.end(JSON.stringify({ error: e.message || String(e) }));
           }
         });
       } else if (req.url.startsWith('/api/plugins/vlm/assign') && req.method === 'POST') {
@@ -1499,7 +1546,7 @@ const fileSystemMiddleware = () => {
               ids.forEach((id: string) => updateStmt.run(workerName, now, id));
             })();
             res.setHeader('Content-Type', 'application/json');
-            res.end(JSON.stringify({ assigned: ids.length }));
+            res.end(JSON.stringify({ assigned: ids.length, taskIds: ids }));
           } catch (e) {
             res.statusCode = 500;
             res.end(JSON.stringify({ error: e.message }));
@@ -1807,6 +1854,26 @@ const fileSystemMiddleware = () => {
       } else if (req.url.startsWith('/api/datasets')) {
         try {
           const url = new URL(req.url, `http://${req.headers.host}`);
+          const idsParam = url.searchParams.get('ids') || '';
+          const listCols = 'id, name, folder, imageUrl, txtPath, assignedWorker, status, reviewerNotes, isModified, lastUpdated, sourceType, sourceRefId, sourceFile';
+
+          // Fetch by specific task IDs (e.g. after VLM assign so client can merge into cache)
+          if (idsParam) {
+            const ids = idsParam.split(',').map((s: string) => s.trim()).filter(Boolean);
+            if (ids.length > 0) {
+              const placeholders = ids.map(() => '?').join(',');
+              const fromTasks = db.prepare(`SELECT ${listCols}, NULL as sourceData FROM tasks WHERE id IN (${placeholders})`).all(...ids) as any[];
+              const fromVlm = db.prepare(`SELECT ${listCols}, NULL as sourceData FROM vlm_tasks WHERE id IN (${placeholders})`).all(...ids) as any[];
+              const byId = new Map<string, any>();
+              fromTasks.forEach((r: any) => byId.set(r.id, r));
+              fromVlm.forEach((r: any) => byId.set(r.id, r));
+              const tasksById = ids.map((id: string) => byId.get(id)).filter(Boolean);
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify(tasksById));
+              return;
+            }
+          }
+
           const limit = parseInt(url.searchParams.get('limit') || '5000');
           const offset = parseInt(url.searchParams.get('offset') || '0');
           const lastUpdated = parseInt(url.searchParams.get('lastUpdated') || '-1');
@@ -1814,8 +1881,6 @@ const fileSystemMiddleware = () => {
           const workerFilter = url.searchParams.get('worker') || '';
           const folderFilter = url.searchParams.get('folder') || '';
 
-          // Exclude sourceData from list to keep payload small; use GET /api/task?id= for full task
-          const listCols = 'id, name, folder, imageUrl, txtPath, assignedWorker, status, reviewerNotes, isModified, lastUpdated, sourceType, sourceRefId, sourceFile';
           let tasks;
           let baseQuery = '';
           let params: any[] = [];
@@ -1827,10 +1892,6 @@ const fileSystemMiddleware = () => {
 
           const whereClause = whereArr.length > 0 ? `WHERE ${whereArr.join(" AND ")}` : "";
           const whereClauseVlm = whereArr.length > 0 ? `WHERE ${whereArr.join(" AND ")}` : "";
-
-          // Keyset or Offset
-          let paginationClause = `LIMIT ? OFFSET ?`;
-          let paginationParams = [limit, offset];
 
           if (lastUpdated !== -1 && lastId !== '') {
             // Use Keyset Pagination
@@ -3202,7 +3263,46 @@ const fileSystemMiddleware = () => {
               writeProjects(projects);
               res.setHeader('Content-Type', 'application/json');
               res.end(JSON.stringify({ success: true, project: projects[projectId] }));
-            } catch (e) {
+            } catch (e: any) {
+              res.statusCode = 500;
+              res.end(JSON.stringify({ error: e.message }));
+            }
+          });
+        } else if (req.method === 'DELETE') {
+          req.setEncoding('utf8');
+          let body = '';
+          req.on('data', chunk => { body += chunk.toString(); });
+          req.on('end', () => {
+            try {
+              const { projectId } = JSON.parse(body);
+              if (!projectId) {
+                throw new Error('projectId is required');
+              }
+              const projects = readProjects();
+              const project = projects[projectId];
+              if (project) {
+                const vlmSourceFile = project.vlmSourceFile ? String(project.vlmSourceFile).trim() : '';
+                if (vlmSourceFile) {
+                  const now = Date.now();
+                  db.prepare('UPDATE vlm_tasks SET assignedWorker = NULL, lastUpdated = ? WHERE sourceFile = ?').run(now, vlmSourceFile);
+                }
+                delete projects[projectId];
+                writeProjects(projects);
+              }
+              const map = readProjectMap();
+              let mapChanged = false;
+              for (const [folder, data] of Object.entries(map)) {
+                if (data.projectId === projectId) {
+                  delete map[folder];
+                  mapChanged = true;
+                }
+              }
+              if (mapChanged) {
+                writeProjectMap(map);
+              }
+              res.setHeader('Content-Type', 'application/json');
+              res.end(JSON.stringify({ success: true }));
+            } catch (e: any) {
               res.statusCode = 500;
               res.end(JSON.stringify({ error: e.message }));
             }

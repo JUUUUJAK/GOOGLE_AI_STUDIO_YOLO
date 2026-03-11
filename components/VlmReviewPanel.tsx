@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState, useCallback } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { Task, TaskStatus } from '../types';
 
 type VlmReviewResult = 'NORMAL' | 'NEEDS_FIX_VP' | 'NEEDS_FIX_DETAIL';
@@ -114,6 +114,21 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const [lastPanPos, setLastPanPos] = useState<{ x: number; y: number } | null>(null);
+  const imageContainerRef = useRef<HTMLDivElement>(null);
+
+  // 휠 확대/축소 시 페이지 스크롤 방지 (passive: false 필요)
+  useEffect(() => {
+    const el = imageContainerRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      const ZOOM_SPEED = 0.001;
+      const delta = -e.deltaY * ZOOM_SPEED;
+      setScale((prev) => Math.min(Math.max(0.1, prev + delta), 10));
+    };
+    el.addEventListener('wheel', handler, { passive: false });
+    return () => el.removeEventListener('wheel', handler);
+  }, []);
 
   useEffect(() => {
     setReviewResult(initialResult);
@@ -126,13 +141,6 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
     setIsPanning(false);
     setLastPanPos(null);
   }, [task.id, task.sourceData, task.reviewerNotes, initialResult, firstPrompt, rawResultData, parsed, initialDueDate]);
-
-  const handleWheel = useCallback((e: React.WheelEvent) => {
-    e.stopPropagation();
-    const ZOOM_SPEED = 0.001;
-    const delta = -e.deltaY * ZOOM_SPEED;
-    setScale((prev) => Math.min(Math.max(0.1, prev + delta), 10));
-  }, []);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button === 0 || e.button === 1 || e.button === 2) {
@@ -257,21 +265,21 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
 
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
         <div 
-          className="bg-slate-900 border border-slate-800 rounded-xl p-3 min-h-[280px] flex items-center justify-center relative overflow-hidden"
-          onWheel={handleWheel}
+          ref={imageContainerRef}
+          className="bg-slate-900 border border-slate-800 rounded-xl p-3 h-[55vh] min-h-[320px] flex items-center justify-center relative overflow-hidden"
           onMouseDown={handleMouseDown}
           onContextMenu={(e) => e.preventDefault()}
           style={{ cursor: isPanning ? 'grabbing' : 'grab' }}
         >
           {canLoadImage ? (
             <div
-              className="relative origin-center"
+              className="relative origin-center h-full flex items-center justify-center"
               style={{
                 transform: `translate(${pan.x}px, ${pan.y}px) scale(${scale})`,
                 transition: isPanning ? 'none' : 'transform 0.075s ease-out'
               }}
             >
-              <img src={imageSrc} alt={task.name} className="max-h-[340px] w-auto rounded-lg border border-slate-700 object-contain pointer-events-none select-none" draggable={false} />
+              <img src={imageSrc} alt={task.name} className="h-full max-w-full rounded-lg border border-slate-700 object-contain pointer-events-none select-none" draggable={false} />
             </div>
           ) : (
             <div className="text-xs text-slate-500 break-all p-3 bg-slate-950 border border-slate-800 rounded-md w-full">

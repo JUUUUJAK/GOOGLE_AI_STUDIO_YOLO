@@ -594,6 +594,24 @@ export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT)
   return await syncTasksDelta();
 };
 
+/** Fetch tasks by ID and merge into cache (e.g. after VLM assign so UI sees new assignments) */
+export const mergeTasksByIds = async (taskIds: string[]): Promise<void> => {
+  if (!taskIds || taskIds.length === 0) return;
+  const url = `/api/datasets?ids=${taskIds.map((id) => encodeURIComponent(id)).join(',')}`;
+  const res = await fetch(url);
+  if (!res.ok) return;
+  const batch = await res.json();
+  if (!Array.isArray(batch) || batch.length === 0) return;
+  const baseMap = new Map(cachedTasks.map((t) => [t.id, t]));
+  batch.forEach((f: any) => {
+    const existing = baseMap.get(f.id);
+    baseMap.set(f.id, normalizeServerTask(f, existing));
+  });
+  cachedTasks = Array.from(baseMap.values())
+    .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+  await persistCachedTasks();
+};
+
 export const getTasks = (): Task[] => {
   return cachedTasks;
 };
@@ -1052,6 +1070,21 @@ export const saveProject = async (payload: {
   }
 };
 
+export const deleteProject = async (projectId: string) => {
+  try {
+    const res = await fetch('/api/projects', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ projectId })
+    });
+    if (!res.ok) throw new Error('Failed to delete project');
+    return await res.json();
+  } catch (e) {
+    console.error('Failed to delete project:', e);
+    throw e;
+  }
+};
+
 export const archiveProject = async (payload: { projectId: string; snapshot?: ProjectDetailPayload | null }) => {
   try {
     const res = await fetch('/api/projects/archive', {
@@ -1202,6 +1235,25 @@ export const importVlmJsonData = async (payload: {
   }
 };
 
+export const deleteVlmJsonData = async (payload: { sourceFiles: string[] }): Promise<{ success: boolean; deletedCount: number }> => {
+  try {
+    const res = await fetch('/api/plugins/vlm/import-json', {
+      method: 'DELETE',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to delete VLM json data';
+      throw new Error(msg);
+    }
+    return data;
+  } catch (e) {
+    console.error('Failed to delete VLM json data:', e);
+    throw e;
+  }
+};
+
 export interface VlmAssignSourceFileInfo {
   sourceFile: string;
   total: number;
@@ -1220,7 +1272,7 @@ export const assignVlmTasks = async (payload: {
   count: number;
   projectId?: string;
   sourceFiles?: string[];
-}): Promise<{ assigned: number }> => {
+}): Promise<{ assigned: number; taskIds?: string[] }> => {
   const res = await fetch('/api/plugins/vlm/assign', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1231,6 +1283,8 @@ export const assignVlmTasks = async (payload: {
     const msg = (data && typeof data.error === 'string') ? data.error : res.statusText || 'Failed to assign VLM tasks';
     throw new Error(msg);
   }
+  const taskIds = Array.isArray(data?.taskIds) ? data.taskIds : [];
+  if (taskIds.length > 0) await mergeTasksByIds(taskIds);
   return data;
 };
 

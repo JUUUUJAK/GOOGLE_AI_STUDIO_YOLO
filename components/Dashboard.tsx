@@ -1812,6 +1812,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
     const [selectedForBulk, setSelectedForBulk] = useState<Set<string>>(new Set());
     const [bulkTargetProject, setBulkTargetProject] = useState<string>('');
     const [editingProjectId, setEditingProjectId] = useState<string>('');
+    const [editingName, setEditingName] = useState<string>('');
     const [editingTargetTotal, setEditingTargetTotal] = useState<string>('');
     const [editingWorkflowSourceType, setEditingWorkflowSourceType] = useState<'native-yolo' | 'vlm-review'>('native-yolo');
     const [editingVisibleToWorkers, setEditingVisibleToWorkers] = useState<boolean>(true);
@@ -1872,12 +1873,14 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
     useEffect(() => {
         if (!activeProjects.length) {
             setEditingProjectId('');
+            setEditingName('');
             setEditingTargetTotal('');
             setEditingWorkflowSourceType('native-yolo');
             return;
         }
         const selected = activeProjects.find((p) => p.id === editingProjectId) || activeProjects[0];
         setEditingProjectId(selected.id);
+        setEditingName(selected.name || '');
         setEditingTargetTotal(String(selected.targetTotal ?? ''));
         setEditingWorkflowSourceType(selected.workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
         setEditingVisibleToWorkers(selected.visibleToWorkers !== false);
@@ -1990,7 +1993,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         try {
             await Storage.saveProject({
                 id: target.id,
-                name: target.name,
+                name: editingName.trim() || target.name,
                 targetTotal: Math.max(0, Number(editingTargetTotal || 0)),
                 workflowSourceType: editingWorkflowSourceType,
                 visibleToWorkers: editingVisibleToWorkers
@@ -2420,6 +2423,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                     setEditingProjectId(nextId);
                                                     const target = overview.projects.find((p) => p.id === nextId);
                                                     if (target) {
+                                                        setEditingName(target.name || '');
                                                         setEditingTargetTotal(String(target.targetTotal ?? ''));
                                                         setEditingWorkflowSourceType(target.workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
                                                         setEditingVisibleToWorkers(target.visibleToWorkers !== false);
@@ -2433,6 +2437,15 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                     </option>
                                                 ))}
                                             </select>
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">프로젝트 일괄 이름 변경</label>
+                                            <input
+                                                type="text"
+                                                value={editingName}
+                                                onChange={(e) => setEditingName(e.target.value)}
+                                                className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors"
+                                            />
                                         </div>
                                         <div>
                                             <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">목표량</label>
@@ -2890,6 +2903,32 @@ const VlmMigrationView: React.FC<{ onRefreshTasks: () => void; workers: string[]
         }
     };
 
+    const runJsonDelete = async () => {
+        const sourceFiles = Array.from(selectedImportFiles);
+        if (sourceFiles.length === 0) {
+            alert('삭제할 json 파일을 선택해주세요.');
+            return;
+        }
+        const ok = window.confirm(`선택한 ${sourceFiles.length}개의 json 파일로 가져온 데이터를 DB에서 완전히 삭제하시겠습니까? (복구 불가)`);
+        if (!ok) return;
+
+        setLoadingCommit(true);
+        try {
+            const payload = { sourceFiles };
+            const result = await Storage.deleteVlmJsonData(payload);
+            setImportCommitResult(null);
+            setImportDryRunResult(null);
+            onRefreshTasks();
+            await refreshImportFiles();
+            onRefreshOverview?.();
+            alert(`삭제 완료 (총 ${result.deletedCount || 0}건 삭제됨)`);
+        } catch (e: any) {
+            alert(`삭제 실패: ${e?.message || '알 수 없는 오류'}`);
+        } finally {
+            setLoadingCommit(false);
+        }
+    };
+
     const runJsonExport = async () => {
         const sourceFiles = Array.from(selectedExportFiles);
         if (sourceFiles.length === 0) {
@@ -3047,6 +3086,13 @@ const VlmMigrationView: React.FC<{ onRefreshTasks: () => void; workers: string[]
                                 className="px-3 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold disabled:opacity-50"
                             >
                                 {loadingCommit ? '처리 중...' : 'Import 실행'}
+                            </button>
+                            <button
+                                onClick={runJsonDelete}
+                                disabled={loadingCommit}
+                                className="px-3 py-2 rounded-lg bg-rose-600 hover:bg-rose-500 text-white text-xs font-bold disabled:opacity-50 ml-auto"
+                            >
+                                가져온 데이터 삭제
                             </button>
                         </div>
                     </div>
@@ -3231,7 +3277,7 @@ const VlmMigrationView: React.FC<{ onRefreshTasks: () => void; workers: string[]
     );
 };
 
-const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review') => void; onArchived?: () => void; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, workerNames = [], tasks, onSelectTask }) => {
+const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review') => void; onArchived?: () => void; onRefresh?: () => void; onRefreshTasksFromServer?: () => Promise<void>; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, onRefresh, onRefreshTasksFromServer, workerNames = [], tasks, onSelectTask }) => {
     const [days, setDays] = useState<number>(30);
     const [loading, setLoading] = useState<boolean>(true);
     const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -3341,6 +3387,29 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
         }
     };
 
+    const handleDeleteProject = async () => {
+        if (!project?.id) return;
+        const ok = window.confirm('프로젝트를 정말 삭제하시겠습니까?\n이 프로젝트에 연결된 폴더 매핑도 모두 즉시 해제되며 복구할 수 없습니다.');
+        if (!ok) return;
+        setArchiving(true); // 재사용
+        try {
+            await Storage.deleteProject(project.id);
+            Array.from(projectDetailCache.keys()).forEach((key) => {
+                if (key.startsWith(`${project.id}::`)) {
+                    projectDetailCache.delete(key);
+                }
+            });
+            await onRefreshTasksFromServer?.();
+            alert('프로젝트가 영구적으로 삭제되었습니다.');
+            onArchived?.();
+            onBack();
+        } catch (_e) {
+            alert('프로젝트 삭제에 실패했습니다.');
+        } finally {
+            setArchiving(false);
+        }
+    };
+
     return (
         <div className="flex flex-col h-full bg-slate-900">
             <div className="px-6 py-4 border-b border-slate-800 bg-slate-800/30 flex items-center justify-between">
@@ -3399,11 +3468,18 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                         {refreshing ? '새로고침 중...' : '지표 새로고침'}
                     </button>
                     <button
+                        onClick={handleDeleteProject}
+                        disabled={archiving || loading || refreshing}
+                        className="px-3 py-2 rounded-lg bg-rose-700 hover:bg-rose-600 text-white text-xs font-bold disabled:opacity-50"
+                    >
+                        삭제
+                    </button>
+                    <button
                         onClick={handleArchiveProject}
                         disabled={archiving || isArchived || loading || refreshing}
                         className="px-3 py-2 rounded-lg bg-amber-700 hover:bg-amber-600 text-white text-xs font-bold disabled:opacity-50"
                     >
-                        {isArchived ? '아카이브 완료' : (archiving ? '아카이브 중...' : '아카이브')}
+                        {isArchived ? '아카이브 완료' : (archiving ? '처리 중...' : '아카이브')}
                     </button>
                 </div>
             </div>
@@ -3530,7 +3606,9 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                         try {
                                                             const result = await Storage.assignVlmTasks({ workerName: vlmAssignWorker, count, projectId });
                                                             alert(`${result.assigned}건 배정되었습니다.`);
+                                                            await onRefreshTasksFromServer?.();
                                                             await handleRefreshDetail();
+                                                            onRefresh?.();
                                                         } catch (e: any) {
                                                             alert(e?.message || '배정 실패');
                                                         } finally {
@@ -3574,7 +3652,9 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                         try {
                                                             const result = await Storage.unassignVlmTasks({ workerName: vlmUnassignWorker, count, projectId });
                                                             alert(`${result.unassigned}건 배정 해제되었습니다.`);
+                                                            await onRefreshTasksFromServer?.();
                                                             await handleRefreshDetail();
+                                                            onRefresh?.();
                                                         } catch (e: any) {
                                                             alert(e?.message || '배정 해제 실패');
                                                         } finally {
@@ -3615,11 +3695,18 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                             onClick={() => {
                                                                 if (project.workflowSourceType === 'vlm-review') {
                                                                     const projectFolderNames = folders.map(f => f.folder);
-                                                                    if (projectFolderNames.length === 0 && project.vlmSourceFile) {
-                                                                        projectFolderNames.push(project.vlmSourceFile);
+                                                                    if (project.vlmSourceFile) {
+                                                                        if (projectFolderNames.length === 0) {
+                                                                            projectFolderNames.push(project.vlmSourceFile);
+                                                                            const base = (project.vlmSourceFile || '').replace(/\.json$/i, '');
+                                                                            if (base) projectFolderNames.push(`VLM_${base}`);
+                                                                        }
                                                                     }
-
-                                                                    const targetTasks = tasks.filter(t => projectFolderNames.includes(t.folder) && t.assignedWorker === row.userId);
+                                                                    const isVlmTaskInProject = (t: Task) =>
+                                                                        t.assignedWorker === row.userId &&
+                                                                        (projectFolderNames.includes(t.folder) ||
+                                                                         (t.sourceType === 'vlm-review' && project.vlmSourceFile && t.sourceFile === project.vlmSourceFile));
+                                                                    const targetTasks = tasks.filter(isVlmTaskInProject);
 
                                                                     if (targetTasks.length > 0) {
                                                                         const isReviewer = role === UserRole.REVIEWER;
@@ -4548,6 +4635,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                             role={role}
                             onBack={() => setSelectedFolder(PROJECT_OVERVIEW_VIEW)}
                             onArchived={() => onRefresh()}
+                            onRefresh={onRefresh}
+                            onRefreshTasksFromServer={onLightRefresh}
                             workerNames={workers}
                             onOpenFolder={(folderName, workflowSourceType) => {
                                 setFolderReturnView(`${PROJECT_DETAIL_VIEW_PREFIX}${selectedProjectId}`);

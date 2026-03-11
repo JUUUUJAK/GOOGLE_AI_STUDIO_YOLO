@@ -849,7 +849,7 @@ const App: React.FC = () => {
 
             <main className="flex-1 relative flex overflow-hidden">
                 <>
-                    {!currentTask ? (
+                    <div style={{ display: currentTask ? 'none' : 'flex' }} className="flex-1 w-full h-full overflow-hidden">
                         <Dashboard
                             role={currentUserRole}
                             accountType={user.accountType}
@@ -861,7 +861,8 @@ const App: React.FC = () => {
                             username={user.username}
                             openIssueRequestsSignal={openIssueRequestsSignal}
                         />
-                    ) : (
+                    </div>
+                    {currentTask ? (
                         <div className="flex w-full h-full">
                             {/* Sidebar (Tools) */}
                             <aside className="w-80 bg-slate-900 border-r border-slate-800 flex flex-col z-20 shadow-2xl">
@@ -870,7 +871,7 @@ const App: React.FC = () => {
                                         onClick={handleCloseTask}
                                         className="text-slate-400 hover:text-white flex items-center gap-2 text-sm font-medium mb-4 transition-colors"
                                     >
-                                        ← Back to Dashboard
+                                        ← 이전으로
                                     </button>
                                     <h2 className="font-bold text-lg text-white truncate" title={currentTask.name}>{currentTask.name}</h2>
                                     <div className="flex items-center gap-3 mt-3">
@@ -1185,7 +1186,7 @@ const App: React.FC = () => {
                                 </div>
                             </div>
                         </div>
-                    )}
+                    ) : null}
                 </>
             </main>
 
