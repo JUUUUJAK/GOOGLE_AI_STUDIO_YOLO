@@ -196,13 +196,19 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
     readOnlyRef.current = readOnly;
   }, [readOnly]);
 
-  // Reset history when switching tasks/images
+  // Reset history and drawing state when switching tasks/images
   useEffect(() => {
     setUndoStack([]);
     setRedoStack([]);
     setSelectedBoxIds([]);
     setHoveredBoxId(null);
     setRecentlyPastedBoxIds([]);
+    setIsDrawing(false);
+    setDrawStartPos(null);
+    setCurrentMousePos(null);
+    setDragStartPos(null);
+    setDraggingBoxesSnapshot([]);
+    setResizingHandle(null);
   }, [taskId, imageUrl]);
 
   useEffect(() => {
@@ -310,6 +316,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
         setSelectedBoxIds([]);
         setIsDrawing(false);
         setDrawStartPos(null);
+        setCurrentMousePos(null);
         setDragStartPos(null);
         setDraggingBoxesSnapshot([]);
         setResizingHandle(null);
@@ -386,6 +393,8 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
     if (e.button === 2) return;
 
     const target = e.target as HTMLElement;
+    if (target.closest('[data-no-draw]')) return;
+
     const isBoxClick = !!target.dataset.boxid || !!target.dataset.handle;
     const isModifying = isModActiveRef.current || (interactionMode === 'CLASSIC' && isBoxClick);
 
@@ -403,7 +412,35 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
     if (readOnly) return;
 
-    // 2. Modification Logic (ONLY if 'N' is held)
+    // 2. Second click to finish box (2-click mode)
+    if (isDrawing && drawStartPos) {
+      const pos = getNormalizedPos(e);
+      const x = Math.min(drawStartPos.x, pos.x);
+      const y = Math.min(drawStartPos.y, pos.y);
+      const w = Math.abs(pos.x - drawStartPos.x);
+      const h = Math.abs(pos.y - drawStartPos.y);
+      if (w > MIN_BOX_SIZE && h > MIN_BOX_SIZE) {
+        const newBox: BoundingBox = {
+          id: Math.random().toString(36).substr(2, 9),
+          classId: currentClass.id,
+          x,
+          y,
+          w,
+          h,
+          isAutoLabel: false
+        };
+        const updated = [...localAnnotations, newBox];
+        setLocalAnnotations(updated);
+        onUpdateAnnotations(updated);
+        setSelectedBoxIds([newBox.id]);
+      }
+      setIsDrawing(false);
+      setDrawStartPos(null);
+      setCurrentMousePos(null);
+      return;
+    }
+
+    // 3. Modification Logic (ONLY if 'N' is held)
     if (isModifying) {
       // Check Resize Handle Click
       if (target.dataset.handle) {
@@ -467,7 +504,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       }
     }
 
-    // 3. Default: Click Empty Space or Over Box (if N not pressed) -> Start Drawing
+    // 4. Default: First click -> Start Drawing (2-click: second click completes in step 2)
     saveHistory(); // Save before drawing new box
     if (!e.shiftKey) setSelectedBoxIds([]);
     setDragStartPos(null);
@@ -590,43 +627,16 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
       return;
     }
 
-    // Finish Drawing
-    if (!isDrawing || !drawStartPos || !currentMousePos) {
-      if (isDrawing) {
-        setIsDrawing(false);
-        setDrawStartPos(null);
-        setCurrentMousePos(null);
-      }
-      return;
+    // Drawing: 2-click mode — box is completed on second click (handleMouseDown), not on mouseUp
+    if (isDrawing && drawStartPos) {
+      return; // keep waiting for second click
     }
-
-    // Calculate box dimensions
-    const x = Math.min(drawStartPos.x, currentMousePos.x);
-    const y = Math.min(drawStartPos.y, currentMousePos.y);
-    const w = Math.abs(currentMousePos.x - drawStartPos.x);
-    const h = Math.abs(currentMousePos.y - drawStartPos.y);
-
-    // Minimum size threshold
-    if (w > MIN_BOX_SIZE && h > MIN_BOX_SIZE) {
-      const newBox: BoundingBox = {
-        id: Math.random().toString(36).substr(2, 9),
-        classId: currentClass.id,
-        x,
-        y,
-        w,
-        h,
-        isAutoLabel: false // Manually drawn
-      };
-      const updated = [...localAnnotations, newBox];
-      setLocalAnnotations(updated);
-      onUpdateAnnotations(updated); // Commit to storage
-      setSelectedBoxIds([newBox.id]); // Auto-select the newly created box
+    if (isDrawing) {
+      setIsDrawing(false);
+      setDrawStartPos(null);
+      setCurrentMousePos(null);
     }
-
-    setIsDrawing(false);
-    setDrawStartPos(null);
-    setCurrentMousePos(null);
-  }, [isDrawing, drawStartPos, currentMousePos, currentClass, onUpdateAnnotations, dragStartPos, isPanning, localAnnotations]);
+  }, [isDrawing, drawStartPos, dragStartPos, isPanning, localAnnotations, onUpdateAnnotations]);
 
   // Spacebar to toggle pan cursor
   useEffect(() => {
@@ -699,7 +709,14 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
           if (showCrosshair) setMouseCanvasPos(null);
         }}
         onWheel={handleWheel}
-        onContextMenu={(e) => e.preventDefault()}
+        onContextMenu={(e) => {
+          if (isDrawing && drawStartPos) {
+            setIsDrawing(false);
+            setDrawStartPos(null);
+            setCurrentMousePos(null);
+          }
+          e.preventDefault();
+        }}
         style={{ cursor: activeTool === 'PAN' || isPanning ? 'grab' : (readOnly ? 'default' : 'crosshair') }}
       >
         {/* Transform Container */}
@@ -778,6 +795,12 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
+                  if (isDrawing && drawStartPos) {
+                    setIsDrawing(false);
+                    setDrawStartPos(null);
+                    setCurrentMousePos(null);
+                    return;
+                  }
                   handleDelete([box.id]);
                 }}
                 data-boxid={box.id}
@@ -870,19 +893,6 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
                   </div>
                 )}
 
-                {/* Trash Button (Only for single selection to avoid clutter) */}
-                {isSelected && selectedBoxIds.length === 1 && !readOnly && activeTool !== 'PAN' && (
-                  <div className="absolute -right-2 animate-in fade-in zoom-in duration-150" style={{ top: `-${35 / scale}px`, pointerEvents: 'auto' }}>
-                    <button
-                      onClick={(e) => { e.stopPropagation(); handleDelete([box.id]); }}
-                      className="bg-red-500 hover:bg-red-600 text-white rounded-full shadow-lg flex items-center justify-center transition-colors hover:scale-105"
-                      style={{ width: `${24 / scale}px`, height: `${24 / scale}px`, padding: `${4 / scale}px` }}
-                      title="Delete Annotation (Right Click)"
-                    >
-                      <svg className="w-full h-full" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
-                    </button>
-                  </div>
-                )}
               </div>
             );
           })}
@@ -931,7 +941,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
 
         {/* Floating Toolbar (Tools & Zoom) */}
-        <div className="absolute top-6 left-6 flex flex-col gap-3 z-50">
+        <div data-no-draw className="absolute top-6 left-6 flex flex-col gap-3 z-50">
           <Tooltip text={activeTool === 'PAN' ? "이미지 조절 (V)" : "박스 생성 (V)"}>
             <button
               onClick={() => setActiveTool(activeTool === 'PAN' ? 'SELECT' : 'PAN')}
@@ -1032,7 +1042,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
         {/* Settings Overlay */}
         {isSettingsOpen && (
-          <div className="absolute bottom-16 left-24 w-[320px] bg-slate-900/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl p-6 z-50 animate-in slide-in-from-bottom-2 duration-300">
+          <div data-no-draw className="absolute bottom-16 left-24 w-[320px] bg-slate-900/95 backdrop-blur-xl border border-white/10 rounded-2xl shadow-2xl p-6 z-50 animate-in slide-in-from-bottom-2 duration-300">
             <div className="flex justify-between items-center mb-6">
               <h3 className="text-white font-bold flex items-center gap-2">
                 <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
@@ -1100,7 +1110,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
         {/* Help Modal */}
         {isHelpOpen && (
-          <div className="absolute inset-0 z-[60] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-300" onClick={() => setIsHelpOpen(false)}>
+          <div data-no-draw className="absolute inset-0 z-[60] bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 animate-in fade-in duration-300" onClick={() => setIsHelpOpen(false)}>
             <div className="bg-slate-900 border border-white/10 rounded-3xl shadow-2xl max-w-md w-full overflow-hidden" onClick={e => e.stopPropagation()}>
               <div className="p-6 border-b border-white/5 flex justify-between items-center bg-slate-800/20">
                 <h3 className="font-bold text-xl text-white">단축키 안내</h3>
@@ -1142,7 +1152,7 @@ const AnnotationCanvas: React.FC<AnnotationCanvasProps> = ({
 
         {/* Delete All Confirmation Modal */}
         {isDeleteAllConfirmOpen && (
-          <div className="absolute inset-0 z-[100] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-300" onClick={() => setIsDeleteAllConfirmOpen(false)}>
+          <div data-no-draw className="absolute inset-0 z-[100] bg-slate-950/80 backdrop-blur-xl flex items-center justify-center p-4 animate-in fade-in zoom-in-95 duration-300" onClick={() => setIsDeleteAllConfirmOpen(false)}>
             <div className="bg-slate-900 border border-white/5 rounded-3xl shadow-2xl max-w-sm w-full overflow-hidden" onClick={e => e.stopPropagation()}>
               <div className="p-8 text-center relative overflow-hidden">
                 <div className="absolute top-0 left-0 w-full h-1 bg-gradient-to-r from-red-600 to-rose-500"></div>

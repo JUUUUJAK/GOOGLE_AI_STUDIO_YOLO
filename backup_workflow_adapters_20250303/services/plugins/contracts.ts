@@ -21,8 +21,7 @@ const nativeYoloContract: PluginContract = {
   report: {
     sourceType: 'native-yolo',
     includeInUnifiedReport: true
-  },
-  folderSource: 'filesystem'
+  }
 };
 
 const vlmReviewContract: PluginContract = {
@@ -50,39 +49,12 @@ const vlmReviewContract: PluginContract = {
   report: {
     sourceType: 'vlm-review',
     includeInUnifiedReport: true
-  },
-  folderSource: 'vlm_source_file'
-};
-
-const imageClassificationContract: PluginContract = {
-  task: {
-    sourceType: 'image-classification',
-    toCommonStatus: (input: string | number) => {
-      const normalized = String(input || '').toUpperCase();
-      if (normalized === TaskStatus.IN_PROGRESS) return TaskStatus.IN_PROGRESS;
-      if (normalized === TaskStatus.SUBMITTED) return TaskStatus.SUBMITTED;
-      if (normalized === TaskStatus.APPROVED) return TaskStatus.APPROVED;
-      if (normalized === TaskStatus.REJECTED) return TaskStatus.REJECTED;
-      return TaskStatus.TODO;
-    },
-    toSourceStatus: (status: TaskStatus) => status
-  },
-  review: {
-    sourceType: 'image-classification',
-    canReview: (_task: Task) => true,
-    normalizeReviewerNote: (note: string) => String(note || '').trim()
-  },
-  report: {
-    sourceType: 'image-classification',
-    includeInUnifiedReport: true
-  },
-  folderSource: 'filesystem'
+  }
 };
 
 const contractsBySourceType: Record<PluginSourceType, PluginContract> = {
   'native-yolo': nativeYoloContract,
-  'vlm-review': vlmReviewContract,
-  'image-classification': imageClassificationContract
+  'vlm-review': vlmReviewContract
 };
 
 export const getPluginContract = (sourceType?: PluginSourceType): PluginContract => {

@@ -341,10 +341,8 @@ const folderFromAbsoluteImagePath = (datasetsDir: string, filePath: string, vali
   return toNativeYoloFolderFromDatasetsRelativePath(rel, validWorkers);
 };
 
-const syncFilesToDb = (datasetsDir: string, options?: { includePaths?: string[] }) => {
+const syncFilesToDb = (datasetsDir: string) => {
   const validWorkers = getValidWorkerUsernames();
-  const includePaths = options?.includePaths?.filter((p) => String(p || '').trim()) ?? [];
-  const isPartialSync = includePaths.length > 0;
 
   // 프로젝트 매핑 반영: 폴더가 이미지 분류 프로젝트에 매핑되어 있으면 sync 시에도 sourceType 유지
   let projectMap: Record<string, { projectId: string; updatedAt: number }> = {};
@@ -454,19 +452,10 @@ const syncFilesToDb = (datasetsDir: string, options?: { includePaths?: string[] 
   };
 
   db.transaction(() => {
-    if (isPartialSync) {
-      includePaths.forEach((relPath) => {
-        const fullPath = path.join(datasetsDir, relPath);
-        if (fs.existsSync(fullPath)) scan(fullPath);
-      });
-    } else {
-      scan(datasetsDir);
-    }
+    scan(datasetsDir);
     const now = Date.now();
-    if (!isPartialSync) {
-      recordDeletions.run(now);
-      deleteMissing.run();
-    }
+    recordDeletions.run(now);
+    deleteMissing.run();
   })();
   db.exec('DROP TABLE temp_ids');
 };
@@ -550,31 +539,6 @@ const fileSystemMiddleware = () => {
       return base || `project-${Date.now()}`;
     };
 
-    /** 워크플로 어댑터: 폴더↔프로젝트 매핑의 filesystem 부문 (_project_map.json 기준) */
-    const resolveProjectMapFilesystem = (rawMap: Record<string, { projectId: string; updatedAt: number }>, existingFolders: Set<string>): Record<string, { projectId: string; updatedAt: number }> => {
-      const out: Record<string, { projectId: string; updatedAt: number }> = {};
-      Object.entries(rawMap || {}).forEach(([folder, mapping]: [string, any]) => {
-        if (existingFolders.has(folder) && mapping?.projectId) {
-          out[folder] = { projectId: String(mapping.projectId), updatedAt: Number(mapping.updatedAt || 0) };
-        }
-      });
-      return out;
-    };
-
-    /** 워크플로 어댑터: VLM 프로젝트용 가상 폴더 매핑 (vlm_tasks의 sourceFile 기준) */
-    const resolveProjectMapVlm = (projects: Record<string, any>, getVlmFoldersBySourceFile: (sourceFile: string) => string[]): Record<string, { projectId: string; updatedAt: number }> => {
-      const out: Record<string, { projectId: string; updatedAt: number }> = {};
-      Object.values(projects || {}).forEach((project: any) => {
-        if (normalizeWorkflowSourceType(project?.workflowSourceType) !== 'vlm-review' || !project?.vlmSourceFile) return;
-        const folders = getVlmFoldersBySourceFile(String(project.vlmSourceFile));
-        const now = Number(project.updatedAt || Date.now());
-        folders.forEach((folder: string) => {
-          if (folder) out[folder] = { projectId: project.id, updatedAt: now };
-        });
-      });
-      return out;
-    };
-
     const buildProjectOverview = () => {
       const projects = readProjects();
       const rawMap = readProjectMap();
@@ -648,15 +612,29 @@ const fileSystemMiddleware = () => {
       const folderStats = Array.from(folderStatsMergedMap.values()).filter((row: any) => !isHiddenFromMapping(row.folder));
 
       const existingFolders = new Set(folderStats.map((row: any) => row.folder));
-      const getVlmFoldersBySourceFile = (sourceFile: string) => {
+      const projectMap: Record<string, { projectId: string; updatedAt: number }> = {};
+      Object.entries(rawMap || {}).forEach(([folder, mapping]: any) => {
+        if (existingFolders.has(folder) && mapping?.projectId) {
+          projectMap[folder] = {
+            projectId: String(mapping.projectId),
+            updatedAt: Number(mapping.updatedAt || 0)
+          };
+        }
+      });
+      // VLM projects: add virtual folders (e.g. VLM_filename) to projectMap so workers see assigned tasks
+      Object.values(projects).forEach((project: any) => {
+        if (normalizeWorkflowSourceType(project?.workflowSourceType) !== 'vlm-review' || !project?.vlmSourceFile) return;
         try {
-          return (db.prepare('SELECT DISTINCT folder FROM vlm_tasks WHERE sourceFile = ?').all(sourceFile) as Array<{ folder: string }>).map((r: any) => String(r.folder || '').trim()).filter(Boolean);
-        } catch (_) { return []; }
-      };
-      const projectMap = {
-        ...resolveProjectMapFilesystem(rawMap, existingFolders),
-        ...resolveProjectMapVlm(projects, getVlmFoldersBySourceFile)
-      };
+          const rows = db.prepare('SELECT DISTINCT folder FROM vlm_tasks WHERE sourceFile = ?').all(project.vlmSourceFile) as Array<{ folder: string }>;
+          const now = Number(project.updatedAt || Date.now());
+          rows.forEach((r: any) => {
+            const folder = String(r.folder || '').trim();
+            if (folder) {
+              projectMap[folder] = { projectId: project.id, updatedAt: now };
+            }
+          });
+        } catch (_) {}
+      });
 
       const statsByProject = new Map<string, { allocated: number; completed: number; folderCount: number }>();
       folderStats.forEach((row: any) => {
@@ -3376,7 +3354,7 @@ const fileSystemMiddleware = () => {
         } else {
           next();
         }
-      } else if ((req.url.startsWith('/api/export/classification') || req.url.startsWith('/api/plugins/classification/export')) && req.method === 'GET') {
+      } else if (req.url.startsWith('/api/export/classification') && req.method === 'GET') {
         try {
           const url = new URL(req.url, `http://${req.headers.host}`);
           const projectId = String(url.searchParams.get('projectId') || '').trim();
@@ -3494,44 +3472,14 @@ const fileSystemMiddleware = () => {
             }
           });
         }
-      } else if (req.url?.startsWith('/api/sync') && req.method === 'POST') {
+      } else if (req.url === '/api/sync' && req.method === 'POST') {
         try {
           const datasetsDir = path.resolve(__dirname, 'datasets');
-          if (!fs.existsSync(datasetsDir)) {
-            res.setHeader('Content-Type', 'application/json');
-            return res.end(JSON.stringify({ success: true }));
+          if (fs.existsSync(datasetsDir)) {
+            syncFilesToDb(datasetsDir);
           }
-          const url = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
-          const projectId = url.searchParams.get('projectId')?.trim() || undefined;
-          const foldersFromQuery = url.searchParams.getAll('folders').map((s) => s.trim()).filter(Boolean);
-          const folderNames: string[] = [];
-          if (projectId) {
-            const projectMap = readProjectMap();
-            Object.entries(projectMap).forEach(([folder, data]) => {
-              if (data?.projectId === projectId) folderNames.push(folder);
-            });
-          }
-          foldersFromQuery.forEach((f) => folderNames.push(f));
-          const uniqueFolderNames = [...new Set(folderNames)];
-          let includePaths: string[] = [];
-          if (uniqueFolderNames.length > 0) {
-            const validWorkers = getValidWorkerUsernames();
-            const seen = new Set<string>();
-            uniqueFolderNames.forEach((folderName) => {
-              const candidates = [folderName, ...validWorkers.map((w) => `${w}/${folderName}`)];
-              candidates.forEach((relPath) => {
-                if (seen.has(relPath)) return;
-                const fullPath = path.join(datasetsDir, relPath);
-                if (fs.existsSync(fullPath)) {
-                  seen.add(relPath);
-                  includePaths.push(relPath);
-                }
-              });
-            });
-          }
-          syncFilesToDb(datasetsDir, includePaths.length > 0 ? { includePaths } : undefined);
           res.setHeader('Content-Type', 'application/json');
-          res.end(JSON.stringify({ success: true, partial: includePaths.length > 0, pathsCount: includePaths.length }));
+          res.end(JSON.stringify({ success: true }));
         } catch (e) {
           console.error(e);
           res.statusCode = 500;

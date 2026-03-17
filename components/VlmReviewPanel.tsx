@@ -136,10 +136,9 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
     setGptResponse(String(rawResultData?.editedAnswer || parsed?.ui?.editedGptResponse || ''));
     setDueDate(initialDueDate);
     setNote(String(task.reviewerNotes || ''));
-    setScale(1);
-    setPan({ x: 0, y: 0 });
     setIsPanning(false);
     setLastPanPos(null);
+    // scale, pan은 이미지 전환 시에도 유지 (사용자가 25% 등으로 둔 상태 유지)
   }, [task.id, task.sourceData, task.reviewerNotes, initialResult, firstPrompt, rawResultData, parsed, initialDueDate]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
@@ -241,28 +240,6 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
         </div>
       </div>
 
-      <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
-        <h3 className="text-sm font-bold text-slate-200">검수 결과</h3>
-        <div className="flex flex-wrap gap-2">
-          {[
-            { key: 'NORMAL', label: '정상' },
-            { key: 'NEEDS_FIX_VP', label: '수정필요(vp)' },
-            { key: 'NEEDS_FIX_DETAIL', label: '수정필요(detail)' }
-          ].map((option) => (
-            <label key={option.key} className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-slate-700 bg-slate-950 text-sm text-slate-200">
-              <input
-                type="radio"
-                name="vlm-review-result"
-                checked={reviewResult === option.key}
-                onChange={() => setReviewResult(option.key as VlmReviewResult)}
-                disabled={readOnly || isSaving || task.status === TaskStatus.ISSUE_PENDING}
-              />
-              {option.label}
-            </label>
-          ))}
-        </div>
-      </div>
-
       <div className="grid grid-cols-1 xl:grid-cols-2 gap-3">
         <div 
           ref={imageContainerRef}
@@ -286,8 +263,34 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
               이미지 경로: {imagePath || '-'}
             </div>
           )}
-          <div className="absolute top-2 right-2 bg-slate-900/80 text-slate-400 text-[10px] px-2 py-1 rounded border border-slate-700 pointer-events-none select-none">
-            마우스 휠: 확대/축소, 드래그: 이동
+          <div className="absolute top-2 left-2 right-2 flex items-center justify-between gap-2 pointer-events-none">
+            <div className="flex gap-1 pointer-events-auto">
+              {[
+                { value: 1, label: '100%' },
+                { value: 0.75, label: '75%' },
+                { value: 0.5, label: '50%' },
+                { value: 0.25, label: '25%' },
+                { value: 0.15, label: '최소' }
+              ].map(({ value, label }) => {
+                const isActive = Math.abs(scale - value) < 0.02;
+                return (
+                  <button
+                    key={label}
+                    type="button"
+                    onClick={() => {
+                      setScale(value);
+                      setPan({ x: 0, y: 0 });
+                    }}
+                    className={`px-2 py-1 rounded text-[11px] font-medium border transition-colors ${isActive ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-900/90 border-slate-600 text-slate-300 hover:bg-slate-800 hover:border-slate-500'}`}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            <span className="bg-slate-900/80 text-slate-400 text-[10px] px-2 py-1 rounded border border-slate-700 select-none">
+              마우스 휠: 확대/축소, 드래그: 이동
+            </span>
           </div>
         </div>
         <div className="space-y-3">
@@ -295,9 +298,8 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
             <label className="block text-xs text-slate-500 font-bold mb-2">입력 프롬프트</label>
             <textarea
               value={inputPrompt}
-              onChange={(e) => setInputPrompt(e.target.value)}
-              readOnly={readOnly}
-              className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-slate-200 outline-none focus:border-cyan-600"
+              readOnly
+              className="w-full h-28 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-slate-200 outline-none focus:border-cyan-600 cursor-default"
             />
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
@@ -307,6 +309,34 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
               readOnly
               className="w-full h-32 bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-sm text-slate-200 outline-none focus:border-cyan-600"
             />
+          </div>
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
+            <h3 className="text-xs font-bold text-slate-200 mb-2">검수 결과</h3>
+            <div className="flex flex-wrap gap-2">
+              {[
+                { key: 'NORMAL', label: '정상', className: 'border-emerald-600/60 bg-emerald-950/50 text-emerald-200 hover:bg-emerald-900/40', activeClass: 'border-emerald-500 bg-emerald-900/50 text-emerald-100' },
+                { key: 'NEEDS_FIX_VP', label: '수정필요(vp)', className: 'border-amber-600/60 bg-amber-950/50 text-amber-200 hover:bg-amber-900/40', activeClass: 'border-amber-500 bg-amber-900/50 text-amber-100' },
+                { key: 'NEEDS_FIX_DETAIL', label: '수정필요(detail)', className: 'border-rose-600/60 bg-rose-950/50 text-rose-200 hover:bg-rose-900/40', activeClass: 'border-rose-500 bg-rose-900/50 text-rose-100' }
+              ].map((option) => {
+                const isChecked = reviewResult === option.key;
+                return (
+                  <label
+                    key={option.key}
+                    className={`inline-flex items-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium transition-all cursor-pointer ${isChecked ? option.activeClass : `${option.className} opacity-45 hover:opacity-70`} ${isChecked ? 'ring-2 ring-offset-2 ring-offset-slate-900' : ''} ${isChecked && option.key === 'NORMAL' ? 'ring-emerald-500' : ''} ${isChecked && option.key === 'NEEDS_FIX_VP' ? 'ring-amber-500' : ''} ${isChecked && option.key === 'NEEDS_FIX_DETAIL' ? 'ring-rose-500' : ''}`}
+                  >
+                    <input
+                      type="radio"
+                      name="vlm-review-result"
+                      checked={isChecked}
+                      onChange={() => setReviewResult(option.key as VlmReviewResult)}
+                      disabled={readOnly || isSaving || task.status === TaskStatus.ISSUE_PENDING}
+                      className="sr-only"
+                    />
+                    {option.label}
+                  </label>
+                );
+              })}
+            </div>
           </div>
           <div className="bg-slate-900 border border-slate-800 rounded-xl p-3">
             <div className="inline-flex items-center gap-2 mb-2">

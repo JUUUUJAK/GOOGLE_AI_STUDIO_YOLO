@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
-import { Task, TaskStatus, TaskStatusLabels, UserRole, FolderMetadata, AccountType, TaskIssue, TaskIssueStatus, VacationRecord, PluginSourceType, WORKFLOW_LABELS } from '../types';
+import { Task, TaskStatus, TaskStatusLabels, UserRole, FolderMetadata, AccountType, TaskIssue, TaskIssueStatus, VacationRecord } from '../types';
 import * as Storage from '../services/storage';
 import { ResponsiveContainer, ComposedChart, CartesianGrid, XAxis, YAxis, Tooltip, Legend, Bar, Line } from 'recharts';
 import { toBlob } from 'html-to-image';
@@ -13,8 +13,6 @@ interface DashboardProps {
     onSelectTask: (taskId: string) => void;
     onRefresh: () => void;
     onSync: () => Promise<void>;
-    onSyncProject?: (projectId: string) => Promise<void>;
-    onSyncFolders?: (folders: string[]) => Promise<void>;
     onLightRefresh?: () => Promise<void>;
     tasks: Task[];
     username: string;
@@ -2266,7 +2264,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                 <div className="text-lg font-black text-white tracking-tight">{project.name}</div>
                                                 <div className="flex items-center gap-1.5">
                                                     <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border shadow-inner ${project.workflowSourceType === 'vlm-review' ? 'bg-violet-500/10 text-violet-300 border-violet-500/20' : project.workflowSourceType === 'image-classification' ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' : 'bg-sky-500/10 text-sky-300 border-sky-500/20'}`}>
-                                                        {WORKFLOW_LABELS[(project.workflowSourceType || 'native-yolo') as PluginSourceType]}
+                                                        {project.workflowSourceType === 'vlm-review' ? 'VLM' : project.workflowSourceType === 'image-classification' ? '분류' : 'YOLO'}
                                                     </span>
                                                     {project.status === 'ARCHIVED' && (
                                                         <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-amber-500/10 text-amber-300 border-amber-500/20 shadow-inner">
@@ -2833,7 +2831,7 @@ const DashboardHomeView: React.FC = () => {
                                 <div className="text-lg font-black text-white tracking-tight">{project.name}</div>
                                 <div className="flex items-center gap-1.5">
                                     <span className={`text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border shadow-inner ${project.workflowSourceType === 'vlm-review' ? 'bg-violet-500/10 text-violet-300 border-violet-500/20' : project.workflowSourceType === 'image-classification' ? 'bg-amber-500/10 text-amber-300 border-amber-500/20' : 'bg-sky-500/10 text-sky-300 border-sky-500/20'}`}>
-                                        {WORKFLOW_LABELS[(project.workflowSourceType || 'native-yolo') as PluginSourceType]}
+                                        {project.workflowSourceType === 'vlm-review' ? 'VLM' : project.workflowSourceType === 'image-classification' ? '분류' : 'YOLO'}
                                     </span>
                                     {project.visibleToWorkers === false && (
                                         <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-1 rounded-md border bg-slate-700/40 text-slate-200 border-slate-600/60 shadow-inner">
@@ -3055,7 +3053,7 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
         }
         setExporting(true);
         try {
-            const url = `/api/plugins/classification/export?projectId=${encodeURIComponent(selectedProjectId)}&format=${exportFormat}`;
+            const url = `/api/export/classification?projectId=${encodeURIComponent(selectedProjectId)}&format=${exportFormat}`;
             const res = await fetch(url);
             const text = await res.text();
             if (!res.ok) {
@@ -3321,7 +3319,7 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
     );
 };
 
-const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review' | 'image-classification') => void; onArchived?: () => void; onRefresh?: () => void; onRefreshTasksFromServer?: () => Promise<void>; onSyncProject?: (projectId: string) => Promise<void>; onSyncFolders?: (folders: string[]) => Promise<void>; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, onRefresh, onRefreshTasksFromServer, onSyncProject, onSyncFolders, workerNames = [], tasks, onSelectTask }) => {
+const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review' | 'image-classification') => void; onArchived?: () => void; onRefresh?: () => void; onRefreshTasksFromServer?: () => Promise<void>; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, onRefresh, onRefreshTasksFromServer, workerNames = [], tasks, onSelectTask }) => {
     const [days, setDays] = useState<number>(30);
     const [loading, setLoading] = useState<boolean>(true);
     const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -3511,16 +3509,6 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                     >
                         {refreshing ? '새로고침 중...' : '지표 새로고침'}
                     </button>
-                    {onSyncProject && (
-                        <button
-                            onClick={() => { const ok = window.confirm('이 프로젝트에 매핑된 폴더만 디스크와 동기화합니다. 계속할까요?'); if (ok) onSyncProject(projectId); }}
-                            disabled={loading || archiving}
-                            className="px-3 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-bold disabled:opacity-50"
-                            title="이 프로젝트에 연결된 폴더만 스캔하여 DB에 반영합니다."
-                        >
-                            이 프로젝트만 동기화
-                        </button>
-                    )}
                     <button
                         onClick={handleDeleteProject}
                         disabled={archiving || loading || refreshing}
@@ -3864,7 +3852,6 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                 <th className="px-6 py-4">완료 / 전체</th>
                                                 <th className="px-6 py-4">진행률</th>
                                                 <th className="px-6 py-4">검수 진행</th>
-                                                {onSyncFolders && <th className="px-6 py-4 w-20">동기화</th>}
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-white/5">
@@ -3873,7 +3860,7 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                 if (filteredFolders.length === 0) {
                                                     return (
                                                         <tr>
-                                                            <td colSpan={onSyncFolders ? 6 : 5} className="px-6 py-10 text-center">
+                                                            <td colSpan={5} className="px-6 py-10 text-center">
                                                                 {folders.length > 0 ? (
                                                                     <span className="text-slate-500 italic">선택한 작업자에 해당하는 폴더가 없습니다.</span>
                                                                 ) : (
@@ -3892,7 +3879,7 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                 }
                                                 return groups.flatMap(({ groupName, items }) => [
                                                     <tr key={`group-${groupName}`} className="bg-slate-700/70 border-t border-b border-cyan-500/30">
-                                                        <td colSpan={onSyncFolders ? 6 : 5} className="px-6 py-3 text-base font-bold text-cyan-200 border-l-4 border-cyan-500 bg-slate-800/90">
+                                                        <td colSpan={5} className="px-6 py-3 text-base font-bold text-cyan-200 border-l-4 border-cyan-500 bg-slate-800/90">
                                                             {groupName}
                                                         </td>
                                                     </tr>,
@@ -3952,25 +3939,10 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                                                 <span className="text-amber-400">WAIT {submittedCount}</span>
                                                                             </div>
                                                                         </div>
-                                                                            ) : (
+                                                                    ) : (
                                                                         <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest italic">No Review</span>
                                                                     )}
                                                                 </td>
-                                                                {onSyncFolders && (
-                                                                    <td className="px-6 py-4">
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => {
-                                                                                const ok = window.confirm(`"${row.folder}" 폴더만 디스크와 동기화할까요?`);
-                                                                                if (ok) onSyncFolders([row.folder]);
-                                                                            }}
-                                                                            className="px-2 py-1 rounded text-xs font-bold border border-slate-600 bg-slate-800 text-slate-300 hover:bg-slate-700 hover:border-slate-500"
-                                                                            title="이 폴더만 동기화"
-                                                                        >
-                                                                            Sync
-                                                                        </button>
-                                                                    </td>
-                                                                )}
                                                             </tr>
                                                         );
                                                     })
@@ -4112,7 +4084,7 @@ const NoticeHomeView: React.FC<{ notice: string; onStart: () => void }> = ({ not
     );
 };
 
-const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, onRefresh, onSync, onSyncProject, onSyncFolders, onLightRefresh, tasks, username, token, openIssueRequestsSignal, openUserManagementSignal }) => {
+const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, onRefresh, onSync, onLightRefresh, tasks, username, token, openIssueRequestsSignal, openUserManagementSignal }) => {
     const [workers, setWorkers] = useState<string[]>([]);
     const [workerProjectOverview, setWorkerProjectOverview] = useState<Storage.ProjectOverviewPayload | null>(null);
 
@@ -4796,8 +4768,6 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                             onArchived={() => onRefresh()}
                             onRefresh={onRefresh}
                             onRefreshTasksFromServer={onLightRefresh}
-                            onSyncProject={onSyncProject}
-                            onSyncFolders={onSyncFolders}
                             workerNames={workers}
                             onOpenFolder={async (folderName, workflowSourceType) => {
                                 const wf = workflowSourceType === 'vlm-review' ? 'vlm-review' : workflowSourceType === 'image-classification' ? 'image-classification' : 'native-yolo';

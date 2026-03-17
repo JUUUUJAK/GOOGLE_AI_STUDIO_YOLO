@@ -70,6 +70,94 @@
 
 ---
 
+2026-03-13 (금) 개발일지 — YOLO 로컬툴
+1) 목표
+yolo_localtool 빌드·실행 시 로고 표시, 이미지/라벨 로딩 깜빡임 제거, 상단/하단 UI 요소 위치 조정
+2) 작업 내용
+로고·아이콘
+- 앱 내 로고: `import.meta.env.BASE_URL`로 상대 경로 사용해 빌드 후 file:// 환경에서도 logo.ico 정상 로딩
+- exe 아이콘: package.json build.icon / win.icon에 public/logo.ico 지정, electron main에서 창 아이콘 경로(logo.ico) 설정 (256×256 이상 ico 필요)
+이미지·라벨 동시 표시(깜빡임 방지)
+- displayItem / displayAnnotations 상태 분리: 현재 인덱스의 라벨을 먼저 로드한 뒤, 완료 시점에만 이미지+라벨을 한 번에 갱신
+- loadAnnotationsForIndex를 Promise<BoundingBox[]> 반환으로 변경, 이전 요청은 cancelled/index 불일치로 무시
+- 폴더 변경 시 display 초기화, 라벨 로딩 중에는 "라벨 로딩 중..." 표시
+UI 배치
+- 헤더: 진행량+스크롤바 제거 → 현재 파일명(displayItem.name) 표시
+- 푸터: 현재 파일명 제거 → 진행량 숫자 + 범위 스크롤바 배치 (이전/다음 버튼 우측)
+3) 수정 파일
+- `yolo_localtool/src/App.tsx` (displayItem/displayAnnotations, 로고 BASE_URL, 헤더/푸터 내용 교체)
+- `yolo_localtool/package.json` (build.icon, win.icon)
+- `yolo_localtool/electron/main.js` (getIconPath, BrowserWindow icon)
+4) 검증
+- npm run electron 후 빌드본에서 헤더 로고 노출 확인
+- 이미지 전환 시 박스가 나중에 따로 그려지지 않고 이미지와 함께 한 번에 전환되는지 확인
+- 상단에는 파일명, 하단에는 진행량+스크롤바가 보이는지 확인
+
+---
+
+이미지 분류(멀티라벨링) 개발
+1) 목표
+YOLO·VLM과 동일한 프로젝트/폴더 구조에서 이미지당 단일 클래스 선택 라벨링 워크플로우 추가
+2) 작업 내용
+워크플로우·타입
+- `PluginSourceType`에 `image-classification` 추가, `ProjectDefinition`에 `classificationClasses`(프로젝트별 클래스 목록) 추가
+- 프로젝트 생성·편집 시 워크플로우를 "이미지 분류"로 선택하고 클래스 목록 설정/수정 가능
+- `WORKFLOW_CONFIG`·`imageClassificationContract`로 분류 워크플로우 어댑터 등록
+작업 화면
+- `ClassificationPanel`: 이미지 표시 + 클래스 라디오 선택, VLM과 유사하게 좌측 패널 단순화, 이미지 확대/축소·팬
+- A/D·Ctrl+S 시 저장 후 다음/이전 이동, 1~9 키로 클래스 선택, 포커스 시에도 A/D 동작
+- 작업 재진입 시 기존 선택 분류값 표시 (`getTaskById`에서 image-classification용 sourceData 로드)
+데이터·매핑
+- 폴더 매핑 시 `getSourceTypeForFolder`로 분류 프로젝트면 `sourceType`을 image-classification으로 설정
+- 프로젝트 상세·폴더 카드에 분류 작업 수(`classificationTaskCount`) 표시
+내보내기
+- Data Import/Export(구 VLM Migration) 하단에 "분류 결과 내보내기" 추가: 프로젝트 단위, CSV/JSON
+- 출력 경로 `datasets/classification_export` 고정, JSON은 pretty-print(들여쓰기·줄바꿈)
+3) 수정·추가 파일
+- `types.ts` (PluginSourceType, ProjectDefinition.classificationClasses, WORKFLOW_CONFIG 등)
+- `services/plugins/contracts.ts` (imageClassificationContract)
+- `services/storage.ts` (getTaskById 분류 sourceData, fetchAndMerge 시 분류 대응)
+- `vite.config.ts` (프로젝트 CRUD·overview·detail에 classificationClasses, getSourceTypeForFolder, classification export API)
+- `components/ClassificationPanel.tsx` (신규)
+- `components/Dashboard.tsx` (분류 프로젝트 UI, 클래스 편집, 분류 내보내기 UI)
+- `App.tsx` (분류 작업 분기, ClassificationPanel 연동, 1~9/A/D·Ctrl+S 분류 처리)
+4) 검증
+- 분류 프로젝트 생성·매핑 후 작업 목록 진입 시 분류 화면으로 열리는지 확인
+- 클래스 선택·저장·재진입 시 선택값 유지 확인
+- 분류 결과 CSV/JSON 내보내기 및 파일 경로·형식 확인
+
+---
+
+2026-03-11 (수) 개발일지
+1) 목표
+VLM 배분·검수 가시성 확보, 프로젝트 삭제 시 배분 해제, 검수 플로우 정리, 작업 목록 정렬·네비게이션 통일
+2) 작업 내용
+VLM 배분 및 가시성
+- VLM 배분 API가 배정된 taskIds 반환하도록 수정, 클라이언트에서 `GET /api/datasets?ids=` 로 해당 작업 병합 후 캐시 반영
+- 프로젝트 삭제 시 해당 VLM 프로젝트의 vlm_tasks 배분 해제(assignedWorker·status 초기화), 삭제 후 `onRefreshTasksFromServer` 호출
+- 로그인 시 `Storage.clearTaskCache()` 후 초기화해 계정별 작업 목록 정확히 로드
+- 검수 버튼: 제출 건이 캐시에 없을 때 `Storage.fetchAndMergeWorkerTasks(workerName)` 호출 후 첫 SUBMITTED 작업 열기
+VLM 검수·재배정 동작
+- VLM 배분 해제(unassign) 시 status를 TODO로 초기화해 재배정 후 제출/대기 섞임 방지
+- 작업자 화면에서 제출(SUBMITTED) 작업도 편집 가능하도록 변경(APPROVED만 읽기 전용)
+정렬·네비게이션 통일
+- VLM: 작업 ID 오름차순, YOLO: 파일명(name) 오름차순으로 목록·이동·Jump to·다음/이전 통일 (App.tsx, Dashboard.tsx)
+- 작업자별 진행 현황에서 검수 시 "제일 처음" 작업: VLM은 ID 순, YOLO는 이름 순으로 정렬한 뒤 첫 SUBMITTED 선택 (orderedForRow 도입, fetchAndMerge 후에도 동일 정렬 적용)
+UI
+- 하단 네비게이션 스크롤바/넘침 방지 (overflow-hidden, min-w-0, shrink-0 등)
+- Jump to 입력 시 정렬 기준을 VLM=id·YOLO=name에 맞춰 인덱스 일치하도록 수정
+3) 수정 파일
+- `vite.config.ts` (VLM assign 반환 taskIds, delete 시 vlm_tasks unassign, unassign 시 status=TODO)
+- `services/storage.ts` (clearTaskCache, mergeTasksByIds, fetchAndMergeWorkerTasks, assignVlmTasks 시 taskIds 병합)
+- `components/Dashboard.tsx` (검수 버튼·행 클릭 시 orderedForRow 사용, VLM/YOLO 정렬, targetTasks 필터)
+- `App.tsx` (orderedCurrentFolderTasks·handleJumpToIndex·findNextTask 정렬 분기, readOnly 조건, 하단 네비 레이아웃)
+- `components/VlmReviewPanel.tsx` (휠 확대 시 preventDefault로 페이지 스크롤 방지)
+4) 검증
+- VLM 배분 후 관리자/작업자 화면에서 해당 작업 노출 확인
+- 프로젝트 삭제 시 해당 VLM 작업 배분 해제 확인
+- 검수 클릭 시 해당 작업자 제출 건 중 정렬 기준 첫 건 열림 확인 (VLM=ID 순, YOLO=이름 순)
+- YOLO 다음/이전·Jump to 시 이름 순, VLM 시 ID 순 일치 확인
+
 2026-02-25 (수) 개발일지 - 추가 업데이트
 1) 목표
 전반 UI 개편 안정화, YOLO 작업 편의성(Undo/Redo) 강화, 프로젝트 노출 정책 운영화

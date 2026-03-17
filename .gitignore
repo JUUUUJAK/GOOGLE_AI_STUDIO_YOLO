@@ -33,6 +33,7 @@ Thumbs.db
 # Optional: Ignore large datasets if you don't want to commit them
 datasets.db
 **/localtool/
+yolo_localtool/
 **/datasets/
 # test1/
 

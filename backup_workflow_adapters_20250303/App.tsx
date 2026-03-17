@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { UserRole, Task, TaskStatus, TaskStatusLabels, YoloClass, User, AccountType, TaskIssueReasonCode, TaskIssueType, PluginSourceType, WORKFLOW_CONFIG } from './types';
+import { UserRole, Task, TaskStatus, TaskStatusLabels, YoloClass, User, AccountType, TaskIssueReasonCode, TaskIssueType } from './types';
 import { COLOR_PALETTE } from './constants';
 import * as Storage from './services/storage';
 import Dashboard from './components/Dashboard';
@@ -227,33 +227,6 @@ const App: React.FC = () => {
         setIsDataLoading(true);
         try {
             await fetch('/api/sync', { method: 'POST' });
-            await Storage.initStorage();
-            await Storage.syncAllTaskPages();
-            refreshTasks();
-        } finally {
-            setIsDataLoading(false);
-        }
-    };
-
-    const handleSyncProject = async (projectId: string) => {
-        setIsDataLoading(true);
-        try {
-            await fetch(`/api/sync?projectId=${encodeURIComponent(projectId)}`, { method: 'POST' });
-            await Storage.initStorage();
-            await Storage.syncAllTaskPages();
-            refreshTasks();
-        } finally {
-            setIsDataLoading(false);
-        }
-    };
-
-    const handleSyncFolders = async (folders: string[]) => {
-        if (folders.length === 0) return;
-        setIsDataLoading(true);
-        try {
-            const params = new URLSearchParams();
-            folders.forEach((f) => params.append('folders', f));
-            await fetch(`/api/sync?${params.toString()}`, { method: 'POST' });
             await Storage.initStorage();
             await Storage.syncAllTaskPages();
             refreshTasks();
@@ -564,10 +537,8 @@ const App: React.FC = () => {
         }
     }, [currentTask, startTime, currentUserRole, handleTaskSelect, handleCloseTask, user]);
 
-    const workflowType: PluginSourceType = currentTask?.sourceType ?? 'native-yolo';
-    const workflowUiConfig = WORKFLOW_CONFIG[workflowType];
-    const isVlmTask = workflowType === 'vlm-review';
-    const isClassificationTask = workflowType === 'image-classification';
+    const isVlmTask = currentTask?.sourceType === 'vlm-review';
+    const isClassificationTask = currentTask?.sourceType === 'image-classification';
 
     useEffect(() => {
         if (!currentTask || currentTask.sourceType !== 'image-classification') {
@@ -755,7 +726,6 @@ const App: React.FC = () => {
                         if (currentUserRole === UserRole.WORKER) handleSubmit(direction);
                         else handleReview(true, direction);
                     }
-                    (document.activeElement as HTMLElement)?.blur();
                 }
                 return;
             }
@@ -1005,8 +975,6 @@ const App: React.FC = () => {
                             onSelectTask={handleTaskSelect}
                             onRefresh={refreshTasks}
                             onSync={handleSync}
-                            onSyncProject={handleSyncProject}
-                            onSyncFolders={handleSyncFolders}
                             onLightRefresh={handleLightRefresh}
                             username={user.username}
                             openIssueRequestsSignal={openIssueRequestsSignal}
@@ -1072,7 +1040,7 @@ const App: React.FC = () => {
                                     </div>
                                 </div>
 
-                                {workflowUiConfig.showYoloSidebar && (
+                                {!isVlmTask && !isClassificationTask && (
                                     <>
                                         {/* Label Set Selector */}
                                         <div className="p-6 bg-slate-800/30 border-b border-slate-800">
@@ -1218,7 +1186,7 @@ const App: React.FC = () => {
 
                             {/* Canvas Area with Separate Status Bars */}
                             <div className="flex-1 flex flex-col bg-slate-950 relative overflow-hidden">
-                                {workflowUiConfig.showYoloSidebar && (
+                                {!isVlmTask && !isClassificationTask && (
                                     <>
                                         {/* Top Bar: Current Status & Class (YOLO only) */}
                                         <div className="h-14 bg-slate-900 border-b border-slate-800 flex items-center justify-between px-6 z-30 shadow-md flex-shrink-0">

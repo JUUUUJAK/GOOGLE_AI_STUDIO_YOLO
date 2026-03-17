@@ -2,12 +2,19 @@ import { Task, TaskStatus, WorkLog, UserRole, BoundingBox, TaskIssue, TaskIssueR
 import JSZip from 'jszip';
 import localforage from 'localforage';
 
+export interface ClassificationClass {
+  id: number;
+  name: string;
+}
+
 export interface ProjectDefinition {
   id: string;
   name: string;
   targetTotal: number;
-  workflowSourceType: 'native-yolo' | 'vlm-review';
+  workflowSourceType: 'native-yolo' | 'vlm-review' | 'image-classification';
   vlmSourceFile?: string;
+  /** 이미지 분류 프로젝트 전용 클래스 목록. 생성 시 설정·상세에서 수정 가능 */
+  classificationClasses?: ClassificationClass[];
   visibleToWorkers?: boolean;
   status?: 'ACTIVE' | 'ARCHIVED';
   archivedAt?: number;
@@ -43,8 +50,9 @@ export interface ProjectDetailPayload {
     id: string;
     name: string;
     targetTotal: number;
-    workflowSourceType: 'native-yolo' | 'vlm-review';
+    workflowSourceType: 'native-yolo' | 'vlm-review' | 'image-classification';
     vlmSourceFile?: string;
+    classificationClasses?: Array<{ id: number; name: string }>;
     visibleToWorkers?: boolean;
     status?: 'ACTIVE' | 'ARCHIVED';
     allocated: number;
@@ -90,7 +98,7 @@ export interface ProjectDetailPayload {
 }
 
 export interface PluginDescriptor {
-  sourceType: 'native-yolo' | 'vlm-review';
+  sourceType: 'native-yolo' | 'vlm-review' | 'image-classification';
   label: string;
   supportsWorkflow: boolean;
   supportsMigration: boolean;
@@ -167,6 +175,11 @@ let _workerScope: string | null = null;
 
 export const setWorkerScope = (worker: string | null) => {
   _workerScope = worker;
+};
+
+/** 로그인/계정 전환 시 호출. 캐시를 비우면 다음 initStorage에서 해당 계정 기준으로 전부 다시 불러옴 */
+export const clearTaskCache = () => {
+  cachedTasks = [];
 };
 
 const buildDatasetsUrl = (limit: number, offset: number, lastUpdated?: number, lastId?: string): string => {
@@ -594,10 +607,54 @@ export const syncAllTaskPages = async (limit: number = INITIAL_TASK_FETCH_LIMIT)
   return await syncTasksDelta();
 };
 
+/** 특정 작업자의 작업을 서버에서 불러와 캐시에 병합 (관리자 검수 시 해당 작업자 작업이 없을 때 사용) */
+export const fetchAndMergeWorkerTasks = async (workerName: string): Promise<void> => {
+  const prevScope = _workerScope;
+  _workerScope = workerName;
+  try {
+    const baseMap = new Map(cachedTasks.map((t) => [t.id, t]));
+    let offset = 0;
+    while (true) {
+      const res = await fetch(buildDatasetsUrl(INITIAL_TASK_FETCH_LIMIT, offset));
+      if (!res.ok) break;
+      const batch = await res.json();
+      if (!Array.isArray(batch) || batch.length === 0) break;
+      batch.forEach((f: any) => {
+        const existing = baseMap.get(f.id);
+        baseMap.set(f.id, normalizeServerTask(f, existing));
+      });
+      offset += batch.length;
+    }
+    cachedTasks = Array.from(baseMap.values())
+      .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+    await persistCachedTasks();
+  } finally {
+    _workerScope = prevScope;
+  }
+};
+
 /** Fetch tasks by ID and merge into cache (e.g. after VLM assign so UI sees new assignments) */
 export const mergeTasksByIds = async (taskIds: string[]): Promise<void> => {
   if (!taskIds || taskIds.length === 0) return;
   const url = `/api/datasets?ids=${taskIds.map((id) => encodeURIComponent(id)).join(',')}`;
+  const res = await fetch(url);
+  if (!res.ok) return;
+  const batch = await res.json();
+  if (!Array.isArray(batch) || batch.length === 0) return;
+  const baseMap = new Map(cachedTasks.map((t) => [t.id, t]));
+  batch.forEach((f: any) => {
+    const existing = baseMap.get(f.id);
+    baseMap.set(f.id, normalizeServerTask(f, existing));
+  });
+  cachedTasks = Array.from(baseMap.values())
+    .sort((a, b) => (b.lastUpdated || 0) - (a.lastUpdated || 0) || a.id.localeCompare(b.id));
+  await persistCachedTasks();
+};
+
+/** Fetch all tasks in a folder from server and merge into cache (e.g. so sourceType is correct for classification projects) */
+export const fetchAndMergeTasksByFolder = async (folder: string): Promise<void> => {
+  if (!folder || !folder.trim()) return;
+  const url = `/api/datasets?folder=${encodeURIComponent(folder.trim())}&limit=10000`;
   const res = await fetch(url);
   if (!res.ok) return;
   const batch = await res.json();
@@ -620,8 +677,8 @@ export const getTaskById = async (id: string): Promise<Task | undefined> => {
   let task = cachedTasks.find(t => t.id === id);
   if (!task) return undefined;
 
-  // List API omits sourceData; fetch full task when needed (e.g. VLM review)
-  if (task.sourceType === 'vlm-review' && task.sourceData == null) {
+  // List API omits sourceData; fetch full task when needed (e.g. VLM review, image classification)
+  if ((task.sourceType === 'vlm-review' || task.sourceType === 'image-classification') && task.sourceData == null) {
     try {
       const res = await fetch(`/api/task?id=${encodeURIComponent(id)}`);
       if (res.ok) {
@@ -1052,8 +1109,9 @@ export const saveProject = async (payload: {
   id?: string;
   name: string;
   targetTotal: number;
-  workflowSourceType?: 'native-yolo' | 'vlm-review';
+  workflowSourceType?: 'native-yolo' | 'vlm-review' | 'image-classification';
   vlmSourceFile?: string;
+  classificationClasses?: Array<{ id: number; name: string }>;
   visibleToWorkers?: boolean;
 }) => {
   try {
