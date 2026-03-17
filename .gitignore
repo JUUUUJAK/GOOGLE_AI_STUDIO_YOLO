@@ -35,6 +35,9 @@ datasets.db
 **/localtool/
 yolo_localtool/
 **/datasets/
+
+# Archived unused / one-off scripts and backups
+_archive_unused/
 # test1/
 
 # Agent artifacts (if valid)
