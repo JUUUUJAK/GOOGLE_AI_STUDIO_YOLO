@@ -1,6 +1,7 @@
 import React, { useMemo, useState, useEffect, useRef, useCallback } from 'react';
 import { Task, TaskStatus } from '../types';
 import type { YoloClass } from '../types';
+import { resolveDatasetPublicUrl } from '../services/apiBase';
 
 type ClassificationPanelProps = {
   task: Task;
@@ -113,7 +114,7 @@ const ClassificationPanel: React.FC<ClassificationPanelProps> = ({
     };
   }, [isPanning, handleMouseMove, handleMouseUp]);
 
-  const imageSrc = task.imageUrl?.startsWith('/') ? task.imageUrl : `/datasets/${task.imageUrl || ''}`;
+  const imageSrc = resolveDatasetPublicUrl(task.imageUrl || '');
   const canSubmit = !readOnly && task.status !== TaskStatus.ISSUE_PENDING;
 
   const scalePresets = [

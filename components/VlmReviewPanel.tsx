@@ -1,5 +1,6 @@
-import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useState, useCallback, useRef } from 'react';
 import { Task, TaskStatus } from '../types';
+import { resolveDatasetPublicUrl } from '../services/apiBase';
 
 type VlmReviewResult = 'NORMAL' | 'NEEDS_FIX_VP' | 'NEEDS_FIX_DETAIL';
 
@@ -71,7 +72,7 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
   const rawResultData = parsed?.rawResultData || {};
   const conversations = Array.isArray(rawData?.conversations) ? rawData.conversations : [];
   const imagePath = String(parsed?.resolvedImagePath || rawData?.image || parsed?.legacyImage || '').trim();
-  const imageSrc = normalizeImageSrc(imagePath);
+  const imageSrc = resolveDatasetPublicUrl(normalizeImageSrc(imagePath));
 
   const firstPrompt = useMemo(() => {
     const candidate = conversations.find((item: any) => {
@@ -106,7 +107,9 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
 
   const [reviewResult, setReviewResult] = useState<VlmReviewResult>(initialResult);
   const [inputPrompt, setInputPrompt] = useState<string>(firstPrompt);
-  const [gptResponse, setGptResponse] = useState<string>(String(rawResultData?.editedAnswer || parsed?.ui?.editedGptResponse || ''));
+  const [gptResponse, setGptResponse] = useState<string>(() =>
+    initialResult === 'NORMAL' ? '' : String(rawResultData?.editedAnswer || parsed?.ui?.editedGptResponse || '')
+  );
   const [dueDate, setDueDate] = useState<string>(initialDueDate);
   const [note, setNote] = useState<string>(String(task.reviewerNotes || ''));
 
@@ -130,16 +133,27 @@ const VlmReviewPanel: React.FC<VlmReviewPanelProps> = ({
     return () => el.removeEventListener('wheel', handler);
   }, []);
 
-  useEffect(() => {
+  // useLayoutEffect: 작업 전환 직후 이전 작업의 GPT 응답이 vlmDraftRef에 남아 다음 저장에 섞이는 것 방지
+  useLayoutEffect(() => {
+    const gpt =
+      initialResult === 'NORMAL' ? '' : String(rawResultData?.editedAnswer || parsed?.ui?.editedGptResponse || '');
+    const due = initialDueDate || getTodayYmd();
+    const n = String(task.reviewerNotes || '');
     setReviewResult(initialResult);
     setInputPrompt(firstPrompt);
-    setGptResponse(String(rawResultData?.editedAnswer || parsed?.ui?.editedGptResponse || ''));
+    setGptResponse(gpt);
     setDueDate(initialDueDate);
-    setNote(String(task.reviewerNotes || ''));
+    setNote(n);
     setIsPanning(false);
     setLastPanPos(null);
-    // scale, pan은 이미지 전환 시에도 유지 (사용자가 25% 등으로 둔 상태 유지)
-  }, [task.id, task.sourceData, task.reviewerNotes, initialResult, firstPrompt, rawResultData, parsed, initialDueDate]);
+    onDraftChange?.({
+      reviewResult: initialResult,
+      inputPrompt: firstPrompt,
+      gptResponse: gpt,
+      dueDate: due,
+      note: n,
+    });
+  }, [task.id, task.sourceData, task.reviewerNotes, initialResult, firstPrompt, rawResultData, parsed, initialDueDate, onDraftChange]);
 
   const handleMouseDown = useCallback((e: React.MouseEvent) => {
     if (e.button === 0 || e.button === 1 || e.button === 2) {

@@ -81,7 +81,7 @@ export interface WorkflowAdapter {
   sourceType: PluginSourceType;
   /** 이 워크플로가 기여하는 projectMap 보정. rawMap + (VLM 등) DB 기반 보정을 합쳐 반환할 수 있음 */
   resolveProjectMap: (params: {
-    projects: Record<string, { id: string; workflowSourceType?: string; vlmSourceFile?: string }>;
+    projects: Record<string, { id: string; workflowSourceType?: string; vlmSourceFile?: string; vlmSourceFiles?: string[] }>;
     rawMap: Record<string, { projectId: string; updatedAt: number }>;
     existingFolders: Set<string>;
     getVlmFoldersBySourceFile?: (sourceFile: string) => string[];
@@ -89,7 +89,7 @@ export interface WorkflowAdapter {
   /** 이 워크플로의 프로젝트 상세용 폴더 목록 + 작업자별 집계. detail API에서 사용 */
   getFolderListForProject?: (params: {
     projectId: string;
-    project: { workflowSourceType?: string; vlmSourceFile?: string };
+    project: { workflowSourceType?: string; vlmSourceFile?: string; vlmSourceFiles?: string[] };
     projectMap: Record<string, { projectId: string; updatedAt: number }>;
     getFolderRowsFromDb: (workflowSourceType: string) => ProjectFolderRow[];
     getWorkerRowsFromDb: (folder: string, workflowSourceType: string) => Array<{ assignedWorker: string; taskCount: number; completedCount: number }>;

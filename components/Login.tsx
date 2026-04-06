@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { AccountType, User } from '../types';
+import { apiUrl } from '../services/apiBase';
 
 interface LoginProps {
   onLogin: (user: User) => void;
@@ -19,7 +20,7 @@ const Login: React.FC<LoginProps> = ({ onLogin }) => {
     setIsLoggingIn(true);
 
     try {
-      const res = await fetch('/api/login', {
+      const res = await fetch(apiUrl('/api/login'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',

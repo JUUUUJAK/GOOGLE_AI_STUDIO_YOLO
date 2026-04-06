@@ -69,8 +69,9 @@ export const AdminGuideContent: React.FC = () => (
             <Bullet>VLM 검수 프로젝트인 경우 <strong>원본 JSON 파일</strong>을 선택해야 합니다.</Bullet>
         </Section>
         <Section title="2. 데이터 동기화 (YOLO 작업 시)">
-            <Bullet>이미지·라벨이 들어 있는 <strong>datasets</strong> 폴더 구조를 준비합니다.</Bullet>
-            <Bullet>대시보드 <strong>데이터</strong> 탭에서 <strong>Sync Data</strong>로 DB에 반영합니다.</Bullet>
+            <Bullet>이미지·라벨은 <strong>프로젝트 폴더</strong> 중심으로 <strong>datasets</strong> 아래에 둡니다 (작업자명 상위 폴더에 의존하지 않음).</Bullet>
+            <Bullet>디스크 → DB 반영은 <strong>프로젝트 상세</strong>에서 해당 프로젝트만 동기화하거나, 폴더 행의 동기화를 사용합니다.</Bullet>
+            <Bullet>상단 <strong>DB 새로고침</strong>은 목록만 갱신합니다. 전체 디스크 스캔은 별도 버튼이며 느릴 수 있습니다.</Bullet>
         </Section>
         <Section title="3. 작업 배정">
             <Bullet><strong>YOLO</strong>: 프로젝트 상세 → 폴더 진행 현황에서 폴더별로 작업자를 배정합니다.</Bullet>

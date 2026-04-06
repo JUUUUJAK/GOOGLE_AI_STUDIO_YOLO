@@ -1,26 +1,56 @@
 import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Task, TaskStatus, TaskStatusLabels, UserRole, FolderMetadata, AccountType, TaskIssue, TaskIssueStatus, VacationRecord, PluginSourceType, WORKFLOW_LABELS } from '../types';
 import * as Storage from '../services/storage';
+import { apiUrl, resolveDatasetPublicUrl } from '../services/apiBase';
+import { resolveProjectMapEntryForFolder } from '../services/projectMapResolve';
+import { resolveWorkerFolderMapEntryForFolder } from '../services/workerFolderMapResolve';
 import { ResponsiveContainer, ComposedChart, CartesianGrid, XAxis, YAxis, Tooltip, Legend, Bar, Line } from 'recharts';
 import { toBlob } from 'html-to-image';
 import ReactQuill from 'react-quill';
 import 'react-quill/dist/quill.snow.css';
 import DOMPurify from 'dompurify';
+import { DatasetsFolderTree } from './DatasetsFolderTree';
+
+/** App 검수 범위·내비: 프로젝트 상세 / 검수 큐에서 전달 */
+export type SelectTaskOptions = {
+    reviewerScopeWorker?: string | null;
+    /** queue: 폴더 무관 이전·다음(작업자 배정 큐 순서) */
+    reviewerNavMode?: 'folder' | 'queue';
+    /** queue 모드에서 목록 필터(검수 큐 패널과 동일) */
+    reviewerQueueFilter?: 'pending' | 'all';
+    /** queue 모드에서 프로젝트 범위만(검수 큐에서 불러온 범위와 동일) */
+    reviewerQueueProjectId?: string | null;
+};
 
 interface DashboardProps {
     role: UserRole;
     accountType: AccountType;
-    onSelectTask: (taskId: string) => void;
+    onSelectTask: (taskId: string, options?: SelectTaskOptions) => void;
     onRefresh: () => void;
     onSync: () => Promise<void>;
+    /** datasets 전체 디스크 스캔 (느림) — 선택 시에만 */
+    onFullDiskSync?: () => Promise<void>;
     onSyncProject?: (projectId: string) => Promise<void>;
     onSyncFolders?: (folders: string[]) => Promise<void>;
+    /** datasets adopt + 부분 스캔 — 관리자 프로젝트 개요 디스크 트리 */
+    onAdoptFolders?: (
+        paths: string[],
+        projectId: string,
+        assignedWorker?: string | null
+    ) => Promise<void>;
     onLightRefresh?: () => Promise<void>;
+    /** 분류 폴더 진입 등 대량 fetch 전후로 App 전역 로딩 표시 */
+    onFolderPrepareLoading?: (loading: boolean) => void;
     tasks: Task[];
     username: string;
     token?: string;
     openIssueRequestsSignal?: number;
     openUserManagementSignal?: number;
+    /** 작업자 목록 새로고침 시 overview 재조회 트리거 */
+    workerOverviewRefreshKey?: number;
+    /** 검수자: 마지막으로 연 태스크의 배정 작업자 — Work List·폴더 그리드가 해당 작업자만 보이도록 */
+    reviewerScopeWorker?: string | null;
+    onClearReviewerScope?: () => void;
 }
 
 const USER_MANAGEMENT_VIEW = 'USERS';
@@ -34,8 +64,9 @@ const DASHBOARD_HOME_VIEW = 'DASHBOARD_HOME';
 const WORK_LIST_VIEW = 'WORK_LIST';
 const DATA_IMPORT_EXPORT_VIEW = 'DATA_IMPORT_EXPORT';
 const PROJECT_DETAIL_VIEW_PREFIX = 'PROJECT_DETAIL:';
-const PROJECT_DETAIL_CACHE_TTL_MS = 60 * 1000;
 const NOTICE_HOME_VIEW = 'NOTICE_HOME';
+/** 관리자 검수자 전용: 작업자 단위 큐(폴더 경계 없음) */
+const REVIEW_QUEUE_VIEW = 'REVIEW_QUEUE';
 
 /** Path의 최상위 세그먼트(그룹명). 예: "A/train/B" => "A" */
 function getTopLevelGroup(folderPath: string): string {
@@ -43,6 +74,16 @@ function getTopLevelGroup(folderPath: string): string {
     if (!s) return s;
     const idx = s.indexOf('/');
     return idx === -1 ? s : s.slice(0, idx);
+}
+
+/** 그룹(첫 세그먼트) 이후 경로만 표시 */
+function folderPathAfterGroup(fullPath: string, group: string): string {
+    const s = String(fullPath || '');
+    const g = String(group || '');
+    if (!g) return s;
+    if (s === g) return '—';
+    if (s.startsWith(g + '/')) return s.slice(g.length + 1);
+    return s;
 }
 
 function groupByTopLevel<T>(items: T[], getFolder: (item: T) => string): { groupName: string; items: T[] }[] {
@@ -60,7 +101,179 @@ function groupByTopLevel<T>(items: T[], getFolder: (item: T) => string): { group
             items: [...items].sort((a, b) => getFolder(a).localeCompare(getFolder(b)))
         }));
 }
+
+/** 작업자 매핑 탭 — 폴더 경로 트리 */
+type WorkerMapFolderRow = Storage.ProjectOverviewPayload['folders'][number];
+type WorkerMapTreeNode = {
+    segment: string;
+    fullPath: string;
+    row: WorkerMapFolderRow | null;
+    children: WorkerMapTreeNode[];
+};
+
+function buildWorkerFolderTree(rows: WorkerMapFolderRow[]): WorkerMapTreeNode[] {
+    const root: WorkerMapTreeNode = { segment: '', fullPath: '', row: null, children: [] };
+    const ensureChild = (parent: WorkerMapTreeNode, seg: string): WorkerMapTreeNode => {
+        let c = parent.children.find((x) => x.segment === seg);
+        if (!c) {
+            const fullPath = parent.fullPath ? `${parent.fullPath}/${seg}` : seg;
+            c = { segment: seg, fullPath, row: null, children: [] };
+            parent.children.push(c);
+        }
+        return c;
+    };
+    for (const row of rows) {
+        const parts = String(row.folder || '')
+            .replace(/\\/g, '/')
+            .split('/')
+            .map((p) => p.trim())
+            .filter(Boolean);
+        if (parts.length === 0) continue;
+        let cur = root;
+        for (let i = 0; i < parts.length; i++) {
+            cur = ensureChild(cur, parts[i]);
+            if (i === parts.length - 1) cur.row = row;
+        }
+    }
+    const sortRec = (nodes: WorkerMapTreeNode[]) => {
+        nodes.sort((a, b) => a.segment.localeCompare(b.segment, undefined, { numeric: true }));
+        nodes.forEach((n) => sortRec(n.children));
+    };
+    sortRec(root.children);
+    return root.children;
+}
+
+function collectFolderPathsUnderPrefix(prefix: string, rows: WorkerMapFolderRow[]): string[] {
+    const p = String(prefix || '').replace(/\\/g, '/').replace(/\/+$/, '');
+    return rows.map((r) => r.folder).filter((f) => f === p || f.startsWith(p + '/'));
+}
+
+function coerceVlmSourceFileStringArray(v: unknown): string[] {
+    if (Array.isArray(v)) {
+        return v.map((x) => String(x || '').trim()).filter(Boolean);
+    }
+    if (typeof v === 'string') {
+        const t = v.trim();
+        if (!t) return [];
+        try {
+            const p = JSON.parse(t) as unknown;
+            if (Array.isArray(p)) {
+                return p.map((x) => String(x || '').trim()).filter(Boolean);
+            }
+        } catch {
+            /* 단일 문자열 */
+        }
+        return [t];
+    }
+    return [];
+}
+
+/**
+ * 프로젝트 레코드에서 VLM 원본 JSON 목록.
+ * API/저장소마다 `vlm_source_files`, JSON 문자열 배열 등 형태가 달라질 수 있어 느슨하게 읽음.
+ */
+function projectVlmSourceFileNamesFromUnknown(project: unknown): string[] {
+    if (!project || typeof project !== 'object') return [];
+    const o = project as Record<string, unknown>;
+    const fromArr = coerceVlmSourceFileStringArray(o.vlmSourceFiles ?? o.vlm_source_files);
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const s of fromArr) {
+        if (!seen.has(s)) {
+            seen.add(s);
+            out.push(s);
+        }
+    }
+    if (out.length > 0) return out;
+    const one = o.vlmSourceFile ?? o.vlm_source_file;
+    if (one != null) {
+        const t = String(one).trim();
+        if (t) return [t];
+    }
+    return [];
+}
+
+/** @deprecated 호환용 — 내부적으로 `projectVlmSourceFileNamesFromUnknown` 사용 */
+function projectVlmSourceFileNames(project: { vlmSourceFiles?: string[]; vlmSourceFile?: string } | null | undefined): string[] {
+    return projectVlmSourceFileNamesFromUnknown(project ?? undefined);
+}
+
+/** `VLM_<stem>` 폴더명에서 원본 JSON 파일명 후보 추출 (import 시 관례) */
+function inferVlmJsonNamesFromFolders(folders: Array<{ folder?: string }>): string[] {
+    const names: string[] = [];
+    const seen = new Set<string>();
+    for (const row of folders) {
+        const folder = String(row.folder || '').trim();
+        const leaf = folder.replace(/\\/g, '/').split('/').pop() || folder;
+        const m = /^VLM_(.+)$/i.exec(leaf);
+        if (!m) continue;
+        let base = m[1];
+        if (!/\.json$/i.test(base)) base = `${base}.json`;
+        if (!seen.has(base)) {
+            seen.add(base);
+            names.push(base);
+        }
+    }
+    return names;
+}
+
+function vlmStatsKeyVariants(sf: string): string[] {
+    const s = String(sf || '').trim();
+    if (!s) return [];
+    const norm = s.replace(/\\/g, '/');
+    const base = norm.split('/').pop() || norm;
+    const lower = s.toLowerCase();
+    const baseLower = base.toLowerCase();
+    return [...new Set([s, norm, base, lower, baseLower])].filter(Boolean);
+}
+
+function buildVlmAssignStatsLookup(list: Storage.VlmAssignSourceFileInfo[]): Map<string, Storage.VlmAssignSourceFileInfo> {
+    const m = new Map<string, Storage.VlmAssignSourceFileInfo>();
+    for (const r of list) {
+        const raw = String(r.sourceFile || '').trim();
+        if (!raw) continue;
+        for (const k of vlmStatsKeyVariants(raw)) {
+            if (!m.has(k)) m.set(k, r);
+        }
+    }
+    return m;
+}
+
+function lookupVlmAssignStats(
+    lookup: Map<string, Storage.VlmAssignSourceFileInfo>,
+    wanted: string
+): Storage.VlmAssignSourceFileInfo | undefined {
+    const w = String(wanted || '').trim();
+    if (!w) return undefined;
+    for (const k of vlmStatsKeyVariants(w)) {
+        const hit = lookup.get(k);
+        if (hit) return hit;
+    }
+    const wb = (w.replace(/\\/g, '/').split('/').pop() || w).toLowerCase();
+    for (const r of lookup.values()) {
+        const rf = String(r.sourceFile || '').trim();
+        const rb = (rf.replace(/\\/g, '/').split('/').pop() || rf).toLowerCase();
+        if (rb === wb) return r;
+    }
+    return undefined;
+}
+
+function collectAllExpandablePaths(nodes: WorkerMapTreeNode[]): string[] {
+    const out: string[] = [];
+    const walk = (list: WorkerMapTreeNode[]) => {
+        for (const n of list) {
+            if (n.children.length > 0) out.push(n.fullPath);
+            walk(n.children);
+        }
+    };
+    walk(nodes);
+    return out;
+}
+
 const projectDetailCache = new Map<string, { fetchedAt: number; payload: Storage.ProjectDetailPayload | null }>();
+/** 열린 프로젝트 현황 자동 갱신 주기 (ms) — 지표 새로고침과 동일 파이프라인 */
+const PROJECT_DETAIL_POLL_MS = 180_000;
+/** 통계는 Storage.getProjectOverview 캐시 + refreshOverview(force) 로 갱신 */
 // const AVAILABLE_WORKERS = ['worker1', 'worker2', 'worker3', 'worker4'];
 
 type WorkerChartRow = { userId: string; submitted: number; totalTimeSeconds: number };
@@ -130,8 +343,13 @@ const WorkerPerformanceComboChart: React.FC<{ data: WorkerChartRow[]; title?: st
 
 type ReportMode = 'DAILY' | 'WEEKLY' | 'MONTHLY';
 
+/** 리포트 집계 기준: 작업자(기존) vs 프로젝트(_project_map) */
+type ReportBasis = 'worker' | 'project';
+
 type ProcessedReportRow = {
     userId: string;
+    /** 프로젝트 리포트 등 표시용 이름 (없으면 userId) */
+    displayName?: string;
     totalTimeSeconds: number;
     submitted: number;
     approved: number;
@@ -215,7 +433,11 @@ const countWeekdaysInRange = (startDate: string, endDate: string): number => {
     return count;
 };
 
-const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorkers: string[] }> = ({ mode, tasks, validWorkers }) => {
+const UnifiedReportPanel: React.FC<{ mode: ReportMode; validWorkers: string[]; reportBasis?: ReportBasis }> = ({
+    mode,
+    validWorkers,
+    reportBasis = 'worker'
+}) => {
     const now = new Date();
     const [selectedDay, setSelectedDay] = useState(() => toDateInputValue(now));
     const [selectedWeekAnchor, setSelectedWeekAnchor] = useState(() => toDateInputValue(now));
@@ -223,13 +445,32 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
     const [reportData, setReportData] = useState<any[]>([]);
     const [vacations, setVacations] = useState<VacationRecord[]>([]);
     const [isLoading, setIsLoading] = useState(false);
+    const [projectReportError, setProjectReportError] = useState<string | null>(null);
     const reportCaptureRef = useRef<HTMLDivElement | null>(null);
     const reportFetchSeqRef = useRef(0);
 
     const weekRange = useMemo(() => getWeekRange(new Date(selectedWeekAnchor)), [selectedWeekAnchor]);
 
-    const titleText = mode === 'DAILY' ? 'Daily Report (일일 리포트)' : mode === 'WEEKLY' ? 'Weekly Report (주간 리포트)' : 'Monthly Report (월간 리포트)';
-    const subtitleText = mode === 'DAILY' ? 'Specific day performance metrics' : mode === 'WEEKLY' ? 'Weekly performance metrics' : 'Monthly performance metrics';
+    const titleText =
+        reportBasis === 'project'
+            ? mode === 'DAILY'
+                ? '프로젝트 일일 리포트'
+                : mode === 'WEEKLY'
+                  ? '프로젝트 주간 리포트'
+                  : '프로젝트 월간 리포트'
+            : mode === 'DAILY'
+              ? 'Daily Report (일일 리포트)'
+              : mode === 'WEEKLY'
+                ? 'Weekly Report (주간 리포트)'
+                : 'Monthly Report (월간 리포트)';
+    const subtitleText =
+        reportBasis === 'project'
+            ? '_project_map 기준 폴더 로그를 프로젝트에 합산 (작업자 구분 없음)'
+            : mode === 'DAILY'
+              ? 'Specific day performance metrics'
+              : mode === 'WEEKLY'
+                ? 'Weekly performance metrics'
+                : 'Monthly performance metrics';
     const periodRange = useMemo(() => {
         if (mode === 'DAILY') {
             return { startDate: selectedDay, endDate: selectedDay, totalDays: countWeekdaysInRange(selectedDay, selectedDay) };
@@ -256,7 +497,24 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
             const requestSeq = ++reportFetchSeqRef.current;
             setIsLoading(true);
             setReportData([]);
+            if (reportBasis === 'project') {
+                setProjectReportError(null);
+            }
             try {
+                if (reportBasis === 'project') {
+                    let stats: any[] = [];
+                    if (mode === 'DAILY') {
+                        stats = await Storage.getDailyProjectStats(new Date(selectedDay));
+                    } else if (mode === 'WEEKLY') {
+                        stats = await Storage.getWeeklyProjectStats(weekRange.startDate);
+                    } else {
+                        const [py, pm] = selectedMonth.split('-').map(Number);
+                        stats = await Storage.getMonthlyProjectStats(py, pm);
+                    }
+                    if (requestSeq !== reportFetchSeqRef.current) return;
+                    setReportData(Array.isArray(stats) ? stats : []);
+                    return;
+                }
                 if (mode === 'DAILY') {
                     const stats = await Storage.getDailyStats(new Date(selectedDay));
                     if (requestSeq !== reportFetchSeqRef.current) return;
@@ -273,6 +531,13 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                 const stats = await Storage.getMonthlyStats(year, month);
                 if (requestSeq !== reportFetchSeqRef.current) return;
                 setReportData(stats);
+            } catch (e) {
+                if (reportBasis === 'project' && requestSeq === reportFetchSeqRef.current) {
+                    const msg = e instanceof Error ? e.message : String(e);
+                    setProjectReportError(msg);
+                    setReportData([]);
+                    console.error('Project report fetch failed:', e);
+                }
             } finally {
                 if (requestSeq === reportFetchSeqRef.current) {
                     setIsLoading(false);
@@ -280,7 +545,7 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
             }
         };
         fetchData();
-    }, [mode, selectedDay, selectedMonth, weekRange.startTs, weekRange.startDate]);
+    }, [mode, reportBasis, selectedDay, selectedMonth, weekRange.startTs, weekRange.startDate]);
 
     const fetchVacations = async () => {
         const rows = await Storage.getVacations(periodRange.startDate, periodRange.endDate);
@@ -288,34 +553,53 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
     };
 
     useEffect(() => {
+        if (reportBasis === 'project') {
+            setVacations([]);
+            return;
+        }
         fetchVacations();
-    }, [periodRange.endDate, periodRange.startDate]);
+    }, [periodRange.endDate, periodRange.startDate, reportBasis]);
 
     const processedData = useMemo(() => {
+        if (reportBasis === 'project') {
+            const wd = Math.max(1, periodRange.totalDays);
+            return reportData
+                .map((item: any) => {
+                    const pid = String(item.projectId || '').trim() || '__unmapped__';
+                    const displayName = String(item.projectName || pid).trim() || pid;
+                    const submitted = Number(item.submissions || 0);
+                    return {
+                        userId: pid,
+                        displayName,
+                        totalTimeSeconds: Number(item.workTime || 0),
+                        submitted,
+                        approved: Number(item.approvals || 0),
+                        rejected: Number(item.rejections || 0),
+                        totalManualBoxes: Number(item.manualBoxCount || 0),
+                        assignedFolders: new Set<string>(Array.isArray(item.folders) ? item.folders : []),
+                        lastTimestamp: Number(item.lastActive || 0),
+                        vacationDays: 0,
+                        workingDays: wd,
+                        submissionsPerWorkingDay: wd > 0 ? Number((submitted / wd).toFixed(2)) : 0
+                    } as ProcessedReportRow;
+                })
+                .filter(
+                    (row) =>
+                        row.totalTimeSeconds > 0 ||
+                        row.submitted > 0 ||
+                        row.assignedFolders.size > 0 ||
+                        row.approved > 0 ||
+                        row.rejected > 0
+                )
+                .sort((a, b) =>
+                    String(a.displayName || a.userId).localeCompare(String(b.displayName || b.userId), undefined, {
+                        numeric: true,
+                        sensitivity: 'base'
+                    })
+                );
+        }
+
         const stats = new Map<string, ProcessedReportRow>();
-        const workerKeys = new Set<string>();
-
-        tasks.forEach(task => {
-            if (!task.assignedWorker) return;
-            const name = sanitizeWorkerName(task.assignedWorker, validWorkers);
-            if (name.toLowerCase() !== 'admin') workerKeys.add(name);
-        });
-
-        workerKeys.forEach(worker => {
-            stats.set(worker, {
-                userId: worker,
-                totalTimeSeconds: 0,
-                submitted: 0,
-                approved: 0,
-                rejected: 0,
-                totalManualBoxes: 0,
-                assignedFolders: new Set<string>(),
-                lastTimestamp: 0,
-                vacationDays: 0,
-                workingDays: periodRange.totalDays,
-                submissionsPerWorkingDay: 0
-            });
-        });
 
         validWorkers.forEach(worker => {
             if (!worker || worker.toLowerCase() === 'admin') return;
@@ -523,8 +807,25 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                     submissionsPerWorkingDay: workingDays > 0 ? Number((Number(row.submitted || 0) / workingDays).toFixed(2)) : 0
                 };
             })
-            .sort((a, b) => b.totalTimeSeconds - a.totalTimeSeconds);
-    }, [mode, periodRange.endDate, periodRange.startDate, periodRange.totalDays, reportData, selectedDay, selectedMonth, tasks, vacations, validWorkers, weekRange.endTs]);
+            .sort((a, b) =>
+                String(a.userId || '').localeCompare(String(b.userId || ''), undefined, {
+                    numeric: true,
+                    sensitivity: 'base'
+                })
+            );
+    }, [
+        mode,
+        periodRange.endDate,
+        periodRange.startDate,
+        periodRange.totalDays,
+        reportBasis,
+        reportData,
+        selectedDay,
+        selectedMonth,
+        vacations,
+        validWorkers,
+        weekRange.endTs
+    ]);
 
     const totals = useMemo(() => {
         return {
@@ -539,26 +840,76 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
         };
     }, [processedData]);
 
-    const chartTitle = mode === 'DAILY'
-        ? '일간 작업자별 Submissions / Work Time'
-        : mode === 'WEEKLY'
-            ? '주간 작업자별 Submissions / Work Time'
-            : '월간 작업자별 Submissions / Work Time';
+    const chartTitle =
+        reportBasis === 'project'
+            ? mode === 'DAILY'
+                ? '일간 프로젝트별 Submissions / Work Time'
+                : mode === 'WEEKLY'
+                  ? '주간 프로젝트별 Submissions / Work Time'
+                  : '월간 프로젝트별 Submissions / Work Time'
+            : mode === 'DAILY'
+              ? '일간 작업자별 Submissions / Work Time'
+              : mode === 'WEEKLY'
+                ? '주간 작업자별 Submissions / Work Time'
+                : '월간 작업자별 Submissions / Work Time';
 
     const handleExportCSV = () => {
-        const header = ['Worker ID', 'Work Duration (s)', 'Formatted Duration', 'Submissions', 'Vacation Days', 'Working Days', 'Submissions / Working Day', 'Last Activity', 'Manual Boxes', 'Folders Worked'];
-        const rows = processedData.map(row => [
-            row.userId,
-            Number(row.totalTimeSeconds || 0),
-            formatDuration(Number(row.totalTimeSeconds || 0)),
-            Number(row.submitted || 0),
-            Number(row.vacationDays || 0),
-            Number(row.workingDays || 0),
-            Number(row.submissionsPerWorkingDay || 0),
-            row.lastTimestamp ? new Date(row.lastTimestamp).toLocaleString() : 'N/A',
-            Number(row.totalManualBoxes || 0),
-            `"${Array.from((row.assignedFolders ?? new Set<string>()) as Set<string>).join(', ')}"`
-        ]);
+        const header =
+            reportBasis === 'project'
+                ? [
+                      'Project ID',
+                      'Project Name',
+                      'Work Duration (s)',
+                      'Formatted Duration',
+                      'Submissions',
+                      'Approvals',
+                      'Rejections',
+                      'Working Days (period)',
+                      'Submissions / Working Day',
+                      'Last Activity',
+                      'Manual Boxes',
+                      'Folders'
+                  ]
+                : [
+                      'Worker ID',
+                      'Work Duration (s)',
+                      'Formatted Duration',
+                      'Submissions',
+                      'Vacation Days',
+                      'Working Days',
+                      'Submissions / Working Day',
+                      'Last Activity',
+                      'Manual Boxes',
+                      'Folders Worked'
+                  ];
+        const rows =
+            reportBasis === 'project'
+                ? processedData.map((row) => [
+                      row.userId,
+                      row.displayName || row.userId,
+                      Number(row.totalTimeSeconds || 0),
+                      formatDuration(Number(row.totalTimeSeconds || 0)),
+                      Number(row.submitted || 0),
+                      Number(row.approved || 0),
+                      Number(row.rejected || 0),
+                      Number(row.workingDays || 0),
+                      Number(row.submissionsPerWorkingDay || 0),
+                      row.lastTimestamp ? new Date(row.lastTimestamp).toLocaleString() : 'N/A',
+                      Number(row.totalManualBoxes || 0),
+                      `"${Array.from((row.assignedFolders ?? new Set<string>()) as Set<string>).join(', ')}"`
+                  ])
+                : processedData.map((row) => [
+                      row.userId,
+                      Number(row.totalTimeSeconds || 0),
+                      formatDuration(Number(row.totalTimeSeconds || 0)),
+                      Number(row.submitted || 0),
+                      Number(row.vacationDays || 0),
+                      Number(row.workingDays || 0),
+                      Number(row.submissionsPerWorkingDay || 0),
+                      row.lastTimestamp ? new Date(row.lastTimestamp).toLocaleString() : 'N/A',
+                      Number(row.totalManualBoxes || 0),
+                      `"${Array.from((row.assignedFolders ?? new Set<string>()) as Set<string>).join(', ')}"`
+                  ]);
         const csvContent = [header, ...rows].map(r => r.join(',')).join('\n');
         const blob = new Blob(['\ufeff' + csvContent], { type: 'text/csv;charset=utf-8;' });
         const url = URL.createObjectURL(blob);
@@ -790,12 +1141,23 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                         <span className="text-sm font-semibold">리포트 로딩 중... 잠시만 기다려주세요.</span>
                     </div>
                 )}
+                {reportBasis === 'project' && projectReportError && !isLoading && (
+                    <div className="mb-4 rounded-lg border border-amber-600/50 bg-amber-950/40 px-4 py-3 text-amber-100">
+                        <div className="text-xs font-bold uppercase tracking-wide text-amber-400/90 mb-1">
+                            프로젝트 리포트를 불러오지 못함
+                        </div>
+                        <p className="text-sm leading-relaxed">{projectReportError}</p>
+                    </div>
+                )}
 
-                <div className="grid grid-cols-1 md:grid-cols-6 gap-5 mb-8">
+                <div
+                    className={`grid grid-cols-1 gap-5 mb-8 ${reportBasis === 'project' ? 'md:grid-cols-5' : 'md:grid-cols-6'}`}
+                >
                     <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-white/10 transition-colors">
                         <div className="absolute -right-4 -top-4 w-24 h-24 bg-slate-500/10 rounded-full blur-2xl group-hover:bg-slate-500/20 transition-colors"></div>
                         <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                            <div className="w-1.5 h-1.5 rounded-full bg-slate-400"></div> Total Workers
+                            <div className="w-1.5 h-1.5 rounded-full bg-slate-400"></div>{' '}
+                            {reportBasis === 'project' ? '프로젝트 수' : 'Total Workers'}
                         </div>
                         <div className="text-3xl font-heading font-black text-white relative z-10 tracking-tight">{totals.workers}</div>
                     </div>
@@ -823,14 +1185,19 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                         </div>
                         <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-orange-300 to-amber-500 relative z-10 tracking-tight">{totals.manualBoxes}</div>
                     </div>
-                    <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-violet-500/30 transition-colors">
-                        <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors"></div>
-                        <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-violet-400/20 to-transparent opacity-50"></div>
-                        <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                            <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> Total Vacation Days
+                    {reportBasis === 'worker' && (
+                        <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-violet-500/30 transition-colors">
+                            <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors"></div>
+                            <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-violet-400/20 to-transparent opacity-50"></div>
+                            <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
+                                <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> Total
+                                Vacation Days
+                            </div>
+                            <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">
+                                {totals.vacationDays}
+                            </div>
                         </div>
-                        <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">{totals.vacationDays}</div>
-                    </div>
+                    )}
                     <div className="bg-slate-900/40 backdrop-blur-xl p-5 rounded-3xl border border-white/5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] flex flex-col justify-center relative overflow-hidden group hover:border-cyan-500/30 transition-colors">
                         <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors"></div>
                         <div className="absolute top-0 right-0 w-16 h-16 bg-gradient-to-br from-cyan-400/20 to-transparent opacity-50"></div>
@@ -846,7 +1213,7 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                         const oneDayRows = processedData.filter(row => Number(row.workingDays || 0) === 1);
                         const sourceRows = oneDayRows.length > 0 ? oneDayRows : processedData;
                         return sourceRows.map(row => ({
-                            userId: row.userId,
+                            userId: row.displayName || row.userId,
                             submitted: row.submitted,
                             totalTimeSeconds: row.totalTimeSeconds
                         }));
@@ -858,15 +1225,22 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                     <table className="w-full text-left border-collapse">
                         <thead>
                             <tr className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/5">
-                                <th className="px-6 py-5">Worker ID</th>
+                                <th className="px-6 py-5">{reportBasis === 'project' ? '프로젝트' : 'Worker ID'}</th>
                                 <th className="px-6 py-5">Work Time</th>
                                 <th className="px-6 py-5">Submissions</th>
-                                <th className="px-6 py-5">Vacation Days</th>
+                                {reportBasis === 'project' ? (
+                                    <>
+                                        <th className="px-6 py-5">Approvals</th>
+                                        <th className="px-6 py-5">Rejections</th>
+                                    </>
+                                ) : (
+                                    <th className="px-6 py-5">Vacation Days</th>
+                                )}
                                 <th className="px-6 py-5">Working Days</th>
                                 <th className="px-6 py-5">Sub / Workday</th>
                                 <th className="px-6 py-5">Last Activity</th>
                                 <th className="px-6 py-5">Manual Boxes</th>
-                                <th className="px-6 py-5">Folders Worked</th>
+                                <th className="px-6 py-5">{reportBasis === 'project' ? 'Folders' : 'Folders Worked'}</th>
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-white/5">
@@ -875,9 +1249,18 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                                     <td className="px-6 py-4">
                                         <div className="flex items-center gap-3">
                                             <div className="w-10 h-10 rounded-full bg-slate-800 flex items-center justify-center text-xs font-bold text-slate-300 border border-white/5 group-hover:bg-sky-600/20 group-hover:text-sky-300 group-hover:border-sky-500/50 transition-all shadow-inner">
-                                                {row.userId?.substring(0, 2)?.toUpperCase() || '?'}
+                                                {(row.displayName || row.userId)?.substring(0, 2)?.toUpperCase() || '?'}
                                             </div>
-                                            <span className="font-semibold text-slate-200 group-hover:text-white transition-colors capitalize tracking-wide">{row.userId}</span>
+                                            <div className="flex flex-col min-w-0">
+                                                <span className="font-semibold text-slate-200 group-hover:text-white transition-colors tracking-wide truncate">
+                                                    {row.displayName || row.userId}
+                                                </span>
+                                                {reportBasis === 'project' && row.displayName && (
+                                                    <span className="text-[10px] text-slate-500 font-mono truncate" title={row.userId}>
+                                                        {row.userId}
+                                                    </span>
+                                                )}
+                                            </div>
                                         </div>
                                     </td>
                                     <td className="px-6 py-4">
@@ -888,11 +1271,26 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                                             {Number(row.submitted || 0)}
                                         </span>
                                     </td>
-                                    <td className="px-6 py-4">
-                                        <span className="bg-violet-500/10 text-violet-300 px-3 py-1.5 rounded-lg border border-violet-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(139,92,246,0.1)]">
-                                            {Number(row.vacationDays || 0)}
-                                        </span>
-                                    </td>
+                                    {reportBasis === 'project' ? (
+                                        <>
+                                            <td className="px-6 py-4">
+                                                <span className="bg-sky-500/10 text-sky-300 px-3 py-1.5 rounded-lg border border-sky-500/20 text-xs font-bold font-mono">
+                                                    {Number(row.approved || 0)}
+                                                </span>
+                                            </td>
+                                            <td className="px-6 py-4">
+                                                <span className="bg-rose-500/10 text-rose-300 px-3 py-1.5 rounded-lg border border-rose-500/20 text-xs font-bold font-mono">
+                                                    {Number(row.rejected || 0)}
+                                                </span>
+                                            </td>
+                                        </>
+                                    ) : (
+                                        <td className="px-6 py-4">
+                                            <span className="bg-violet-500/10 text-violet-300 px-3 py-1.5 rounded-lg border border-violet-500/20 text-xs font-bold font-mono shadow-[0_0_10px_rgba(139,92,246,0.1)]">
+                                                {Number(row.vacationDays || 0)}
+                                            </span>
+                                        </td>
+                                    )}
                                     <td className="px-6 py-4">
                                         <span className="text-slate-400 font-mono text-sm tracking-tight">{Number(row.workingDays || 0)}</span>
                                     </td>
@@ -911,26 +1309,59 @@ const UnifiedReportPanel: React.FC<{ mode: ReportMode; tasks: Task[]; validWorke
                                             {Number(row.totalManualBoxes || 0).toLocaleString()}
                                         </span>
                                     </td>
-                                    <td className="px-6 py-4">
-                                        <div className="flex flex-wrap gap-1.5 max-w-[300px]">
-                                            {Array.from((row.assignedFolders ?? new Set<string>()) as Set<string>).slice(0, 3).map((folderName: string) => (
-                                                <span key={folderName} className="text-[10px] bg-slate-800/80 text-slate-300 px-2 py-0.5 rounded-md border border-slate-700/50">
-                                                    {folderName}
-                                                </span>
-                                            ))}
-                                            {((row.assignedFolders ?? new Set<string>()) as Set<string>).size > 3 && (
-                                                <span className="text-[10px] text-slate-500 px-1 font-medium">+ {((row.assignedFolders ?? new Set<string>()) as Set<string>).size - 3} more</span>
-                                            )}
-                                            {((row.assignedFolders ?? new Set<string>()) as Set<string>).size === 0 && (
-                                                <span className="text-[10px] text-slate-600 italic">No folders logged</span>
-                                            )}
-                                        </div>
+                                    <td className="px-6 py-4 align-top">
+                                        {(() => {
+                                            const folderList = Array.from(
+                                                (row.assignedFolders ?? new Set<string>()) as Set<string>
+                                            ).sort((a, b) =>
+                                                a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' })
+                                            );
+                                            const n = folderList.length;
+                                            if (n === 0) {
+                                                return (
+                                                    <span className="text-[10px] text-slate-600 italic">No folders logged</span>
+                                                );
+                                            }
+                                            return (
+                                                <details className="group/fw max-w-[min(100%,320px)]">
+                                                    <summary className="flex cursor-pointer list-none items-center gap-2 text-xs font-medium text-slate-400 hover:text-slate-200 select-none [&::-webkit-details-marker]:hidden">
+                                                        <svg
+                                                            className="h-3.5 w-3.5 shrink-0 text-slate-500 transition-transform group-open/fw:rotate-90"
+                                                            fill="none"
+                                                            stroke="currentColor"
+                                                            viewBox="0 0 24 24"
+                                                        >
+                                                            <path
+                                                                strokeLinecap="round"
+                                                                strokeLinejoin="round"
+                                                                strokeWidth={2}
+                                                                d="M9 5l7 7-7 7"
+                                                            />
+                                                        </svg>
+                                                        <span>폴더 {n}개</span>
+                                                    </summary>
+                                                    <div className="mt-2 flex flex-wrap gap-1.5 border-t border-white/5 pt-2">
+                                                        {folderList.map((folderName: string) => (
+                                                            <span
+                                                                key={folderName}
+                                                                className="text-[10px] bg-slate-800/80 text-slate-300 px-2 py-0.5 rounded-md border border-slate-700/50"
+                                                            >
+                                                                {folderName}
+                                                            </span>
+                                                        ))}
+                                                    </div>
+                                                </details>
+                                            );
+                                        })()}
                                     </td>
                                 </tr>
                             ))}
                             {!isLoading && processedData.length === 0 && (
                                 <tr>
-                                    <td colSpan={9} className="px-6 py-16 text-center text-slate-500 italic font-medium">
+                                    <td
+                                        colSpan={reportBasis === 'project' ? 10 : 9}
+                                        className="px-6 py-16 text-center text-slate-500 italic font-medium"
+                                    >
                                         해당 기간의 작업 기록이 없습니다.
                                     </td>
                                 </tr>
@@ -954,7 +1385,7 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
 
     const fetchUsers = async () => {
         try {
-            const res = await fetch('/api/users', {
+            const res = await fetch(apiUrl('/api/users'), {
                 headers: token ? { 'Authorization': `Bearer ${token}` } : {}
             });
             if (res.ok) {
@@ -978,7 +1409,7 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
             return;
         }
         try {
-            const res = await fetch('/api/users', {
+            const res = await fetch(apiUrl('/api/users'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -1003,7 +1434,7 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
     const handleUpdatePassword = async (username: string) => {
         if (!editPassword) return;
         try {
-            const res = await fetch('/api/users', {
+            const res = await fetch(apiUrl('/api/users'), {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
@@ -1183,16 +1614,25 @@ const UserManagementView: React.FC<{ token?: string }> = ({ token }) => {
     );
 };
 
-const WeeklyReportView: React.FC<{ tasks: Task[], validWorkers: string[] }> = ({ tasks, validWorkers }) => {
-    return <UnifiedReportPanel mode="WEEKLY" tasks={tasks} validWorkers={validWorkers} />;
+const WeeklyReportView: React.FC<{ validWorkers: string[]; reportBasis: ReportBasis }> = ({
+    validWorkers,
+    reportBasis
+}) => {
+    return <UnifiedReportPanel mode="WEEKLY" validWorkers={validWorkers} reportBasis={reportBasis} />;
 };
 
-const WorkerReportView: React.FC<{ tasks: Task[], validWorkers: string[] }> = ({ tasks, validWorkers }) => {
-    return <UnifiedReportPanel mode="MONTHLY" tasks={tasks} validWorkers={validWorkers} />;
+const WorkerReportView: React.FC<{ validWorkers: string[]; reportBasis: ReportBasis }> = ({
+    validWorkers,
+    reportBasis
+}) => {
+    return <UnifiedReportPanel mode="MONTHLY" validWorkers={validWorkers} reportBasis={reportBasis} />;
 };
 
-const DailyReportView: React.FC<{ tasks: Task[], validWorkers: string[] }> = ({ tasks, validWorkers }) => {
-    return <UnifiedReportPanel mode="DAILY" tasks={tasks} validWorkers={validWorkers} />;
+const DailyReportView: React.FC<{ validWorkers: string[]; reportBasis: ReportBasis }> = ({
+    validWorkers,
+    reportBasis
+}) => {
+    return <UnifiedReportPanel mode="DAILY" validWorkers={validWorkers} reportBasis={reportBasis} />;
 };
 
 const ISSUE_REASON_LABELS: Record<string, string> = {
@@ -1213,8 +1653,9 @@ const ISSUE_STATUS_LABELS: Record<string, string> = {
 
 type ReportTab = 'DAILY' | 'WEEKLY' | 'MONTHLY';
 
-const UnifiedReportsView: React.FC<{ tasks: Task[], validWorkers: string[], onOpenSchedule?: () => void }> = ({ tasks, validWorkers, onOpenSchedule }) => {
+const UnifiedReportsView: React.FC<{ validWorkers: string[], onOpenSchedule?: () => void }> = ({ validWorkers, onOpenSchedule }) => {
     const [tab, setTab] = useState<ReportTab>('DAILY');
+    const [reportBasis, setReportBasis] = useState<ReportBasis>('worker');
 
     return (
         <div className="flex flex-col h-full bg-transparent">
@@ -1223,7 +1664,23 @@ const UnifiedReportsView: React.FC<{ tasks: Task[], validWorkers: string[], onOp
                     <h2 className="text-xl font-heading font-bold text-white tracking-tight">리포트 조회 <span className="text-slate-500 font-medium text-sm ml-1">(Reports)</span></h2>
                     <span className="text-[10px] bg-sky-500/10 text-sky-400 px-2 py-1 rounded-md border border-sky-500/20 shadow-inner font-bold tracking-wider">통합 뷰</span>
                 </div>
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-4 flex-wrap justify-end">
+                    <div className="flex bg-slate-950/50 backdrop-blur-md border border-white/10 rounded-xl p-1 shadow-inner">
+                        <button
+                            type="button"
+                            onClick={() => setReportBasis('worker')}
+                            className={`px-3 py-2 rounded-lg text-xs font-bold transition-all ${reportBasis === 'worker' ? 'bg-amber-500/20 text-amber-300 shadow-[0_0_10px_rgba(245,158,11,0.25)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+                        >
+                            작업자
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => setReportBasis('project')}
+                            className={`px-3 py-2 rounded-lg text-xs font-bold transition-all ${reportBasis === 'project' ? 'bg-teal-500/20 text-teal-300 shadow-[0_0_10px_rgba(20,184,166,0.25)]' : 'text-slate-400 hover:text-white hover:bg-white/5'}`}
+                        >
+                            프로젝트
+                        </button>
+                    </div>
                     <div className="flex bg-slate-950/50 backdrop-blur-md border border-white/10 rounded-xl p-1 shadow-inner">
                         <button
                             onClick={() => setTab('DAILY')}
@@ -1257,11 +1714,11 @@ const UnifiedReportsView: React.FC<{ tasks: Task[], validWorkers: string[], onOp
             </div>
             <div className="flex-1 min-h-0">
                 {tab === 'DAILY' ? (
-                    <DailyReportView tasks={tasks} validWorkers={validWorkers} />
+                    <DailyReportView validWorkers={validWorkers} reportBasis={reportBasis} />
                 ) : tab === 'WEEKLY' ? (
-                    <WeeklyReportView tasks={tasks} validWorkers={validWorkers} />
+                    <WeeklyReportView validWorkers={validWorkers} reportBasis={reportBasis} />
                 ) : (
-                    <WorkerReportView tasks={tasks} validWorkers={validWorkers} />
+                    <WorkerReportView validWorkers={validWorkers} reportBasis={reportBasis} />
                 )}
             </div>
         </div>
@@ -1638,7 +2095,7 @@ const ScheduleManagementView: React.FC<{ validWorkers: string[] }> = ({ validWor
     );
 };
 
-const IssueRequestView: React.FC<{ currentAdmin: string; onSelectTask: (taskId: string) => void }> = ({ currentAdmin, onSelectTask }) => {
+const IssueRequestView: React.FC<{ currentAdmin: string; onSelectTask: (taskId: string, options?: SelectTaskOptions) => void }> = ({ currentAdmin, onSelectTask }) => {
     const [issues, setIssues] = useState<TaskIssue[]>([]);
     const [previewImage, setPreviewImage] = useState<string | null>(null);
     const [selectedStatus, setSelectedStatus] = useState<TaskIssueStatus | 'ALL'>('OPEN');
@@ -1725,9 +2182,9 @@ const IssueRequestView: React.FC<{ currentAdmin: string; onSelectTask: (taskId: 
                                     <td className="px-4 py-3">
                                         <div
                                             className="w-12 h-12 rounded bg-black border border-slate-700 overflow-hidden cursor-zoom-in hover:border-sky-500 transition-colors"
-                                            onClick={() => setPreviewImage(issue.imageUrl)}
+                                            onClick={() => setPreviewImage(resolveDatasetPublicUrl(issue.imageUrl))}
                                         >
-                                            <img src={issue.imageUrl} className="w-full h-full object-cover" alt="preview" />
+                                            <img src={resolveDatasetPublicUrl(issue.imageUrl)} className="w-full h-full object-cover" alt="preview" />
                                         </div>
                                     </td>
                                     <td className="px-4 py-3 text-slate-300">{ISSUE_REASON_LABELS[issue.reasonCode] || issue.reasonCode}</td>
@@ -1798,7 +2255,29 @@ const IssueRequestView: React.FC<{ currentAdmin: string; onSelectTask: (taskId: 
     );
 };
 
-const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: boolean; onOpenProject: (projectId: string) => void; overviewRefreshKey?: number }> = ({ onSync, isSyncing, onOpenProject, overviewRefreshKey = 0 }) => {
+const ProjectOverviewView: React.FC<{
+    onSync: () => Promise<void>;
+    onFullDiskSync?: () => Promise<void>;
+    onSyncFolders?: (folders: string[]) => Promise<void>;
+    onAdoptFolders?: (
+        paths: string[],
+        projectId: string,
+        assignedWorker?: string | null
+    ) => Promise<void>;
+    isSyncing: boolean;
+    onOpenProject: (projectId: string) => void;
+    overviewRefreshKey?: number;
+    workerNames?: string[];
+}> = ({
+    onSync,
+    onFullDiskSync,
+    onSyncFolders,
+    onAdoptFolders,
+    isSyncing,
+    onOpenProject,
+    overviewRefreshKey = 0,
+    workerNames = []
+}) => {
     const [loading, setLoading] = useState<boolean>(true);
     const [savingProject, setSavingProject] = useState<boolean>(false);
     const [mappingFolder, setMappingFolder] = useState<string>('');
@@ -1807,11 +2286,19 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
     const [projectWorkflowSourceType, setProjectWorkflowSourceType] = useState<'native-yolo' | 'vlm-review' | 'image-classification'>('native-yolo');
     const [projectClassificationClasses, setProjectClassificationClasses] = useState<Array<{ id: number; name: string }>>([]);
     const [vlmSourceFileOptions, setVlmSourceFileOptions] = useState<Storage.VlmAssignSourceFileInfo[]>([]);
-    const [selectedVlmSourceFile, setSelectedVlmSourceFile] = useState<string>('');
+    const [selectedVlmSourceFiles, setSelectedVlmSourceFiles] = useState<string[]>([]);
     const [projectVisibleToWorkers, setProjectVisibleToWorkers] = useState<boolean>(true);
-    const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'MAPPING' | 'ARCHIVE'>('OVERVIEW');
+    const [activeTab, setActiveTab] = useState<'OVERVIEW' | 'DISK_TREE' | 'MAPPING' | 'WORKER_MAPPING' | 'ARCHIVE'>('OVERVIEW');
+    const [savingWorkerFolder, setSavingWorkerFolder] = useState<string>('');
+    const [workerMapProgressText, setWorkerMapProgressText] = useState<string>('');
+    const [workerMapSelected, setWorkerMapSelected] = useState<Set<string>>(new Set());
+    const [workerMapExpanded, setWorkerMapExpanded] = useState<Set<string>>(new Set());
+    const [bulkWorkerMapValue, setBulkWorkerMapValue] = useState<string>('__NONE__');
     const [searchKeyword, setSearchKeyword] = useState<string>('');
-    const [unassignedOnly, setUnassignedOnly] = useState<boolean>(true);
+    /** 프로젝트 매핑 탭: 프로젝트 미지정(미분류) 폴더만 */
+    const [mappingUnmappedOnly, setMappingUnmappedOnly] = useState<boolean>(true);
+    /** 작업자 매핑 탭: DB+맵 기준 미배정만 */
+    const [workerMapUnassignedOnly, setWorkerMapUnassignedOnly] = useState<boolean>(false);
     const [selectedForBulk, setSelectedForBulk] = useState<Set<string>>(new Set());
     const [bulkTargetProject, setBulkTargetProject] = useState<string>('');
     const [editingProjectId, setEditingProjectId] = useState<string>('');
@@ -1819,38 +2306,43 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
     const [editingTargetTotal, setEditingTargetTotal] = useState<string>('');
     const [editingWorkflowSourceType, setEditingWorkflowSourceType] = useState<'native-yolo' | 'vlm-review' | 'image-classification'>('native-yolo');
     const [editingClassificationClasses, setEditingClassificationClasses] = useState<Array<{ id: number; name: string }>>([]);
+    const [editingVlmSourceFiles, setEditingVlmSourceFiles] = useState<string[]>([]);
     const [editingVisibleToWorkers, setEditingVisibleToWorkers] = useState<boolean>(true);
     const [restoringProjectId, setRestoringProjectId] = useState<string>('');
     const [overview, setOverview] = useState<Storage.ProjectOverviewPayload>({
         projects: [],
         projectMap: {},
+        workerFolderMap: {},
         unassigned: { folderCount: 0, allocated: 0, completed: 0 },
         folders: []
     });
 
-    const refreshOverview = async () => {
+    const refreshOverview = useCallback(async (force: boolean = false) => {
         setLoading(true);
         try {
-            const data = await Storage.getProjectOverview();
+            if (force) Storage.invalidateProjectOverviewCache();
+            const data = await Storage.getProjectOverview(force);
             setOverview(data);
             setSelectedForBulk(new Set());
         } finally {
             setLoading(false);
         }
-    };
-
-    useEffect(() => {
-        refreshOverview();
     }, []);
 
     useEffect(() => {
-        if (overviewRefreshKey > 0) refreshOverview();
-    }, [overviewRefreshKey]);
+        void refreshOverview(false);
+    }, [refreshOverview]);
 
     useEffect(() => {
-        if (projectWorkflowSourceType !== 'vlm-review') {
+        if (overviewRefreshKey > 0) void refreshOverview(true);
+    }, [overviewRefreshKey, refreshOverview]);
+
+    useEffect(() => {
+        const needVlmList =
+            projectWorkflowSourceType === 'vlm-review' || editingWorkflowSourceType === 'vlm-review';
+        if (!needVlmList) {
             setVlmSourceFileOptions([]);
-            setSelectedVlmSourceFile('');
+            setSelectedVlmSourceFiles([]);
             if (projectWorkflowSourceType !== 'image-classification') setProjectClassificationClasses([]);
             return;
         }
@@ -1864,7 +2356,17 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
             }
         })();
         return () => { cancelled = true; };
-    }, [projectWorkflowSourceType]);
+    }, [projectWorkflowSourceType, editingWorkflowSourceType]);
+
+    useEffect(() => {
+        if (projectWorkflowSourceType !== 'vlm-review') return;
+        let sum = 0;
+        for (const sf of selectedVlmSourceFiles) {
+            const row = vlmSourceFileOptions.find((r) => r.sourceFile === sf);
+            if (row) sum += Number(row.total || 0);
+        }
+        setProjectTarget(String(sum));
+    }, [projectWorkflowSourceType, selectedVlmSourceFiles, vlmSourceFileOptions]);
 
     const activeProjects = useMemo(
         () => overview.projects.filter((p) => p.status !== 'ARCHIVED'),
@@ -1881,6 +2383,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
             setEditingName('');
             setEditingTargetTotal('');
             setEditingWorkflowSourceType('native-yolo');
+            setEditingVlmSourceFiles([]);
             return;
         }
         const selected = activeProjects.find((p) => p.id === editingProjectId) || activeProjects[0];
@@ -1889,6 +2392,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         setEditingTargetTotal(String(selected.targetTotal ?? ''));
         setEditingWorkflowSourceType(selected.workflowSourceType === 'vlm-review' ? 'vlm-review' : selected.workflowSourceType === 'image-classification' ? 'image-classification' : 'native-yolo');
         setEditingClassificationClasses(Array.isArray((selected as any).classificationClasses) ? (selected as any).classificationClasses : []);
+        setEditingVlmSourceFiles(projectVlmSourceFileNames(selected));
         setEditingVisibleToWorkers(selected.visibleToWorkers !== false);
     }, [activeProjects, editingProjectId]);
 
@@ -1907,13 +2411,62 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
     }, [activeProjects]);
 
     const keyword = searchKeyword.trim().toLowerCase();
-    const filteredFolders = useMemo(() => {
+    const effectiveWorkerForOverviewRow = (
+        folder: string,
+        rowAssigned: string | null | undefined
+    ): string => {
+        const wm = overview.workerFolderMap || {};
+        const resolved = resolveWorkerFolderMapEntryForFolder(folder, wm);
+        if (resolved?.workerName) {
+            const w = String(resolved.workerName).trim();
+            if (w && w.toLowerCase() !== 'unassigned') return w;
+        }
+        const r = rowAssigned != null ? String(rowAssigned).trim() : '';
+        if (!r || r.toLowerCase() === 'unassigned') return '';
+        return r;
+    };
+
+    const mappingFilteredFolders = useMemo(() => {
         return overview.folders.filter((row) => {
-            if (unassignedOnly && row.projectId) return false;
+            if (mappingUnmappedOnly && row.projectId) return false;
             if (!keyword) return true;
-            return row.folder.toLowerCase().includes(keyword) || String(row.assignedWorker || '').toLowerCase().includes(keyword);
+            return (
+                row.folder.toLowerCase().includes(keyword) ||
+                String(row.assignedWorker || '').toLowerCase().includes(keyword) ||
+                effectiveWorkerForOverviewRow(row.folder, row.assignedWorker).toLowerCase().includes(keyword)
+            );
         });
-    }, [keyword, overview.folders, unassignedOnly]);
+    }, [keyword, overview.folders, overview.workerFolderMap, mappingUnmappedOnly]);
+
+    const workerMapFilteredFolders = useMemo(() => {
+        return overview.folders.filter((row) => {
+            if (workerMapUnassignedOnly) {
+                const eff = effectiveWorkerForOverviewRow(row.folder, row.assignedWorker);
+                if (eff) return false;
+            }
+            if (!keyword) return true;
+            const eff = effectiveWorkerForOverviewRow(row.folder, row.assignedWorker);
+            return (
+                row.folder.toLowerCase().includes(keyword) ||
+                String(row.assignedWorker || '').toLowerCase().includes(keyword) ||
+                eff.toLowerCase().includes(keyword)
+            );
+        });
+    }, [keyword, overview.folders, overview.workerFolderMap, workerMapUnassignedOnly]);
+
+    const workerFolderTree = useMemo(() => buildWorkerFolderTree(workerMapFilteredFolders), [workerMapFilteredFolders]);
+
+    useEffect(() => {
+        if (activeTab !== 'WORKER_MAPPING') return;
+        setWorkerMapExpanded((prev) => {
+            if (prev.size > 0) return prev;
+            return new Set(workerFolderTree.map((n) => n.fullPath));
+        });
+    }, [activeTab, workerFolderTree]);
+
+    useEffect(() => {
+        if (activeTab !== 'WORKER_MAPPING') setWorkerMapSelected(new Set());
+    }, [activeTab]);
 
     const foldersByProject = useMemo(() => {
         const map: Record<string, typeof overview.folders> = {};
@@ -1921,13 +2474,13 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         overview.projects.forEach((project) => {
             map[project.id] = [];
         });
-        filteredFolders.forEach((folderRow) => {
+        mappingFilteredFolders.forEach((folderRow) => {
             const key = folderRow.projectId || '__UNASSIGNED__';
             if (!map[key]) map[key] = [];
             map[key].push(folderRow);
         });
         return map;
-    }, [filteredFolders, overview.projects]);
+    }, [mappingFilteredFolders, overview.projects]);
 
     const getWorkflowMismatchMessage = (row: Storage.ProjectOverviewPayload['folders'][number], projectId: string): string => {
         if (!projectId) return '';
@@ -1942,8 +2495,9 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         if (project.workflowSourceType === 'vlm-review' && (nativeCount > 0 || classificationCount > 0)) {
             return `VLM 프로젝트인데 다른 타입 작업이 포함되어 있습니다.`;
         }
-        if (project.workflowSourceType === 'image-classification' && (nativeCount > 0 || vlmCount > 0)) {
-            return `이미지 분류 프로젝트인데 다른 타입 작업이 포함되어 있습니다.`;
+        // 이미지 분류는 DB에 native-yolo로 쌓이는 경우가 많아, VLM 혼입만 경고
+        if (project.workflowSourceType === 'image-classification' && vlmCount > 0) {
+            return `이미지 분류 프로젝트인데 VLM 작업이 포함되어 있습니다.`;
         }
         return '';
     };
@@ -1958,8 +2512,8 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
             alert('프로젝트명을 입력해주세요.');
             return;
         }
-        if (projectWorkflowSourceType === 'vlm-review' && !selectedVlmSourceFile.trim()) {
-            alert('VLM 프로젝트는 원본 JSON 파일을 선택해주세요.');
+        if (projectWorkflowSourceType === 'vlm-review' && selectedVlmSourceFiles.length === 0) {
+            alert('VLM 프로젝트는 원본 JSON 파일을 하나 이상 선택해주세요.');
             return;
         }
         if (projectWorkflowSourceType === 'image-classification' && projectClassificationClasses.length === 0) {
@@ -1973,7 +2527,8 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                 name,
                 targetTotal,
                 workflowSourceType: projectWorkflowSourceType,
-                vlmSourceFile: projectWorkflowSourceType === 'vlm-review' ? selectedVlmSourceFile.trim() || undefined : undefined,
+                vlmSourceFiles:
+                    projectWorkflowSourceType === 'vlm-review' ? [...selectedVlmSourceFiles] : undefined,
                 classificationClasses: projectWorkflowSourceType === 'image-classification' ? projectClassificationClasses : undefined,
                 visibleToWorkers: projectVisibleToWorkers
             });
@@ -1981,10 +2536,10 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
             setProjectTarget('');
             setProjectWorkflowSourceType('native-yolo');
             setProjectClassificationClasses([]);
-            setSelectedVlmSourceFile('');
+            setSelectedVlmSourceFiles([]);
             setVlmSourceFileOptions([]);
             setProjectVisibleToWorkers(true);
-            await refreshOverview();
+            await refreshOverview(true);
         } catch (e) {
             alert('프로젝트 저장에 실패했습니다.');
         } finally {
@@ -1998,6 +2553,10 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         if (!target) return;
         if (editingWorkflowSourceType === 'image-classification' && editingClassificationClasses.length === 0) {
             alert('이미지 분류 프로젝트는 최소 1개 이상의 클래스를 추가해주세요.');
+            return;
+        }
+        if (editingWorkflowSourceType === 'vlm-review' && editingVlmSourceFiles.length === 0) {
+            alert('VLM 프로젝트는 원본 JSON 파일을 하나 이상 선택해주세요.');
             return;
         }
         const hasMixedFolder = overview.folders.some((row) => {
@@ -2016,10 +2575,12 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                 name: editingName.trim() || target.name,
                 targetTotal: Math.max(0, Number(editingTargetTotal || 0)),
                 workflowSourceType: editingWorkflowSourceType,
+                vlmSourceFiles:
+                    editingWorkflowSourceType === 'vlm-review' ? [...editingVlmSourceFiles] : undefined,
                 classificationClasses: editingWorkflowSourceType === 'image-classification' ? editingClassificationClasses : undefined,
                 visibleToWorkers: editingVisibleToWorkers
             });
-            await refreshOverview();
+            await refreshOverview(true);
         } catch (_e) {
             alert('프로젝트 설정 변경에 실패했습니다.');
         } finally {
@@ -2034,13 +2595,200 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         setRestoringProjectId(projectId);
         try {
             await Storage.restoreProject({ projectId });
-            await refreshOverview();
+            await refreshOverview(true);
             alert('프로젝트가 복원되었습니다.');
         } catch (_e) {
             alert('프로젝트 복원에 실패했습니다.');
         } finally {
             setRestoringProjectId('');
         }
+    };
+
+    const handleWorkerFolderMapSelect = async (folder: string, workerValue: string) => {
+        setSavingWorkerFolder(folder);
+        setWorkerMapProgressText('매핑 저장 중…');
+        try {
+            const result =
+                workerValue === '__NONE__'
+                    ? await Storage.mapFolderToWorker(folder, null)
+                    : await Storage.mapFolderToWorker(folder, workerValue);
+            await refreshOverview(true);
+            const t = Number(result?.tasksUpdated ?? 0);
+            const v = Number(result?.vlmUpdated ?? 0);
+            setWorkerMapProgressText(`반영 완료 · YOLO ${t}건, VLM ${v}건`);
+            window.setTimeout(() => setWorkerMapProgressText(''), 4000);
+        } catch (e) {
+            setWorkerMapProgressText('');
+            const detail = e instanceof Error ? e.message : String(e);
+            alert(`작업자 매핑 저장에 실패했습니다.\n${detail}`);
+        } finally {
+            setSavingWorkerFolder('');
+        }
+    };
+
+    const toggleWorkerMapPrefixSelection = (prefix: string) => {
+        const paths = collectFolderPathsUnderPrefix(prefix, workerMapFilteredFolders);
+        if (paths.length === 0) return;
+        setWorkerMapSelected((prev) => {
+            const next = new Set(prev);
+            const allOn = paths.every((p) => next.has(p));
+            if (allOn) paths.forEach((p) => next.delete(p));
+            else paths.forEach((p) => next.add(p));
+            return next;
+        });
+    };
+
+    const toggleWorkerMapSingleFolder = (folder: string) => {
+        setWorkerMapSelected((prev) => {
+            const next = new Set(prev);
+            if (next.has(folder)) next.delete(folder);
+            else next.add(folder);
+            return next;
+        });
+    };
+
+    const handleBulkWorkerMapApply = async () => {
+        if (workerMapSelected.size === 0) return;
+        const worker = bulkWorkerMapValue === '__NONE__' ? null : bulkWorkerMapValue;
+        const folders = Array.from(workerMapSelected);
+        setSavingWorkerFolder('__BULK__');
+        try {
+            for (let i = 0; i < folders.length; i++) {
+                const folder = folders[i]!;
+                const short = folder.length > 48 ? `${folder.slice(0, 45)}…` : folder;
+                setWorkerMapProgressText(`일괄 매핑: ${i + 1} / ${folders.length} — ${short}`);
+                await Storage.mapFolderToWorker(folder, worker);
+            }
+            await refreshOverview(true);
+            setWorkerMapSelected(new Set());
+            setWorkerMapProgressText(`일괄 완료: ${folders.length}개 폴더`);
+            window.setTimeout(() => setWorkerMapProgressText(''), 5000);
+        } catch (e) {
+            setWorkerMapProgressText('');
+            const detail = e instanceof Error ? e.message : String(e);
+            alert(`일괄 작업자 매핑에 실패했습니다.\n${detail}`);
+        } finally {
+            setSavingWorkerFolder('');
+        }
+    };
+
+    const renderWorkerMapTreeNodes = (nodes: WorkerMapTreeNode[], depth: number): React.ReactNode => {
+        const wm = overview.workerFolderMap || {};
+        return nodes.map((node) => {
+            const hasKids = node.children.length > 0;
+            const expanded = workerMapExpanded.has(node.fullPath);
+            const pathsUnder = collectFolderPathsUnderPrefix(node.fullPath, workerMapFilteredFolders);
+            const selectedCount = pathsUnder.filter((p) => workerMapSelected.has(p)).length;
+            const allSelected = pathsUnder.length > 0 && selectedCount === pathsUnder.length;
+            const someSelected = selectedCount > 0 && !allSelected;
+
+            const row = node.row;
+            const explicit = row ? wm[row.folder]?.workerName : undefined;
+            const resolved = row ? resolveWorkerFolderMapEntryForFolder(row.folder, wm) : null;
+            const selectValue = explicit ? explicit : '__NONE__';
+
+            return (
+                <div key={node.fullPath} className="border-b border-slate-800/80 last:border-b-0">
+                    <div
+                        className="flex flex-wrap items-start gap-2 py-2 pr-2"
+                        style={{ paddingLeft: Math.min(48, 8 + depth * 14) }}
+                    >
+                        <div className="flex items-center gap-1 shrink-0 pt-0.5">
+                            {hasKids ? (
+                                <button
+                                    type="button"
+                                    aria-label={expanded ? '접기' : '펼치기'}
+                                    onClick={() =>
+                                        setWorkerMapExpanded((prev) => {
+                                            const n = new Set(prev);
+                                            if (n.has(node.fullPath)) n.delete(node.fullPath);
+                                            else n.add(node.fullPath);
+                                            return n;
+                                        })
+                                    }
+                                    className="w-7 h-7 flex items-center justify-center rounded border border-slate-600 bg-slate-900 text-slate-300 hover:bg-slate-800 text-[10px]"
+                                >
+                                    {expanded ? '▼' : '▶'}
+                                </button>
+                            ) : (
+                                <span className="w-7 inline-block" />
+                            )}
+                            <input
+                                type="checkbox"
+                                title="이 노드 아래 모든 폴더 경로 선택"
+                                ref={(el) => {
+                                    if (el) el.indeterminate = someSelected;
+                                }}
+                                checked={allSelected}
+                                onChange={() => toggleWorkerMapPrefixSelection(node.fullPath)}
+                                className="mt-0.5 rounded border-slate-600 bg-slate-800 text-emerald-500"
+                            />
+                        </div>
+                        <div className="min-w-0 flex-1">
+                            <div className="text-sm font-bold text-slate-100">
+                                <span className="text-emerald-400/90 font-mono">{node.segment}</span>
+                                {hasKids && (
+                                    <span className="text-[10px] font-normal text-slate-500 ml-2">
+                                        ({pathsUnder.length}폴더)
+                                    </span>
+                                )}
+                            </div>
+                            {row && (
+                                <>
+                                    <div className="text-xs text-slate-400 mt-0.5 break-all font-mono opacity-90">{row.folder}</div>
+                                    <div className="text-xs text-slate-400 mt-1">
+                                        태스크 {row.taskCount} · DB 작업자{' '}
+                                        <span className="text-slate-200">{row.assignedWorker || '—'}</span>
+                                    </div>
+                                    {resolved ? (
+                                        <div className="text-[11px] text-emerald-300 mt-1">
+                                            매핑 적용: <span className="font-semibold">{resolved.workerName}</span>
+                                            {' '}(키: <span className="font-mono opacity-90">{resolved.mappedKey}</span>)
+                                        </div>
+                                    ) : (
+                                        <div className="text-[11px] text-slate-500 mt-1">적용 중인 작업자 매핑 없음</div>
+                                    )}
+                                </>
+                            )}
+                        </div>
+                        {row && (
+                            <div className="shrink-0 flex items-center gap-2 w-full sm:w-auto sm:min-w-[220px]">
+                                <select
+                                    value={selectValue}
+                                    onChange={(e) => void handleWorkerFolderMapSelect(row.folder, e.target.value)}
+                                    disabled={savingWorkerFolder === row.folder || workerNames.length === 0}
+                                    className="w-full bg-slate-900 border border-slate-600 rounded-lg px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-500 disabled:opacity-50"
+                                >
+                                    <option value="__NONE__">이 경로에 전용 키 없음</option>
+                                    {workerNames
+                                        .filter((w) => w && String(w).trim() !== '' && String(w).toLowerCase() !== 'unassigned')
+                                        .map((w) => (
+                                            <option key={w} value={w}>
+                                                {w}
+                                            </option>
+                                        ))}
+                                </select>
+                                <input
+                                    type="checkbox"
+                                    title="이 폴더만 선택"
+                                    checked={workerMapSelected.has(row.folder)}
+                                    onChange={() => toggleWorkerMapSingleFolder(row.folder)}
+                                    className="rounded border-slate-600 bg-slate-800 text-cyan-500 shrink-0"
+                                />
+                                {savingWorkerFolder === row.folder && (
+                                    <span className="text-[11px] text-emerald-400 whitespace-nowrap">저장 중…</span>
+                                )}
+                            </div>
+                        )}
+                    </div>
+                    {hasKids && expanded && (
+                        <div className="border-l border-emerald-900/40 ml-[calc(8px+14px*depth+12px)]">
+                            {renderWorkerMapTreeNodes(node.children, depth + 1)}
+                        </div>
+                    )}
+                </div>
+            );
+        });
     };
 
     const handleMapFolder = async (folder: string, projectId: string) => {
@@ -2055,9 +2803,10 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
         setMappingFolder(folder);
         try {
             await Storage.mapFolderToProject(folder, projectId || null);
-            await refreshOverview();
+            await refreshOverview(true);
         } catch (e) {
-            alert('프로젝트 매핑 저장에 실패했습니다.');
+            const detail = e instanceof Error ? e.message : String(e);
+            alert(`프로젝트 매핑 저장에 실패했습니다.\n${detail}`);
         } finally {
             setMappingFolder('');
         }
@@ -2108,10 +2857,49 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
             for (const folderName of Array.from(selectedForBulk)) {
                 await Storage.mapFolderToProject(folderName, target);
             }
-            await refreshOverview();
+            await refreshOverview(true);
             setSelectedForBulk(new Set());
         } catch (e) {
-            alert('일괄 매핑에 실패했습니다.');
+            const detail = e instanceof Error ? e.message : String(e);
+            alert(`일괄 매핑에 실패했습니다.\n${detail}`);
+        } finally {
+            setMappingFolder('');
+        }
+    };
+
+    const handleBulkDeleteDbTasks = async () => {
+        if (selectedForBulk.size === 0) return;
+        const folders = Array.from(selectedForBulk);
+        setMappingFolder('__BULK_DELETE__');
+        try {
+            const preview = await Storage.pruneDatasetsScope({
+                kind: 'delete_tasks_under_folders',
+                folders,
+                dryRun: true
+            });
+            const errHint =
+                preview.errors && preview.errors.length > 0 ? `\n\n경고: ${preview.errors.slice(0, 5).join('; ')}` : '';
+            const ok = window.confirm(
+                `선택한 ${folders.length}개 폴더 경로(접두)에 해당하는 DB 작업을 삭제합니다.\n\n` +
+                    `대상 건수(시뮬): 네이티브 ${preview.deletedNative}건, VLM ${preview.deletedVlm}건${errHint}\n\n` +
+                    `복구할 수 없습니다. datasets에 같은 이미지가 남아 있으면 이후 「DB 새로고침」·동기화 시 다시 등록될 수 있습니다.\n` +
+                    `프로젝트/작업자 맵은 그대로입니다. 필요하면 별도로 배정 해제하세요.\n\n실제로 삭제할까요?`
+            );
+            if (!ok) return;
+            const done = await Storage.pruneDatasetsScope({
+                kind: 'delete_tasks_under_folders',
+                folders,
+                dryRun: false
+            });
+            alert(
+                `삭제 완료: 네이티브 ${done.deletedNative}건, VLM ${done.deletedVlm}건` +
+                    (done.errors?.length ? `\n참고: ${done.errors.slice(0, 5).join('; ')}` : '')
+            );
+            setSelectedForBulk(new Set());
+            await refreshOverview(true);
+        } catch (e) {
+            const detail = e instanceof Error ? e.message : String(e);
+            alert(`DB 작업 삭제에 실패했습니다.\n${detail}`);
         } finally {
             setMappingFolder('');
         }
@@ -2132,12 +2920,10 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                     />
                     <div className="min-w-0 flex-1">
                         <div className="text-sm font-bold text-slate-100 truncate">{row.folder}</div>
-                        <div className="text-xs text-slate-300 mt-1">작업자: <span className="font-medium text-slate-100">{row.assignedWorker || 'Unassigned'}</span></div>
+                        <div className="text-xs text-slate-300 mt-1">작업자: <span className="font-medium text-slate-100">{effectiveWorkerForOverviewRow(row.folder, row.assignedWorker) || 'Unassigned'}</span></div>
                         <div className="text-[11px] text-slate-400">
-                            YOLO {Number(row.nativeTaskCount || 0)} / VLM {Number(row.vlmTaskCount || 0)}
-                            {Number((row as any).classificationTaskCount || 0) > 0 && (
-                                <> / 분류 {Number((row as any).classificationTaskCount || 0)}</>
-                            )}
+                            YOLO {Number(row.nativeTaskCount || 0)} / VLM {Number(row.vlmTaskCount || 0)} / 분류{' '}
+                            {Number((row as { classificationTaskCount?: number }).classificationTaskCount || 0)}
                         </div>
                         <div className="text-xs text-slate-300">완료 <span className="font-medium text-slate-100">{row.completedCount}</span> / <span className="font-medium text-slate-100">{row.taskCount}</span></div>
                         {workflowWarning && (
@@ -2168,10 +2954,22 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                             개요
                         </button>
                         <button
+                            onClick={() => setActiveTab('DISK_TREE')}
+                            className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'DISK_TREE' ? 'bg-teal-900/40 text-teal-200' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                            디스크 트리
+                        </button>
+                        <button
                             onClick={() => setActiveTab('MAPPING')}
                             className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'MAPPING' ? 'bg-cyan-900/40 text-cyan-200' : 'text-slate-400 hover:text-slate-200'}`}
                         >
-                            매핑
+                            프로젝트 매핑
+                        </button>
+                        <button
+                            onClick={() => setActiveTab('WORKER_MAPPING')}
+                            className={`px-3 py-1.5 text-xs font-bold rounded ${activeTab === 'WORKER_MAPPING' ? 'bg-emerald-900/40 text-emerald-200' : 'text-slate-400 hover:text-slate-200'}`}
+                        >
+                            작업자 매핑
                         </button>
                         <button
                             onClick={() => setActiveTab('ARCHIVE')}
@@ -2181,19 +2979,33 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                         </button>
                     </div>
                     <button
-                        onClick={refreshOverview}
+                        type="button"
+                        onClick={() => void refreshOverview(true)}
                         disabled={loading}
                         className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
                     >
                         새로고침
                     </button>
                     <button
-                        onClick={onSync}
+                        type="button"
+                        onClick={() => void onSync()}
                         disabled={isSyncing}
-                        className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
+                        className="bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-700/50 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
+                        title="디스크 스캔 없이 DB 기준으로 목록·통계만 새로고침"
                     >
-                        {isSyncing ? 'Syncing...' : 'Sync Data'}
+                        {isSyncing ? '새로고침…' : 'DB 새로고침'}
                     </button>
+                    {onFullDiskSync && (
+                        <button
+                            type="button"
+                            onClick={() => void onFullDiskSync()}
+                            disabled={isSyncing}
+                            className="bg-slate-900 hover:bg-slate-800 text-amber-200/90 border border-amber-800/60 px-3 py-2 rounded-lg text-xs font-bold disabled:opacity-50"
+                            title="datasets 전체 디스크 스캔 — 매우 느릴 수 있음"
+                        >
+                            전체 디스크 스캔
+                        </button>
+                    )}
                 </div>
             </div>
 
@@ -2371,7 +3183,10 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                     const v = e.target.value;
                                                     const next = v === 'vlm-review' ? 'vlm-review' : v === 'image-classification' ? 'image-classification' : 'native-yolo';
                                                     setProjectWorkflowSourceType(next);
-                                                    if (next !== 'vlm-review') setProjectTarget('');
+                                                    if (next !== 'vlm-review') {
+                                                        setProjectTarget('');
+                                                        setSelectedVlmSourceFiles([]);
+                                                    }
                                                     if (next !== 'image-classification') setProjectClassificationClasses([]);
                                                 }}
                                                 className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
@@ -2420,25 +3235,44 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                         )}
                                         {projectWorkflowSourceType === 'vlm-review' && (
                                             <div>
-                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">원본 JSON 파일</label>
-                                                <select
-                                                    value={selectedVlmSourceFile}
-                                                    onChange={(e) => {
-                                                        const file = e.target.value;
-                                                        setSelectedVlmSourceFile(file);
-                                                        const row = vlmSourceFileOptions.find((r) => r.sourceFile === file);
-                                                        if (row) setProjectTarget(String(row.total));
-                                                    }}
-                                                    className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
-                                                >
-                                                    <option value="">선택 (필수)</option>
-                                                    {vlmSourceFileOptions.map((row) => (
-                                                        <option key={row.sourceFile} value={row.sourceFile}>
-                                                            {row.sourceFile} (전체 {row.total}건)
-                                                        </option>
-                                                    ))}
-                                                </select>
-                                                <p className="text-[10px] text-slate-500 mt-1">DB에 이미 이관된 JSON 파일 중 하나를 선택하세요. 목표량이 자동으로 채워집니다.</p>
+                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">원본 JSON 파일 (복수 선택)</label>
+                                                <div className="max-h-44 overflow-y-auto rounded-xl border border-white/[0.06] bg-slate-950/50 px-3 py-2 space-y-2">
+                                                    {vlmSourceFileOptions.length === 0 ? (
+                                                        <p className="text-xs text-slate-500 py-2">이관된 JSON 목록을 불러오는 중이거나 항목이 없습니다.</p>
+                                                    ) : (
+                                                        vlmSourceFileOptions.map((row) => (
+                                                            <label
+                                                                key={row.sourceFile}
+                                                                className="flex items-start gap-2.5 text-sm text-slate-200 cursor-pointer hover:bg-slate-900/60 rounded-lg px-1 py-1"
+                                                            >
+                                                                <input
+                                                                    type="checkbox"
+                                                                    className="mt-0.5 h-4 w-4 accent-emerald-400 shrink-0"
+                                                                    checked={selectedVlmSourceFiles.includes(row.sourceFile)}
+                                                                    onChange={(e) => {
+                                                                        setSelectedVlmSourceFiles((prev) => {
+                                                                            if (e.target.checked) {
+                                                                                if (prev.includes(row.sourceFile)) return prev;
+                                                                                return [...prev, row.sourceFile];
+                                                                            }
+                                                                            return prev.filter((f) => f !== row.sourceFile);
+                                                                        });
+                                                                    }}
+                                                                />
+                                                                <span className="leading-snug">
+                                                                    <span className="font-mono text-xs text-slate-300">{row.sourceFile}</span>
+                                                                    <span className="text-slate-500 text-[11px]">
+                                                                        {' '}
+                                                                        · 전체 {row.total}건 · 미배정 {row.unassigned}건
+                                                                    </span>
+                                                                </span>
+                                                            </label>
+                                                        ))
+                                                    )}
+                                                </div>
+                                                <p className="text-[10px] text-slate-500 mt-1">
+                                                    DB에 이관된 JSON을 여러 개 선택할 수 있습니다. 목표량은 선택한 파일의 행 수 합계로 맞춰집니다.
+                                                </p>
                                             </div>
                                         )}
                                         <div>
@@ -2448,7 +3282,7 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                 min={0}
                                                 value={projectTarget}
                                                 onChange={(e) => setProjectTarget(e.target.value)}
-                                                readOnly={projectWorkflowSourceType === 'vlm-review' && !!selectedVlmSourceFile}
+                                                readOnly={projectWorkflowSourceType === 'vlm-review' && selectedVlmSourceFiles.length > 0}
                                                 className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-mono text-slate-200 outline-none focus:border-emerald-500/50 focus:bg-slate-900 shadow-inner transition-colors disabled:opacity-80"
                                                 placeholder="예: 50000"
                                             />
@@ -2491,7 +3325,19 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                     if (target) {
                                                         setEditingName(target.name || '');
                                                         setEditingTargetTotal(String(target.targetTotal ?? ''));
-                                                        setEditingWorkflowSourceType(target.workflowSourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo');
+                                                        setEditingWorkflowSourceType(
+                                                            target.workflowSourceType === 'vlm-review'
+                                                                ? 'vlm-review'
+                                                                : target.workflowSourceType === 'image-classification'
+                                                                  ? 'image-classification'
+                                                                  : 'native-yolo'
+                                                        );
+                                                        setEditingClassificationClasses(
+                                                            Array.isArray((target as any).classificationClasses)
+                                                                ? (target as any).classificationClasses
+                                                                : []
+                                                        );
+                                                        setEditingVlmSourceFiles(projectVlmSourceFileNames(target));
                                                         setEditingVisibleToWorkers(target.visibleToWorkers !== false);
                                                     }
                                                 }}
@@ -2530,8 +3376,15 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                 value={editingWorkflowSourceType}
                                                 onChange={(e) => {
                                                     const v = e.target.value;
-                                                    setEditingWorkflowSourceType(v === 'vlm-review' ? 'vlm-review' : v === 'image-classification' ? 'image-classification' : 'native-yolo');
-                                                    if (v !== 'image-classification') setEditingClassificationClasses([]);
+                                                    const next =
+                                                        v === 'vlm-review'
+                                                            ? 'vlm-review'
+                                                            : v === 'image-classification'
+                                                              ? 'image-classification'
+                                                              : 'native-yolo';
+                                                    setEditingWorkflowSourceType(next);
+                                                    if (next !== 'image-classification') setEditingClassificationClasses([]);
+                                                    if (next !== 'vlm-review') setEditingVlmSourceFiles([]);
                                                 }}
                                                 className="w-full bg-slate-950/50 border border-white/[0.05] rounded-xl px-4 py-2.5 text-sm font-bold text-slate-200 outline-none focus:border-violet-500/50 focus:bg-slate-900 shadow-inner transition-colors appearance-none"
                                             >
@@ -2540,6 +3393,50 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                                 <option value="image-classification">이미지 분류</option>
                                             </select>
                                         </div>
+                                        {editingWorkflowSourceType === 'vlm-review' && (
+                                            <div>
+                                                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">
+                                                    원본 JSON 파일 (복수 선택)
+                                                </label>
+                                                <div className="max-h-44 overflow-y-auto rounded-xl border border-white/[0.06] bg-slate-950/50 px-3 py-2 space-y-2">
+                                                    {vlmSourceFileOptions.length === 0 ? (
+                                                        <p className="text-xs text-slate-500 py-2">이관된 JSON 목록을 불러오는 중이거나 항목이 없습니다.</p>
+                                                    ) : (
+                                                        vlmSourceFileOptions.map((row) => (
+                                                            <label
+                                                                key={row.sourceFile}
+                                                                className="flex items-start gap-2.5 text-sm text-slate-200 cursor-pointer hover:bg-slate-900/60 rounded-lg px-1 py-1"
+                                                            >
+                                                                <input
+                                                                    type="checkbox"
+                                                                    className="mt-0.5 h-4 w-4 accent-violet-400 shrink-0"
+                                                                    checked={editingVlmSourceFiles.includes(row.sourceFile)}
+                                                                    onChange={(e) => {
+                                                                        setEditingVlmSourceFiles((prev) => {
+                                                                            if (e.target.checked) {
+                                                                                if (prev.includes(row.sourceFile)) return prev;
+                                                                                return [...prev, row.sourceFile];
+                                                                            }
+                                                                            return prev.filter((f) => f !== row.sourceFile);
+                                                                        });
+                                                                    }}
+                                                                />
+                                                                <span className="leading-snug">
+                                                                    <span className="font-mono text-xs text-slate-300">{row.sourceFile}</span>
+                                                                    <span className="text-slate-500 text-[11px]">
+                                                                        {' '}
+                                                                        · 전체 {row.total}건 · 미배정 {row.unassigned}건
+                                                                    </span>
+                                                                </span>
+                                                            </label>
+                                                        ))
+                                                    )}
+                                                </div>
+                                                <p className="text-[10px] text-slate-500 mt-1">
+                                                    프로젝트에 포함할 이관 JSON을 고릅니다. 저장 후 개요·배정 범위에 반영됩니다.
+                                                </p>
+                                            </div>
+                                        )}
                                         {editingWorkflowSourceType === 'image-classification' && (
                                             <div>
                                                 <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">분류 클래스 편집</label>
@@ -2597,6 +3494,22 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                             </div>
                         </div>
                     </>
+                ) : activeTab === 'DISK_TREE' ? (
+                    <>
+                        {onSyncFolders ? (
+                            <DatasetsFolderTree
+                                disabled={isSyncing}
+                                onSyncFolders={onSyncFolders}
+                                onAdoptFolders={onAdoptFolders}
+                                workerNames={workerNames}
+                                treeRefreshKey={overviewRefreshKey}
+                            />
+                        ) : (
+                            <div className="text-sm text-slate-400 bg-slate-900/40 border border-slate-700 rounded-xl px-4 py-6 text-center">
+                                폴더 단위 디스크 스캔(onSyncFolders)이 연결되어 있지 않습니다.
+                            </div>
+                        )}
+                    </>
                 ) : activeTab === 'MAPPING' ? (
                     <>
                         <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4">
@@ -2610,11 +3523,11 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                 <label className="inline-flex items-center gap-2 text-xs text-slate-300">
                                     <input
                                         type="checkbox"
-                                        checked={unassignedOnly}
-                                        onChange={(e) => setUnassignedOnly(e.target.checked)}
+                                        checked={mappingUnmappedOnly}
+                                        onChange={(e) => setMappingUnmappedOnly(e.target.checked)}
                                         className="rounded border-slate-600 bg-slate-900 text-sky-500"
                                     />
-                                    미분류 우선 보기
+                                    미분류(프로젝트)만 보기
                                 </label>
                             </div>
                         </div>
@@ -2629,12 +3542,17 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                 <div className="flex items-center justify-between mb-2 gap-2">
                                     <div className="text-xs font-bold text-amber-300">미분류 ({foldersByProject.__UNASSIGNED__?.length || 0})</div>
                                     <button
+                                        type="button"
                                         onClick={() => handleToggleColumnBulk(foldersByProject.__UNASSIGNED__ || [])}
                                         className="text-[10px] px-2 py-1 rounded border border-amber-700/40 text-amber-200 hover:bg-amber-900/20"
+                                        title="이 열 카드의 체크박스만 전부 선택하거나 전부 해제합니다"
                                     >
-                                        {(foldersByProject.__UNASSIGNED__ || []).length > 0 && (foldersByProject.__UNASSIGNED__ || []).every((row) => selectedForBulk.has(row.folder)) ? '해제' : '전체 선택'}
+                                        {(foldersByProject.__UNASSIGNED__ || []).length > 0 && (foldersByProject.__UNASSIGNED__ || []).every((row) => selectedForBulk.has(row.folder)) ? '선택 해제' : '전체 선택'}
                                     </button>
                                 </div>
+                                <p className="text-[10px] text-slate-500 mb-2 leading-relaxed">
+                                    프로젝트에만 안 묶인 상태입니다. DB에 잘못 들어간 작업은 아래 「DB 작업 삭제」로 지울 수 있습니다(맵은 유지).
+                                </p>
                                 <div className="space-y-2 max-h-[60vh] overflow-auto pr-1">
                                     {(foldersByProject.__UNASSIGNED__ || []).map(renderFolderCard)}
                                 </div>
@@ -2645,10 +3563,12 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                     <div className="flex items-center justify-between mb-2 gap-2">
                                         <div className="text-xs font-bold text-cyan-300">{project.name} ({foldersByProject[project.id]?.length || 0})</div>
                                         <button
+                                            type="button"
                                             onClick={() => handleToggleColumnBulk(foldersByProject[project.id] || [])}
                                             className="text-[10px] px-2 py-1 rounded border border-cyan-700/40 text-cyan-200 hover:bg-cyan-900/20"
+                                            title="이 열 카드의 체크박스만 전부 선택하거나 전부 해제합니다"
                                         >
-                                            {(foldersByProject[project.id] || []).length > 0 && (foldersByProject[project.id] || []).every((row) => selectedForBulk.has(row.folder)) ? '해제' : '전체 선택'}
+                                            {(foldersByProject[project.id] || []).length > 0 && (foldersByProject[project.id] || []).every((row) => selectedForBulk.has(row.folder)) ? '선택 해제' : '전체 선택'}
                                         </button>
                                     </div>
                                     <div className="space-y-2 max-h-[60vh] overflow-auto pr-1">
@@ -2675,19 +3595,145 @@ const ProjectOverviewView: React.FC<{ onSync: () => Promise<void>; isSyncing: bo
                                         ))}
                                     </select>
                                     <button
+                                        type="button"
                                         onClick={handleBulkMove}
-                                        disabled={mappingFolder === '__BULK__'}
+                                        disabled={mappingFolder === '__BULK__' || mappingFolder === '__BULK_DELETE__'}
                                         className="px-3 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-xs font-bold disabled:opacity-50"
                                     >
                                         {mappingFolder === '__BULK__' ? '이동 중...' : '선택 항목 이동'}
                                     </button>
                                     <button
+                                        type="button"
+                                        onClick={() => void handleBulkDeleteDbTasks()}
+                                        disabled={mappingFolder === '__BULK__' || mappingFolder === '__BULK_DELETE__'}
+                                        className="px-3 py-2 rounded-lg bg-rose-900/80 hover:bg-rose-800 border border-rose-700/50 text-rose-100 text-xs font-bold disabled:opacity-50"
+                                        title="선택한 폴더 문자열을 접두로 하는 imageUrl 작업을 DB에서 삭제합니다"
+                                    >
+                                        {mappingFolder === '__BULK_DELETE__' ? '삭제 중...' : 'DB 작업 삭제'}
+                                    </button>
+                                    <button
+                                        type="button"
                                         onClick={() => setSelectedForBulk(new Set())}
                                         className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-300 text-xs font-bold"
                                     >
                                         선택 해제
                                     </button>
                                 </div>
+                            </div>
+                        )}
+                    </>
+                ) : activeTab === 'WORKER_MAPPING' ? (
+                    <>
+                        {workerMapProgressText ? (
+                            <div className="text-xs text-cyan-100 bg-cyan-950/50 border border-cyan-800/60 rounded-lg px-3 py-2 font-mono leading-relaxed">
+                                {workerMapProgressText}
+                            </div>
+                        ) : null}
+                        <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4 space-y-2">
+                            <p className="text-sm text-slate-300">
+                                폴더 경로(접두)에 작업자를 지정하면 <span className="text-emerald-300 font-semibold">해당 폴더와 하위 경로의 모든 태스크</span>에 배정됩니다.
+                                디스크의 작업자 상위 폴더보다 <span className="text-emerald-300">우선</span>합니다(동기화 시 신규 파일에도 적용). &quot;이 경로에 전용 키 없음&quot;은 이 폴더 문자열에 대한 매핑만 제거합니다.
+                            </p>
+                            <p className="text-xs text-slate-500">
+                                <span className="text-emerald-400/80">트리</span>: 경로가 슬래시(<span className="font-mono">/</span>) 기준으로 묶입니다.{' '}
+                                <span className="text-cyan-400/80">왼쪽 체크</span>는 그 아래 포함된 모든 폴더를 한 번에 선택하고, 행 오른쪽 체크는 해당 폴더만 선택합니다.
+                            </p>
+                        </div>
+                        <div className="bg-slate-800/30 border border-slate-700 rounded-xl p-4 space-y-3">
+                            <div className="flex flex-wrap items-center gap-3">
+                                <input
+                                    value={searchKeyword}
+                                    onChange={(e) => setSearchKeyword(e.target.value)}
+                                    placeholder="폴더명/작업자 검색"
+                                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 outline-none focus:border-emerald-500 min-w-[260px]"
+                                />
+                                <label className="inline-flex items-center gap-2 text-xs text-slate-300">
+                                    <input
+                                        type="checkbox"
+                                        checked={workerMapUnassignedOnly}
+                                        onChange={(e) => setWorkerMapUnassignedOnly(e.target.checked)}
+                                        className="rounded border-slate-600 bg-slate-900 text-emerald-500"
+                                    />
+                                    미배정(Unassigned)만 보기
+                                </label>
+                            </div>
+                            <div className="flex flex-wrap gap-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setWorkerMapExpanded(new Set(collectAllExpandablePaths(workerFolderTree)))}
+                                    className="text-[11px] px-2 py-1.5 rounded-lg border border-emerald-700/50 text-emerald-200 hover:bg-emerald-900/20"
+                                >
+                                    트리 전체 펼치기
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setWorkerMapExpanded(new Set(workerFolderTree.map((n) => n.fullPath)))}
+                                    className="text-[11px] px-2 py-1.5 rounded-lg border border-slate-600 text-slate-300 hover:bg-slate-800"
+                                >
+                                    1단계만 펼치기
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => setWorkerMapExpanded(new Set())}
+                                    className="text-[11px] px-2 py-1.5 rounded-lg border border-slate-600 text-slate-400 hover:bg-slate-800"
+                                >
+                                    모두 접기
+                                </button>
+                            </div>
+                        </div>
+                        <div className="border border-slate-700 rounded-xl overflow-hidden bg-slate-950/30">
+                            <div className="max-h-[65vh] overflow-auto">
+                                {workerFolderTree.length > 0 ? (
+                                    renderWorkerMapTreeNodes(workerFolderTree, 0)
+                                ) : (
+                                    <div className="px-4 py-12 text-center text-slate-500 text-sm">표시할 폴더가 없습니다.</div>
+                                )}
+                            </div>
+                        </div>
+                        {workerMapSelected.size > 0 && (
+                            <div className="sticky bottom-0 bg-slate-900/95 border border-emerald-800/50 rounded-xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 shadow-lg">
+                                <div className="text-sm text-slate-200">
+                                    선택된 폴더 <span className="font-bold text-emerald-300">{workerMapSelected.size}</span>개
+                                </div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                    <select
+                                        value={bulkWorkerMapValue}
+                                        onChange={(e) => setBulkWorkerMapValue(e.target.value)}
+                                        className="bg-slate-900 border border-slate-600 rounded-lg px-2 py-2 text-xs text-slate-200 outline-none focus:border-emerald-500 min-w-[200px]"
+                                    >
+                                        <option value="__NONE__">일괄: 매핑 제거</option>
+                                        {workerNames
+                                            .filter((w) => w && String(w).trim() !== '' && String(w).toLowerCase() !== 'unassigned')
+                                            .map((w) => (
+                                                <option key={w} value={w}>
+                                                    일괄: {w}
+                                                </option>
+                                            ))}
+                                    </select>
+                                    <button
+                                        type="button"
+                                        onClick={() => void handleBulkWorkerMapApply()}
+                                        disabled={
+                                            savingWorkerFolder === '__BULK__' ||
+                                            (bulkWorkerMapValue !== '__NONE__' && workerNames.length === 0)
+                                        }
+                                        className="px-3 py-2 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold disabled:opacity-50"
+                                    >
+                                        {savingWorkerFolder === '__BULK__' ? '적용 중…' : '선택에 일괄 적용'}
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={() => setWorkerMapSelected(new Set())}
+                                        className="px-3 py-2 rounded-lg bg-slate-800 hover:bg-slate-700 border border-slate-600 text-slate-300 text-xs font-bold"
+                                    >
+                                        선택 해제
+                                    </button>
+                                </div>
+                            </div>
+                        )}
+                        {workerNames.length === 0 && (
+                            <div className="text-xs text-amber-200 bg-amber-900/20 border border-amber-700/40 rounded-lg px-3 py-2">
+                                등록된 작업자(WORKER) 계정이 없습니다. 사용자 관리에서 작업자를 추가한 뒤 다시 시도해주세요.
                             </div>
                         )}
                     </>
@@ -2772,14 +3818,6 @@ const DashboardHomeView: React.FC = () => {
         return overview.projects.filter((project) => project.status !== 'ARCHIVED' && project.visibleToWorkers !== false);
     }, [overview.projects]);
 
-    const totals = useMemo(() => {
-        const totalTarget = workerVisibleProjects.reduce((acc, row) => acc + Number(row.targetTotal || 0), 0);
-        const totalAllocated = workerVisibleProjects.reduce((acc, row) => acc + Number(row.allocated || 0), 0) + Number(overview.unassigned.allocated || 0);
-        const totalCompleted = workerVisibleProjects.reduce((acc, row) => acc + Number(row.completed || 0), 0) + Number(overview.unassigned.completed || 0);
-        const progress = totalTarget > 0 ? Number(((totalCompleted / totalTarget) * 100).toFixed(2)) : 0;
-        return { totalTarget, totalAllocated, totalCompleted, progress };
-    }, [overview.unassigned.allocated, overview.unassigned.completed, workerVisibleProjects]);
-
     return (
         <div className="h-full overflow-auto p-6 space-y-6">
             {loading && (
@@ -2787,37 +3825,6 @@ const DashboardHomeView: React.FC = () => {
                     프로젝트 대시보드 로딩 중...
                 </div>
             )}
-
-            <div className="grid grid-cols-1 md:grid-cols-4 gap-5 mb-8">
-                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-cyan-500/30 transition-colors">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-cyan-500/10 rounded-full blur-2xl group-hover:bg-cyan-500/20 transition-colors" />
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-cyan-400 shadow-[0_0_8px_rgba(34,211,238,0.8)]"></div> 총 목표량
-                    </div>
-                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-cyan-300 to-sky-500 relative z-10 tracking-tight">{Number(totals.totalTarget || 0).toLocaleString()}</div>
-                </div>
-                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-sky-500/30 transition-colors">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-sky-500/10 rounded-full blur-2xl group-hover:bg-sky-500/20 transition-colors" />
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.8)]"></div> 총 배분량
-                    </div>
-                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-sky-300 to-blue-500 relative z-10 tracking-tight">{Number(totals.totalAllocated || 0).toLocaleString()}</div>
-                </div>
-                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-lime-500/30 transition-colors">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-lime-500/10 rounded-full blur-2xl group-hover:bg-lime-500/20 transition-colors" />
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-lime-400 shadow-[0_0_8px_rgba(163,230,53,0.8)]"></div> 총 완료량
-                    </div>
-                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-lime-300 to-green-500 relative z-10 tracking-tight">{Number(totals.totalCompleted || 0).toLocaleString()}</div>
-                </div>
-                <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-5 shadow-[0_8px_30px_rgb(0,0,0,0.4)] relative flex flex-col justify-center overflow-hidden group hover:border-violet-500/30 transition-colors">
-                    <div className="absolute -right-4 -top-4 w-24 h-24 bg-violet-500/10 rounded-full blur-2xl group-hover:bg-violet-500/20 transition-colors" />
-                    <div className="text-[10px] text-slate-400 font-bold uppercase tracking-widest mb-2 relative z-10 flex items-center gap-2">
-                        <div className="w-1.5 h-1.5 rounded-full bg-violet-400 shadow-[0_0_8px_rgba(167,139,250,0.8)]"></div> 전체 진행률
-                    </div>
-                    <div className="text-3xl font-heading font-black text-transparent bg-clip-text bg-gradient-to-br from-violet-300 to-purple-500 relative z-10 tracking-tight">{Number(totals.progress || 0)}%</div>
-                </div>
-            </div>
 
             <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl p-6 shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
                 <h3 className="text-sm font-bold text-slate-200 mb-5 flex items-center gap-3">
@@ -3013,10 +4020,20 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
                 setExportProgress({ inProgress: true, done: i + 1, total: sourceFiles.length, percent: Math.round(((i + 1) / Math.max(sourceFiles.length, 1)) * 100), currentFile: sourceFile });
             }
             setExportResult({ success: true, onlySubmitted: exportOnlySubmitted, savedFiles: mergedSavedFiles });
-            alert('VLM JSON export가 완료되었습니다. datasets/vlm_export 폴더를 확인해주세요.');
+            const totalRows = mergedSavedFiles.reduce((a, f) => a + (f.count ?? 0), 0);
+            if (totalRows === 0 && exportOnlySubmitted) {
+                alert(
+                    'VLM JSON export는 완료되었으나, 보낸 행이 0건입니다. "제출된 작업만"을 끄면 TODO·작업중 상태도 포함됩니다. 서버의 datasets/vlm_export 또는 아래 다운로드 링크를 확인하세요.'
+                );
+            } else {
+                alert(
+                    `VLM JSON export 완료: 총 ${totalRows}건, 파일 ${mergedSavedFiles.length}개. 원격 API면 파일은 API 서버 디스크에 저장됩니다. 화면의 다운로드 링크로 받을 수 있습니다.`
+                );
+            }
             await refreshExportFiles();
-        } catch (_e) {
-            alert('VLM JSON export에 실패했습니다.');
+        } catch (e: unknown) {
+            const msg = e instanceof Error ? e.message : String(e);
+            alert(`VLM JSON export 실패: ${msg}`);
         } finally {
             setExportProgress((prev) => ({ ...prev, inProgress: false }));
             setLoadingCommit(false);
@@ -3055,7 +4072,7 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
         }
         setExporting(true);
         try {
-            const url = `/api/plugins/classification/export?projectId=${encodeURIComponent(selectedProjectId)}&format=${exportFormat}`;
+            const url = apiUrl(`/api/plugins/classification/export?projectId=${encodeURIComponent(selectedProjectId)}&format=${exportFormat}`);
             const res = await fetch(url);
             const text = await res.text();
             if (!res.ok) {
@@ -3259,8 +4276,29 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
                                 </button>
                             </div>
                             {exportResult && (
-                                <div className="text-xs text-slate-400">
-                                    완료: {exportResult.savedFiles?.length ?? 0}개 파일 저장
+                                <div className="text-xs text-slate-400 space-y-2">
+                                    <div>
+                                        완료: {exportResult.savedFiles?.length ?? 0}개 파일 · 총{' '}
+                                        {(exportResult.savedFiles ?? []).reduce((a, f) => a + (f.count ?? 0), 0)}건
+                                    </div>
+                                    <ul className="space-y-1 max-h-40 overflow-y-auto">
+                                        {(exportResult.savedFiles ?? []).map((f) => (
+                                            <li key={f.outputPath} className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                                <span className="text-slate-500">
+                                                    {f.sourceFile}
+                                                    <span className="text-slate-600"> ({f.count ?? 0}건)</span>
+                                                </span>
+                                                <a
+                                                    href={resolveDatasetPublicUrl(f.outputPath)}
+                                                    target="_blank"
+                                                    rel="noreferrer"
+                                                    className="text-cyan-400 hover:underline shrink-0"
+                                                >
+                                                    다운로드
+                                                </a>
+                                            </li>
+                                        ))}
+                                    </ul>
                                 </div>
                             )}
                         </div>
@@ -3321,7 +4359,358 @@ const DataImportExportView: React.FC<{ onRefreshTasks: () => void; workers: stri
     );
 };
 
-const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review' | 'image-classification') => void; onArchived?: () => void; onRefresh?: () => void; onRefreshTasksFromServer?: () => Promise<void>; onSyncProject?: (projectId: string) => Promise<void>; onSyncFolders?: (folders: string[]) => Promise<void>; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, onRefresh, onRefreshTasksFromServer, onSyncProject, onSyncFolders, workerNames = [], tasks, onSelectTask }) => {
+function sortTasksInReviewFolder(folderTasks: Task[]): Task[] {
+    const isVlm = folderTasks.some((t) => t.sourceType === 'vlm-review');
+    return [...folderTasks].sort((a, b) =>
+        isVlm ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true })
+    );
+}
+
+/** 프로젝트에 속한 폴더 경로(서버에서 불러올 범위) — 검수 큐 */
+function getFolderPathsForProjectLoad(projectId: string, overview: Storage.ProjectOverviewPayload): string[] {
+    const map = overview.projectMap ?? {};
+    if (projectId === '__unmapped__') {
+        const set = new Set<string>();
+        overview.folders?.forEach((row) => {
+            const pid = row.projectId ? String(row.projectId) : '';
+            if (!pid) set.add(row.folder);
+        });
+        return [...set].sort((a, b) => a.localeCompare(b));
+    }
+    return Object.entries(map)
+        .filter(([, v]) => String(v.projectId) === projectId)
+        .map(([k]) => k)
+        .sort((a, b) => a.localeCompare(b));
+}
+
+/** 관리자 검수자: 프로젝트·작업자 선택 후 해당 프로젝트 폴더만 서버에서 불러와 폴더별 요약 — 열면 검수 내비가 큐(전역) 모드 */
+const ReviewQueuePanel: React.FC<{
+    workers: string[];
+    tasks: Task[];
+    onSelectTask: (id: string, options?: SelectTaskOptions) => void;
+    onRefresh: () => void;
+}> = ({ workers, tasks, onSelectTask, onRefresh }) => {
+    const [worker, setWorker] = useState('');
+    const [selectedProjectId, setSelectedProjectId] = useState('');
+    const [loading, setLoading] = useState(false);
+    const [filter, setFilter] = useState<'pending' | 'all'>('pending');
+    const [projectOverview, setProjectOverview] = useState<Storage.ProjectOverviewPayload | null>(null);
+    const [loadScope, setLoadScope] = useState<{ projectId: string; worker: string } | null>(null);
+
+    useEffect(() => {
+        let cancelled = false;
+        void Storage.getProjectOverview().then((o) => {
+            if (!cancelled) setProjectOverview(o);
+        });
+        return () => {
+            cancelled = true;
+        };
+    }, []);
+
+    useEffect(() => {
+        setLoadScope(null);
+    }, [selectedProjectId, worker]);
+
+    const loadScopeOk = useMemo(() => {
+        const w = String(worker || '').trim();
+        if (!w || !selectedProjectId || !loadScope) return false;
+        return loadScope.worker === w && loadScope.projectId === selectedProjectId;
+    }, [worker, selectedProjectId, loadScope]);
+
+    const handleLoadFromServer = useCallback(async () => {
+        const w = String(worker || '').trim();
+        const pid = String(selectedProjectId || '').trim();
+        if (!w || !pid || !projectOverview) return;
+        const folders = getFolderPathsForProjectLoad(pid, projectOverview);
+        if (folders.length === 0) {
+            alert(
+                '이 프로젝트에 매핑된 폴더가 없습니다. 프로젝트 개요·폴더 매핑을 확인하거나, 미매핑 폴더가 없으면 다른 프로젝트를 선택해 주세요.'
+            );
+            return;
+        }
+        setLoading(true);
+        try {
+            await Storage.fetchAndMergeWorkerTasksForProjectFolders(w, folders);
+            onRefresh();
+            setLoadScope({ projectId: pid, worker: w });
+        } catch {
+            alert('선택한 범위의 작업을 서버에서 불러오지 못했습니다.');
+        } finally {
+            setLoading(false);
+        }
+    }, [worker, selectedProjectId, projectOverview, onRefresh]);
+
+    const baseRows = useMemo(() => {
+        if (!projectOverview || !loadScopeOk) return [];
+        const w = String(worker || '').trim();
+        if (!w) return [];
+        const projectMap = projectOverview.projectMap ?? {};
+        const scopePid = selectedProjectId;
+        let list = tasks.filter((t) => String(t.assignedWorker || '').trim() === w);
+        list = list.filter((t) => {
+            const resolved = resolveProjectMapEntryForFolder(t.folder, projectMap);
+            const pid = resolved?.projectId ?? '__unmapped__';
+            return pid === scopePid;
+        });
+        if (filter === 'pending') {
+            list = list.filter((t) => t.status === TaskStatus.SUBMITTED);
+        }
+        const isVlm = list.some((t) => t.sourceType === 'vlm-review');
+        return [...list].sort((a, b) => {
+            const fc = String(a.folder).localeCompare(String(b.folder));
+            if (fc !== 0) return fc;
+            return isVlm ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true });
+        });
+    }, [tasks, worker, filter, projectOverview, loadScopeOk, selectedProjectId]);
+
+    const rows = baseRows;
+
+    const projectGroups = useMemo(() => {
+        const projectMap = projectOverview?.projectMap ?? {};
+        const nameById = new Map<string, string>();
+        projectOverview?.projects?.forEach((p) => nameById.set(String(p.id), p.name));
+
+        const folderToTasks = new Map<string, Task[]>();
+        for (const t of rows) {
+            const f = t.folder;
+            if (!folderToTasks.has(f)) folderToTasks.set(f, []);
+            folderToTasks.get(f)!.push(t);
+        }
+
+        const byProject = new Map<string, Array<{ folder: string; tasks: Task[] }>>();
+        for (const [folder, folderTasks] of folderToTasks) {
+            const resolved = resolveProjectMapEntryForFolder(folder, projectMap);
+            const pid = resolved?.projectId ?? '__unmapped__';
+            if (!byProject.has(pid)) byProject.set(pid, []);
+            byProject.get(pid)!.push({ folder, tasks: folderTasks });
+        }
+
+        const out: Array<{
+            projectId: string;
+            displayName: string;
+            totalTasks: number;
+            folders: Array<{ folder: string; tasks: Task[]; pendingInFolder: number; firstTaskId: string }>;
+        }> = [];
+
+        for (const [projectId, folderList] of byProject) {
+            const displayName =
+                projectId === '__unmapped__'
+                    ? '프로젝트 미매핑'
+                    : nameById.get(projectId) ?? `프로젝트 (${projectId})`;
+            const folders = folderList
+                .map(({ folder, tasks: ft }) => {
+                    const sorted = sortTasksInReviewFolder(ft);
+                    const first = sorted[0];
+                    return {
+                        folder,
+                        tasks: ft,
+                        pendingInFolder: ft.filter((t) => t.status === TaskStatus.SUBMITTED).length,
+                        firstTaskId: first?.id ?? ''
+                    };
+                })
+                .filter((f) => f.firstTaskId)
+                .sort((a, b) => a.folder.localeCompare(b.folder, 'ko'));
+            const totalTasks = folders.reduce((s, f) => s + f.tasks.length, 0);
+            out.push({ projectId, displayName, folders, totalTasks });
+        }
+
+        out.sort((a, b) => a.displayName.localeCompare(b.displayName, 'ko'));
+        return out;
+    }, [rows, projectOverview]);
+
+    const workerOpts = [...workers].filter(Boolean).sort((a, b) => a.localeCompare(b));
+
+    const projectSelectOpts = useMemo(() => {
+        const list = projectOverview?.projects ? [...projectOverview.projects] : [];
+        list.sort((a, b) => a.name.localeCompare(b.name, 'ko'));
+        return list;
+    }, [projectOverview]);
+
+    const folderCountHint = useMemo(() => {
+        if (!selectedProjectId || !projectOverview) return 0;
+        return getFolderPathsForProjectLoad(selectedProjectId, projectOverview).length;
+    }, [selectedProjectId, projectOverview]);
+
+    return (
+        <div className="h-full overflow-auto p-6 space-y-5">
+            <div>
+                <h2 className="text-xl font-bold text-white tracking-tight">작업자 검수 큐</h2>
+                <p className="text-sm text-slate-400 mt-2 max-w-3xl leading-relaxed">
+                    프로젝트와 작업자를 고른 뒤 <span className="text-purple-300">선택 범위 불러오기</span>로 해당 프로젝트에 매핑된 폴더만 서버에서 가져옵니다.
+                    표시(검수 대기/전체)는 불러온 뒤 캐시에서 필터합니다. 폴더에서 <span className="text-purple-300">검수</span>를 누르면 해당 폴더의 첫 항목부터 열리고, 캔버스 이전/다음은 작업자 전체 큐 순서를 따릅니다.
+                </p>
+            </div>
+            <div className="flex flex-wrap items-end gap-3">
+                <div className="min-w-[16rem]">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">프로젝트</label>
+                    <select
+                        value={selectedProjectId}
+                        onChange={(e) => setSelectedProjectId(e.target.value)}
+                        disabled={!projectOverview}
+                        className="w-full bg-slate-950 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-purple-500 disabled:opacity-40"
+                    >
+                        <option value="">프로젝트 선택…</option>
+                        {projectSelectOpts.map((p) => (
+                            <option key={p.id} value={String(p.id)}>
+                                {p.name}
+                            </option>
+                        ))}
+                        <option value="__unmapped__">프로젝트 미매핑</option>
+                    </select>
+                </div>
+                <div className="min-w-[14rem]">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">작업자</label>
+                    <select
+                        value={worker}
+                        onChange={(e) => setWorker(e.target.value)}
+                        className="w-full bg-slate-950 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-purple-500"
+                    >
+                        <option value="">선택…</option>
+                        {workerOpts.map((w) => (
+                            <option key={w} value={w}>
+                                {w}
+                            </option>
+                        ))}
+                    </select>
+                </div>
+                <div className="min-w-[12rem]">
+                    <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1.5">표시</label>
+                    <select
+                        value={filter}
+                        onChange={(e) => setFilter(e.target.value as 'pending' | 'all')}
+                        className="w-full bg-slate-950 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-slate-100 outline-none focus:border-purple-500"
+                    >
+                        <option value="pending">검수 대기 (제출됨)</option>
+                        <option value="all">전체 배정 건</option>
+                    </select>
+                </div>
+                <button
+                    type="button"
+                    disabled={!worker || !selectedProjectId || !projectOverview || loading}
+                    onClick={() => void handleLoadFromServer()}
+                    className="px-4 py-2.5 rounded-lg text-sm font-bold bg-purple-900/50 hover:bg-purple-800/50 text-purple-100 border border-purple-600/50 disabled:opacity-40"
+                >
+                    {loading ? '불러오는 중…' : '선택 범위 불러오기'}
+                </button>
+            </div>
+            {selectedProjectId && projectOverview ? (
+                <p className="text-[11px] text-slate-500">
+                    서버에서 가져올 폴더 수: <span className="font-mono text-slate-400">{folderCountHint.toLocaleString()}</span>개
+                    {folderCountHint === 0 ? ' (매핑 없음 — 불러오기 시 안내)' : ''}
+                </p>
+            ) : null}
+            {!projectOverview ? (
+                <p className="text-slate-500 text-sm">프로젝트 목록을 불러오는 중…</p>
+            ) : !selectedProjectId || !worker ? (
+                <p className="text-slate-500 text-sm italic">프로젝트와 작업자를 선택한 뒤 「선택 범위 불러오기」를 누르세요.</p>
+            ) : !loadScopeOk ? (
+                <p className="text-slate-500 text-sm">
+                    프로젝트·작업자를 맞춘 뒤 「선택 범위 불러오기」를 누르면 여기에 표시됩니다. 항목을 바꾼 경우에도 다시 불러오기를 눌러 주세요.
+                </p>
+            ) : rows.length === 0 ? (
+                <p className="text-slate-500 text-sm">
+                    {filter === 'pending'
+                        ? '검수 대기(SUBMITTED) 태스크가 없습니다. 표시를 「전체 배정 건」으로 바꿔 보거나, 다른 프로젝트/작업자를 불러오세요.'
+                        : '이 범위에 캐시된 배정 태스크가 없습니다. 폴더·배정 상태를 확인하거나 다시 불러오기를 눌러 주세요.'}
+                </p>
+            ) : (
+                <div className="space-y-3">
+                    {projectGroups.map((pg) => (
+                        <details key={pg.projectId} open className="border border-slate-700 rounded-xl bg-slate-900/40 overflow-hidden group">
+                            <summary className="cursor-pointer list-none px-4 py-3 bg-slate-900/80 border-b border-white/5 flex flex-wrap items-center justify-between gap-2 [&::-webkit-details-marker]:hidden">
+                                <span className="font-bold text-slate-100 text-sm flex items-center gap-2">
+                                    <span className="text-slate-500 group-open:rotate-90 transition-transform inline-block">▸</span>
+                                    {pg.displayName}
+                                </span>
+                                <span className="text-xs text-slate-500 font-mono">
+                                    {pg.totalTasks.toLocaleString()}건 / {pg.folders.length}폴더
+                                </span>
+                            </summary>
+                            <ul className="divide-y divide-white/5">
+                                {pg.folders.map((fg) => (
+                                    <li
+                                        key={fg.folder}
+                                        className="px-4 py-3 flex flex-wrap items-center justify-between gap-3 hover:bg-slate-800/40"
+                                    >
+                                        <div className="min-w-0 flex-1">
+                                            <p className="font-mono text-xs text-slate-300 truncate" title={fg.folder}>
+                                                {fg.folder}
+                                            </p>
+                                            <p className="text-[11px] text-slate-500 mt-1">
+                                                {fg.tasks.length.toLocaleString()}건
+                                                {filter === 'all' && fg.pendingInFolder > 0 ? (
+                                                    <span className="text-amber-200/80"> · 검수 대기 {fg.pendingInFolder.toLocaleString()}건</span>
+                                                ) : null}
+                                            </p>
+                                        </div>
+                                        <button
+                                            type="button"
+                                            onClick={() =>
+                                                onSelectTask(fg.firstTaskId, {
+                                                    reviewerScopeWorker: String(worker).trim(),
+                                                    reviewerNavMode: 'queue',
+                                                    reviewerQueueFilter: filter,
+                                                    reviewerQueueProjectId: selectedProjectId
+                                                })
+                                            }
+                                            className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-900/40 text-purple-200 border border-purple-600/40 hover:bg-purple-800/50"
+                                        >
+                                            검수
+                                        </button>
+                                    </li>
+                                ))}
+                            </ul>
+                        </details>
+                    ))}
+                    <div className="px-1 text-[11px] text-slate-500">
+                        합계 {rows.length.toLocaleString()}건 (캐시 기준) · 폴더의 검수는 해당 폴더에서 정렬된 첫 태스크부터 열립니다.
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+const FOLDER_TABLE_COLS_STORAGE_KEY = 'yolo_projectDetail_folderTableCols';
+const DEFAULT_FOLDER_COL_WIDTHS_NATIVE = [280, 144, 104, 136, 176, 112];
+const DEFAULT_FOLDER_COL_WIDTHS_VLM = [280, 160, 104, 136, 176, 112];
+
+function loadFolderTableColWidths(): { native: number[]; vlm: number[] } {
+    const clamp = (arr: unknown, def: number[]) =>
+        Array.isArray(arr) && arr.length === 6 && arr.every((x) => typeof x === 'number' && Number(x) >= 48)
+            ? (arr as number[]).map((n) => Math.round(Number(n)))
+            : [...def];
+    try {
+        const raw = localStorage.getItem(FOLDER_TABLE_COLS_STORAGE_KEY);
+        if (raw) {
+            const j = JSON.parse(raw) as { native?: unknown; vlm?: unknown };
+            return {
+                native: clamp(j?.native, DEFAULT_FOLDER_COL_WIDTHS_NATIVE),
+                vlm: clamp(j?.vlm, DEFAULT_FOLDER_COL_WIDTHS_VLM)
+            };
+        }
+    } catch {
+        /* ignore */
+    }
+    return {
+        native: [...DEFAULT_FOLDER_COL_WIDTHS_NATIVE],
+        vlm: [...DEFAULT_FOLDER_COL_WIDTHS_VLM]
+    };
+}
+
+function formatProjectDetailStatsFetchedAt(ts: number): string {
+    return new Date(ts).toLocaleString('ko-KR', {
+        year: 'numeric',
+        month: 'numeric',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: true
+    });
+}
+
+const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () => void; onOpenFolder: (folderName: string, workflowSourceType?: 'native-yolo' | 'vlm-review' | 'image-classification') => void; onArchived?: () => void; onRefresh?: () => void; onRefreshTasksFromServer?: () => Promise<void>; onSyncProject?: (projectId: string) => Promise<void>; workerNames?: string[]; tasks: Task[]; onSelectTask: (id: string, options?: SelectTaskOptions) => void }> = ({ projectId, role, onBack, onOpenFolder, onArchived, onRefresh, onRefreshTasksFromServer, onSyncProject, workerNames = [], tasks, onSelectTask }) => {
     const [days, setDays] = useState<number>(30);
     const [loading, setLoading] = useState<boolean>(true);
     const [refreshing, setRefreshing] = useState<boolean>(false);
@@ -3335,68 +4724,178 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
     const [vlmUnassignWorker, setVlmUnassignWorker] = useState<string>('');
     const [vlmAssigning, setVlmAssigning] = useState<boolean>(false);
     const [vlmUnassigning, setVlmUnassigning] = useState<boolean>(false);
+    const [vlmModalSourceRows, setVlmModalSourceRows] = useState<Storage.VlmAssignSourceFileInfo[]>([]);
+    const [vlmModalSelectedSourceFiles, setVlmModalSelectedSourceFiles] = useState<string[]>([]);
+    const [showNativeAssignModal, setShowNativeAssignModal] = useState<boolean>(false);
+    const [nativeAssignCount, setNativeAssignCount] = useState<string>('10');
+    const [nativeAssignWorker, setNativeAssignWorker] = useState<string>('');
+    const [nativeUnassignCount, setNativeUnassignCount] = useState<string>('10');
+    const [nativeUnassignWorker, setNativeUnassignWorker] = useState<string>('');
+    const [nativeAssigning, setNativeAssigning] = useState<boolean>(false);
+    const [nativeUnassigning, setNativeUnassigning] = useState<boolean>(false);
+    const [unassigningFolder, setUnassigningFolder] = useState<string | null>(null);
+    const [folderTableCols, setFolderTableCols] = useState(loadFolderTableColWidths);
+    const [detailStatsFetchedAt, setDetailStatsFetchedAt] = useState<number | null>(null);
+    const [detailStatsFetchPending, setDetailStatsFetchPending] = useState(false);
 
     const fetchDetail = useCallback(async (force: boolean = false) => {
         const cacheKey = `${projectId}::${days}`;
         const cached = projectDetailCache.get(cacheKey);
-        const cacheValid = cached && (Date.now() - cached.fetchedAt) < PROJECT_DETAIL_CACHE_TTL_MS;
-        if (!force && cacheValid) {
+        if (!force && cached) {
             setDetail(cached.payload || null);
+            setDetailStatsFetchedAt(cached.fetchedAt);
             setLoading(false);
             return;
         }
         if (!force) setLoading(true);
+        setDetailStatsFetchPending(true);
         try {
             const payload = await Storage.getProjectDetail(projectId, days);
+            const now = Date.now();
             setDetail(payload);
-            projectDetailCache.set(cacheKey, { fetchedAt: Date.now(), payload: payload || null });
+            projectDetailCache.set(cacheKey, { fetchedAt: now, payload: payload || null });
+            setDetailStatsFetchedAt(now);
         } finally {
+            setDetailStatsFetchPending(false);
             setLoading(false);
         }
     }, [projectId, days]);
 
+    /**
+     * 지표 새로고침·자동 갱신 공통: 델타로 로컬 tasks 맞춘 뒤 상세 API 재조회.
+     * (작업자 표의 검수 수 등은 네이티브일 때 tasks 캐시를 쓰므로 fetchDetail 만으로는 부족함)
+     */
+    const runProjectDetailMetricsRefresh = useCallback(
+        async (options?: { showUiRefreshing?: boolean }) => {
+            const showUi = options?.showUiRefreshing === true;
+            if (showUi) setRefreshing(true);
+            try {
+                await Storage.syncTasksDelta();
+                onRefresh?.();
+                await fetchDetail(true);
+            } finally {
+                if (showUi) setRefreshing(false);
+            }
+        },
+        [fetchDetail, onRefresh]
+    );
+
     useEffect(() => {
-        fetchDetail(false);
+        void fetchDetail(false);
     }, [fetchDetail]);
 
+    /** 배정·맵 변경 등으로 overview 캐시가 무효화될 때 상세 통계도 같은 시점에 맞춤 (/api/projects/detail 재조회) */
+    useEffect(() => {
+        const ev = Storage.PROJECT_OVERVIEW_INVALIDATE_EVENT;
+        const onOverviewInvalidate = () => {
+            for (const k of [...projectDetailCache.keys()]) {
+                if (k.startsWith(`${projectId}::`)) projectDetailCache.delete(k);
+            }
+            void runProjectDetailMetricsRefresh({ showUiRefreshing: false });
+        };
+        window.addEventListener(ev, onOverviewInvalidate);
+        return () => window.removeEventListener(ev, onOverviewInvalidate);
+    }, [projectId, runProjectDetailMetricsRefresh]);
+
+    /** 주기적 갱신 = 지표 새로고침과 동일(델타 + tasks 반영 + detail). 백그라운드 탭은 생략 */
+    useEffect(() => {
+        const tick = () => {
+            if (typeof document !== 'undefined' && document.visibilityState === 'hidden') return;
+            void runProjectDetailMetricsRefresh({ showUiRefreshing: false });
+        };
+        const id = window.setInterval(tick, PROJECT_DETAIL_POLL_MS);
+        return () => window.clearInterval(id);
+    }, [projectId, days, runProjectDetailMetricsRefresh]);
+
     const handleRefreshDetail = async () => {
-        setRefreshing(true);
-        try {
-            await fetchDetail(true);
-        } finally {
-            setRefreshing(false);
-        }
+        await runProjectDetailMetricsRefresh({ showUiRefreshing: true });
     };
 
-    useEffect(() => {
-        const sameProjectKeys = Array.from(projectDetailCache.keys()).filter((key) => key.startsWith(`${projectId}::`));
-        if (sameProjectKeys.length === 0) {
-            return;
+    const handleUnassignFolderRow = async (folder: string) => {
+        if (!folder.trim() || isArchived) return;
+        const ok = window.confirm(
+            `"${folder}" 폴더의 프로젝트 연결과 작업자 배정을 모두 해제할까요?\n프로젝트 맵·작업자 맵이 지워지고, DB의 project_id·assignedWorker도 해당 트리에서 비워집니다.`
+        );
+        if (!ok) return;
+        setUnassigningFolder(folder);
+        try {
+            await Storage.mapFolderToProject(folder, null);
+            await Storage.mapFolderToWorker(folder, null);
+            Array.from(projectDetailCache.keys()).forEach((key) => {
+                if (key.startsWith(`${projectId}::`)) projectDetailCache.delete(key);
+            });
+            Storage.invalidateProjectOverviewCache();
+            alert(
+                '배정 해제를 서버에 반영했습니다.\n\n' +
+                    '화면·작업 목록·디스크와의 일치는 자동으로 맞추지 않습니다. 필요할 때 아래를 직접 실행해 주세요.\n' +
+                    '· 이 화면 통계: 「지표 새로고침」\n' +
+                    '· 작업 목록 캐시: 상단 「DB 새로고침」\n' +
+                    '· datasets 스캔 반영: 「이 프로젝트만 동기화」'
+            );
+        } catch (e) {
+            alert(e instanceof Error ? e.message : String(e));
+        } finally {
+            setUnassigningFolder(null);
         }
-        // Keep cache size bounded per project by dropping very old entries on days/project switches.
-        const now = Date.now();
-        sameProjectKeys.forEach((key) => {
-            const row = projectDetailCache.get(key);
-            if (!row) return;
-            if (now - row.fetchedAt > PROJECT_DETAIL_CACHE_TTL_MS * 3) {
-                projectDetailCache.delete(key);
-            }
-        });
-    }, [projectId, days]);
+    };
 
     const project = detail?.project;
     const trends = detail?.trends || [];
     const workers = detail?.workers || [];
-    const folders = detail?.folders || [];
+    const folders = useMemo(
+        () => (Array.isArray(detail?.folders) ? detail!.folders : []),
+        [detail?.folders]
+    );
+    const isVlmProjectDetail = project?.workflowSourceType === 'vlm-review';
     const folderWorkerOptions = useMemo(() => {
         const names = Array.from(new Set(folders.map((row) => String(row.assignedWorker || 'Unassigned').trim() || 'Unassigned')));
         return names.sort((a, b) => a.localeCompare(b));
     }, [folders]);
     const filteredFolders = useMemo(() => {
+        if (!isVlmProjectDetail) return folders;
         if (folderWorkerFilter === 'ALL') return folders;
         return folders.filter((row) => (String(row.assignedWorker || 'Unassigned').trim() || 'Unassigned') === folderWorkerFilter);
-    }, [folders, folderWorkerFilter]);
+    }, [folders, folderWorkerFilter, isVlmProjectDetail]);
     const isArchived = Boolean(detail?.isArchived || project?.status === 'ARCHIVED');
+
+    const folderTableWidths = isVlmProjectDetail ? folderTableCols.vlm : folderTableCols.native;
+
+    const onFolderTableColResizeStart = useCallback(
+        (colIndex: number, e: React.PointerEvent<HTMLButtonElement>) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const grip = e.currentTarget;
+            grip.setPointerCapture(e.pointerId);
+            const mode = isVlmProjectDetail ? ('vlm' as const) : ('native' as const);
+            const startX = e.clientX;
+            const startWidths = [...folderTableCols[mode]];
+            const minW = 56;
+
+            const onMove = (ev: PointerEvent) => {
+                const delta = ev.clientX - startX;
+                const nw = Math.max(minW, startWidths[colIndex] + delta);
+                setFolderTableCols((prev) => ({
+                    ...prev,
+                    [mode]: prev[mode].map((w, i) => (i === colIndex ? nw : w))
+                }));
+            };
+            const onUp = (ev: PointerEvent) => {
+                window.removeEventListener('pointermove', onMove);
+                grip.releasePointerCapture(ev.pointerId);
+                setFolderTableCols((prev) => {
+                    try {
+                        localStorage.setItem(FOLDER_TABLE_COLS_STORAGE_KEY, JSON.stringify(prev));
+                    } catch {
+                        /* ignore */
+                    }
+                    return prev;
+                });
+            };
+            window.addEventListener('pointermove', onMove);
+            window.addEventListener('pointerup', onUp, { once: true });
+        },
+        [isVlmProjectDetail, folderTableCols]
+    );
 
     useEffect(() => {
         if (folderWorkerFilter === 'ALL') return;
@@ -3404,6 +4903,79 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
             setFolderWorkerFilter('ALL');
         }
     }, [folderWorkerFilter, folderWorkerOptions]);
+
+    useEffect(() => {
+        if (!showVlmModal) return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const list = await Storage.getVlmAssignSourceFiles(projectId);
+                if (cancelled) return;
+
+                if (project?.workflowSourceType !== 'vlm-review') {
+                    setVlmModalSourceRows(list);
+                    setVlmModalSelectedSourceFiles(list.map((r) => r.sourceFile));
+                    return;
+                }
+
+                const pid = String(projectId || '').trim();
+                let allowed = projectVlmSourceFileNamesFromUnknown(project ?? undefined);
+
+                if (allowed.length === 0) {
+                    try {
+                        const all = await Storage.getProjects();
+                        const fromList = all.find((p) => String(p.id || '').trim() === pid);
+                        allowed = projectVlmSourceFileNamesFromUnknown(fromList);
+                    } catch {
+                        /* ignore */
+                    }
+                }
+
+                if (allowed.length === 0) {
+                    try {
+                        const ov = await Storage.getProjectOverview(false);
+                        const fromOv = ov.projects.find((p) => String(p.id || '').trim() === pid);
+                        allowed = projectVlmSourceFileNamesFromUnknown(fromOv);
+                    } catch {
+                        /* ignore */
+                    }
+                }
+
+                if (allowed.length === 0) {
+                    allowed = inferVlmJsonNamesFromFolders(folders);
+                }
+
+                if (allowed.length === 0) {
+                    setVlmModalSourceRows([]);
+                    setVlmModalSelectedSourceFiles([]);
+                    return;
+                }
+
+                const lookup = buildVlmAssignStatsLookup(list);
+                const rows = allowed.map((sf) => {
+                    const hit = lookupVlmAssignStats(lookup, sf);
+                    const canonical = hit?.sourceFile ?? sf;
+                    return (
+                        hit ?? {
+                            sourceFile: canonical,
+                            total: 0,
+                            unassigned: 0
+                        }
+                    );
+                });
+                setVlmModalSourceRows(rows);
+                setVlmModalSelectedSourceFiles(rows.map((r) => r.sourceFile));
+            } catch {
+                if (!cancelled) {
+                    setVlmModalSourceRows([]);
+                    setVlmModalSelectedSourceFiles([]);
+                }
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [showVlmModal, projectId, project?.workflowSourceType, project?.vlmSourceFiles, project?.vlmSourceFile, folders]);
 
     const handleArchiveProject = async () => {
         if (!project?.id || !detail) return;
@@ -3421,6 +4993,7 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                     projectDetailCache.delete(key);
                 }
             });
+            Storage.invalidateProjectOverviewCache();
             alert('프로젝트 아카이브가 완료되었습니다.');
             onArchived?.();
             onBack();
@@ -3443,6 +5016,7 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                     projectDetailCache.delete(key);
                 }
             });
+            Storage.invalidateProjectOverviewCache();
             await onRefreshTasksFromServer?.();
             alert('프로젝트가 영구적으로 삭제되었습니다.');
             onArchived?.();
@@ -3479,20 +5053,34 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                             )}
                         </div>
                         <p className="text-slate-400 text-sm mt-1">프로젝트 단위 작업/배분/추이 현황</p>
+                        <div
+                            className="text-xs mt-1.5 flex flex-wrap items-center gap-2 text-slate-500"
+                            role="status"
+                            aria-live="polite"
+                        >
+                            <span
+                                className={`inline-flex h-2 w-2 shrink-0 rounded-full ${
+                                    detailStatsFetchPending ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500/90'
+                                }`}
+                                aria-hidden
+                            />
+                            {detailStatsFetchedAt != null ? (
+                                <>
+                                    <span className={detailStatsFetchPending ? 'text-slate-500' : 'text-slate-400'}>
+                                        {formatProjectDetailStatsFetchedAt(detailStatsFetchedAt)}
+                                    </span>
+                                    {!detailStatsFetchPending && <span>에 불러온 데이터입니다</span>}
+                                    {detailStatsFetchPending && (
+                                        <span className="text-amber-200/85">· 갱신 중…</span>
+                                    )}
+                                </>
+                            ) : detailStatsFetchPending ? (
+                                <span className="text-slate-400">통계를 불러오는 중…</span>
+                            ) : null}
+                        </div>
                     </div>
                 </div>
                 <div className="flex items-center gap-2">
-                    <select
-                        value={folderWorkerFilter}
-                        onChange={(e) => setFolderWorkerFilter(e.target.value)}
-                        className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200 outline-none focus:border-cyan-500"
-                        title="폴더 진행 현황 작업자 필터"
-                    >
-                        <option value="ALL">전체 작업자</option>
-                        {folderWorkerOptions.map((name) => (
-                            <option key={name} value={name}>{name}</option>
-                        ))}
-                    </select>
                     <select
                         value={String(days)}
                         onChange={(e) => setDays(Number(e.target.value))}
@@ -3513,7 +5101,14 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                     </button>
                     {onSyncProject && (
                         <button
-                            onClick={() => { const ok = window.confirm('이 프로젝트에 매핑된 폴더만 디스크와 동기화합니다. 계속할까요?'); if (ok) onSyncProject(projectId); }}
+                            onClick={() => {
+                                void (async () => {
+                                    const ok = window.confirm('이 프로젝트에 매핑된 폴더만 디스크와 동기화합니다. 계속할까요?');
+                                    if (!ok) return;
+                                    await onSyncProject(projectId);
+                                    await handleRefreshDetail();
+                                })();
+                            }}
                             disabled={loading || archiving}
                             className="px-3 py-2 rounded-lg bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-bold disabled:opacity-50"
                             title="이 프로젝트에 연결된 폴더만 스캔하여 DB에 반영합니다."
@@ -3621,6 +5216,18 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                             </div>
                         )}
 
+                        {project.workflowSourceType !== 'vlm-review' && !isArchived && (
+                            <div>
+                                <button
+                                    type="button"
+                                    onClick={() => setShowNativeAssignModal(true)}
+                                    className="px-4 py-2 rounded-lg bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold transition-colors"
+                                >
+                                    {project.workflowSourceType === 'image-classification' ? '분류 작업 배분' : 'YOLO 작업 배분'}
+                                </button>
+                            </div>
+                        )}
+
                         {showVlmModal && project.workflowSourceType === 'vlm-review' && (
                             <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60" onClick={() => setShowVlmModal(false)}>
                                 <div className="bg-slate-900 border border-violet-700/50 rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
@@ -3629,7 +5236,52 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                         <button type="button" onClick={() => setShowVlmModal(false)} className="text-slate-400 hover:text-white p-1 rounded">✕</button>
                                     </div>
                                     <div className="p-6 overflow-auto space-y-5">
-                                        <p className="text-xs text-slate-400">이 프로젝트는 원본 JSON 1개에 대응됩니다. 미배정 풀에서 N건을 배정하거나, 작업자에게 배정된 N건을 해제할 수 있습니다.</p>
+                                        <p className="text-xs text-slate-400">
+                                            배정할 원본 JSON을 선택한 뒤, 해당 범위의 미배정 풀에서 N건을 배정하거나 작업자에게 배정된 N건을 해제할 수 있습니다.
+                                        </p>
+
+                                        <div className="rounded-lg border border-slate-600/60 bg-slate-800/40 px-3 py-2.5 space-y-2">
+                                            <div className="text-[11px] font-bold text-slate-400 uppercase tracking-wide">배정·해제 대상 JSON</div>
+                                            {vlmModalSourceRows.length === 0 ? (
+                                                <p className="text-xs text-slate-500">
+                                                    이 프로젝트에 쓸 원본 JSON을 찾지 못했습니다. 프로젝트 설정에 VLM JSON이 있는지,
+                                                    상세/개요 API에 <span className="font-mono text-slate-400">vlmSourceFiles</span>가
+                                                    포함되는지 확인하세요. (폴더명이 <span className="font-mono text-slate-400">VLM_*</span> 형태면
+                                                    그 이름으로 자동 추론합니다.)
+                                                </p>
+                                            ) : (
+                                                <div className="max-h-36 overflow-y-auto space-y-1.5">
+                                                    {vlmModalSourceRows.map((row) => (
+                                                        <label
+                                                            key={row.sourceFile}
+                                                            className="flex items-start gap-2 text-xs text-slate-200 cursor-pointer"
+                                                        >
+                                                            <input
+                                                                type="checkbox"
+                                                                className="mt-0.5 h-3.5 w-3.5 accent-violet-400 shrink-0"
+                                                                checked={vlmModalSelectedSourceFiles.includes(row.sourceFile)}
+                                                                onChange={(e) => {
+                                                                    setVlmModalSelectedSourceFiles((prev) => {
+                                                                        if (e.target.checked) {
+                                                                            if (prev.includes(row.sourceFile)) return prev;
+                                                                            return [...prev, row.sourceFile];
+                                                                        }
+                                                                        return prev.filter((f) => f !== row.sourceFile);
+                                                                    });
+                                                                }}
+                                                            />
+                                                            <span>
+                                                                <span className="font-mono text-[11px]">{row.sourceFile}</span>
+                                                                <span className="text-slate-500">
+                                                                    {' '}
+                                                                    · 미배정 {row.unassigned} / 전체 {row.total}
+                                                                </span>
+                                                            </span>
+                                                        </label>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
 
                                         <div className="flex flex-wrap items-end gap-4">
                                             <div className="flex items-center gap-2">
@@ -3653,14 +5305,28 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                     ))}
                                                 </select>
                                                 <button
-                                                    disabled={vlmAssigning || !vlmAssignWorker || Number(vlmAssignCount) < 1}
+                                                    disabled={
+                                                        vlmAssigning ||
+                                                        !vlmAssignWorker ||
+                                                        Number(vlmAssignCount) < 1 ||
+                                                        vlmModalSelectedSourceFiles.length === 0
+                                                    }
                                                     onClick={async () => {
                                                         const count = Math.max(1, Math.floor(Number(vlmAssignCount) || 0));
+                                                        const w = String(vlmAssignWorker || '').trim();
+                                                        const ok = window.confirm(
+                                                            `「${w}」에게 선택한 JSON 범위에서 미배정 풀 최대 ${count.toLocaleString()}건을 배정합니다.\n계속할까요?`
+                                                        );
+                                                        if (!ok) return;
                                                         setVlmAssigning(true);
                                                         try {
-                                                            const result = await Storage.assignVlmTasks({ workerName: vlmAssignWorker, count, projectId });
+                                                            const result = await Storage.assignVlmTasks({
+                                                                workerName: vlmAssignWorker,
+                                                                count,
+                                                                projectId,
+                                                                sourceFiles: [...vlmModalSelectedSourceFiles]
+                                                            });
                                                             alert(`${result.assigned}건 배정되었습니다.`);
-                                                            await onRefreshTasksFromServer?.();
                                                             await handleRefreshDetail();
                                                             onRefresh?.();
                                                         } catch (e: any) {
@@ -3699,14 +5365,28 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                     ))}
                                                 </select>
                                                 <button
-                                                    disabled={vlmUnassigning || !vlmUnassignWorker || Number(vlmUnassignCount) < 1}
+                                                    disabled={
+                                                        vlmUnassigning ||
+                                                        !vlmUnassignWorker ||
+                                                        Number(vlmUnassignCount) < 1 ||
+                                                        vlmModalSelectedSourceFiles.length === 0
+                                                    }
                                                     onClick={async () => {
                                                         const count = Math.max(1, Math.floor(Number(vlmUnassignCount) || 0));
+                                                        const w = String(vlmUnassignWorker || '').trim();
+                                                        const ok = window.confirm(
+                                                            `「${w}」에게서 선택한 JSON 범위에서 최대 ${count.toLocaleString()}건의 배정을 해제합니다.\n계속할까요?`
+                                                        );
+                                                        if (!ok) return;
                                                         setVlmUnassigning(true);
                                                         try {
-                                                            const result = await Storage.unassignVlmTasks({ workerName: vlmUnassignWorker, count, projectId });
+                                                            const result = await Storage.unassignVlmTasks({
+                                                                workerName: vlmUnassignWorker,
+                                                                count,
+                                                                projectId,
+                                                                sourceFiles: [...vlmModalSelectedSourceFiles]
+                                                            });
                                                             alert(`${result.unassigned}건 배정 해제되었습니다.`);
-                                                            await onRefreshTasksFromServer?.();
                                                             await handleRefreshDetail();
                                                             onRefresh?.();
                                                         } catch (e: any) {
@@ -3726,7 +5406,164 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                             </div>
                         )}
 
-                        <div className="grid gap-4 grid-cols-1 xl:grid-cols-2">
+                        {showNativeAssignModal && project.workflowSourceType !== 'vlm-review' && (
+                            <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60" onClick={() => setShowNativeAssignModal(false)}>
+                                <div className="bg-slate-900 border border-sky-700/50 rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+                                    <div className="px-6 py-4 border-b border-slate-700 flex items-center justify-between">
+                                        <h3 className="text-base font-bold text-sky-200">
+                                            {project.workflowSourceType === 'image-classification'
+                                                ? '이미지 분류 배분 (수량 단위 배정·배정 해제)'
+                                                : 'YOLO 배분 (수량 단위 배정·배정 해제)'}
+                                        </h3>
+                                        <button type="button" onClick={() => setShowNativeAssignModal(false)} className="text-slate-400 hover:text-white p-1 rounded">✕</button>
+                                    </div>
+                                    <div className="p-6 overflow-auto space-y-5">
+                                        {project?.nativeAssignPool && (
+                                            <div className="text-xs text-slate-200 bg-slate-800/60 border border-slate-600 rounded-lg px-3 py-2.5 font-mono space-y-1">
+                                                <div>
+                                                    <span className="text-slate-500">전체 태스크</span>{' '}
+                                                    <span className="text-white font-bold">{Number(project.nativeAssignPool.total).toLocaleString()}</span>
+                                                    <span className="text-slate-500">건</span>
+                                                </div>
+                                                <div>
+                                                    <span className="text-slate-500">이미 배정</span>{' '}
+                                                    <span className="text-sky-300 font-bold">{Number(project.nativeAssignPool.assigned).toLocaleString()}</span>
+                                                    <span className="text-slate-500">건 · </span>
+                                                    <span className="text-slate-500">배정 가능(미배정)</span>{' '}
+                                                    <span className="text-amber-200 font-bold">{Number(project.nativeAssignPool.unassigned).toLocaleString()}</span>
+                                                    <span className="text-slate-500">건</span>
+                                                </div>
+                                            </div>
+                                        )}
+                                        <p className="text-xs text-slate-400">
+                                            이 프로젝트에 매핑된 폴더의 <span className="text-sky-300 font-semibold">tasks</span> 행 기준으로, 미배정 풀에서 N건을 배정합니다.
+                                            배정 해제는 <span className="text-amber-200/90">제출·승인 완료(SUBMITTED/APPROVED) 건은 제외</span>하고 작업자에게서 뺍니다 (상태는 TODO로 되돌림).
+                                        </p>
+
+                                        <div className="flex flex-wrap items-end gap-4">
+                                            <div className="flex flex-wrap items-center gap-2">
+                                                <label className="text-xs text-slate-400">배정 수량</label>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    value={nativeAssignCount}
+                                                    onChange={(e) => setNativeAssignCount(e.target.value)}
+                                                    className="w-20 bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs text-slate-200 font-mono"
+                                                />
+                                                <label className="text-xs text-slate-400">작업자</label>
+                                                <select
+                                                    value={nativeAssignWorker}
+                                                    onChange={(e) => setNativeAssignWorker(e.target.value)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-slate-200"
+                                                >
+                                                    <option value="">선택</option>
+                                                    {workerNames.filter((w) => w && String(w).trim() !== 'Unassigned').map((name) => (
+                                                        <option key={name} value={name}>{name}</option>
+                                                    ))}
+                                                </select>
+                                                <button
+                                                    disabled={nativeAssigning || !nativeAssignWorker || Number(nativeAssignCount) < 1}
+                                                    onClick={async () => {
+                                                        const count = Math.max(1, Math.floor(Number(nativeAssignCount) || 0));
+                                                        const w = String(nativeAssignWorker || '').trim();
+                                                        const ok = window.confirm(
+                                                            `「${w}」에게 미배정 풀에서 최대 ${count.toLocaleString()}건을 배정합니다.\n계속할까요?`
+                                                        );
+                                                        if (!ok) return;
+                                                        setNativeAssigning(true);
+                                                        try {
+                                                            const result = await Storage.assignNativeTasks({
+                                                                workerName: nativeAssignWorker,
+                                                                count,
+                                                                projectId
+                                                            });
+                                                            const hint = typeof result.hint === 'string' ? result.hint : '';
+                                                            const dbg = result.assignDebug;
+                                                            if (Number(result.assigned) > 0) {
+                                                                alert(`${result.assigned}건 배정되었습니다.`);
+                                                            } else {
+                                                                const lines = ['배정된 건이 없습니다.'];
+                                                                if (hint) lines.push('', hint);
+                                                                if (dbg && typeof dbg === 'object') {
+                                                                    lines.push('', '[진단 정보 — API·DB 확인용]', JSON.stringify(dbg, null, 2));
+                                                                } else {
+                                                                    lines.push(
+                                                                        '',
+                                                                        '(진단 정보 없음: 이 UI가 붙은 서버가 최신 vite API가 아니면 assignDebug 가 오지 않습니다. VITE_API_BASE_URL / dev 서버 재시작을 확인하세요.)'
+                                                                    );
+                                                                }
+                                                                alert(lines.join('\n'));
+                                                            }
+                                                            await handleRefreshDetail();
+                                                            onRefresh?.();
+                                                        } catch (e: unknown) {
+                                                            alert(e instanceof Error ? e.message : '배정 실패');
+                                                        } finally {
+                                                            setNativeAssigning(false);
+                                                        }
+                                                    }}
+                                                    className="px-4 py-2 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold disabled:opacity-50"
+                                                >
+                                                    {nativeAssigning ? '처리 중...' : 'N건 배정'}
+                                                </button>
+                                            </div>
+                                        </div>
+
+                                        <div>
+                                            <div className="text-xs font-bold text-slate-300 mb-2">배정 해제 (작업자 기준)</div>
+                                            <div className="flex flex-wrap items-end gap-4">
+                                                <label className="text-xs text-slate-400">해제 수량</label>
+                                                <input
+                                                    type="number"
+                                                    min={1}
+                                                    value={nativeUnassignCount}
+                                                    onChange={(e) => setNativeUnassignCount(e.target.value)}
+                                                    className="w-20 bg-slate-900 border border-slate-600 rounded px-2 py-1.5 text-xs text-slate-200 font-mono"
+                                                />
+                                                <label className="text-xs text-slate-400">작업자</label>
+                                                <select
+                                                    value={nativeUnassignWorker}
+                                                    onChange={(e) => setNativeUnassignWorker(e.target.value)}
+                                                    className="bg-slate-900 border border-slate-600 rounded px-3 py-1.5 text-xs text-slate-200"
+                                                >
+                                                    <option value="">선택</option>
+                                                    {workers.filter((w) => w.userId && String(w.userId).trim() !== 'Unassigned' && Number(w.allocated || 0) > 0).map((w) => (
+                                                        <option key={w.userId} value={w.userId}>{w.userId} ({Number(w.allocated || 0)}건)</option>
+                                                    ))}
+                                                </select>
+                                                <button
+                                                    disabled={nativeUnassigning || !nativeUnassignWorker || Number(nativeUnassignCount) < 1}
+                                                    onClick={async () => {
+                                                        const count = Math.max(1, Math.floor(Number(nativeUnassignCount) || 0));
+                                                        const w = String(nativeUnassignWorker || '').trim();
+                                                        const ok = window.confirm(
+                                                            `「${w}」에게서 최대 ${count.toLocaleString()}건의 배정을 해제합니다.\n제출·승인 완료 건은 해제 대상에서 제외될 수 있습니다.\n계속할까요?`
+                                                        );
+                                                        if (!ok) return;
+                                                        setNativeUnassigning(true);
+                                                        try {
+                                                            const result = await Storage.unassignNativeTasks({ workerName: nativeUnassignWorker, count, projectId });
+                                                            alert(`${result.unassigned}건 배정 해제되었습니다.`);
+                                                            await handleRefreshDetail();
+                                                            onRefresh?.();
+                                                        } catch (e: unknown) {
+                                                            alert(e instanceof Error ? e.message : '배정 해제 실패');
+                                                        } finally {
+                                                            setNativeUnassigning(false);
+                                                        }
+                                                    }}
+                                                    className="px-4 py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-xs font-bold disabled:opacity-50"
+                                                >
+                                                    {nativeUnassigning ? '처리 중...' : 'N건 배정 해제'}
+                                                </button>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="grid gap-4 grid-cols-1 xl:grid-cols-[minmax(0,3.5fr)_minmax(0,6.5fr)]">
                             <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
                                 <div className="px-6 py-4 border-b border-white/5 bg-slate-900/60 text-sm font-bold text-slate-200">
                                     {project.workflowSourceType === 'vlm-review' ? '작업자별 진행 현황' : '작업자 배분 현황'}
@@ -3744,35 +5581,66 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                         </thead>
                                         <tbody className="divide-y divide-white/5">
                                             {workers.filter(row => !['unassigned', 'admin'].includes(String(row.userId).toLowerCase())).map((row) => {
-                                                const projectFolderNamesForRow = (project.workflowSourceType === 'vlm-review' && project.vlmSourceFile)
-                                                    ? (folders.length > 0 ? folders.map(f => f.folder) : [project.vlmSourceFile, `VLM_${(project.vlmSourceFile || '').replace(/\.json$/i, '')}`].filter(Boolean))
-                                                    : folders.map(f => f.folder);
+                                                /** 검수자: 표의 작업자 행과 동일한 ID로 범위 고정 — 폴더 단위 클릭과 무관하게 해당 작업자 배정 태스크만 */
+                                                const reviewScopeOpts =
+                                                    role === UserRole.REVIEWER
+                                                        ? { reviewerScopeWorker: String(row.userId || '').trim() || null }
+                                                        : undefined;
+                                                const isVlmProject = project.workflowSourceType === 'vlm-review';
+                                                /** API(project detail)에서 온 작업자별 검수·샘플 ID — VLM 파일 프로젝트 또는 폴더 매핑 enrich */
+                                                const useServerReviewMeta = isVlmProject || Boolean(row.sampleTaskId);
+                                                const vlmSfList = projectVlmSourceFileNames(project);
+                                                const projectFolderNamesForRow =
+                                                    isVlmProject && vlmSfList.length > 0
+                                                        ? folders.length > 0
+                                                            ? folders.map((f) => f.folder)
+                                                            : vlmSfList.flatMap((sf) => [sf, `VLM_${sf.replace(/\.json$/i, '')}`])
+                                                        : folders.map((f) => f.folder);
+                                                const vlmSfSet = new Set(vlmSfList);
                                                 const isTaskForWorker = (t: Task) =>
                                                     t.assignedWorker === row.userId &&
-                                                    (projectFolderNamesForRow.includes(t.folder) || (t.sourceType === 'vlm-review' && project.vlmSourceFile && t.sourceFile === project.vlmSourceFile));
-                                                const targetTasksForRow = tasks.filter(isTaskForWorker);
-                                                const orderedForRow = project.workflowSourceType === 'vlm-review'
-                                                    ? [...targetTasksForRow].sort((a, b) => a.id.localeCompare(b.id))
-                                                    : targetTasksForRow;
-                                                const submittedCountForRow = targetTasksForRow.filter(t => t.status === TaskStatus.SUBMITTED).length;
-                                                const firstSubmittedForRow = orderedForRow.find(t => t.status === TaskStatus.SUBMITTED);
+                                                    (projectFolderNamesForRow.includes(t.folder) ||
+                                                        (t.sourceType === 'vlm-review' && vlmSfSet.has(String(t.sourceFile || ''))));
+                                                const targetTasksForRow = useServerReviewMeta ? [] : tasks.filter(isTaskForWorker);
+                                                const orderedForRow = useServerReviewMeta ? ([] as Task[]) : [...targetTasksForRow];
+                                                if (!useServerReviewMeta && orderedForRow.length > 0) {
+                                                    orderedForRow.sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+                                                }
+                                                const submittedCountForRow = useServerReviewMeta
+                                                    ? Number(row.reviewPendingCount ?? 0)
+                                                    : targetTasksForRow.filter(t => t.status === TaskStatus.SUBMITTED).length;
+                                                const firstSubmittedForRow = useServerReviewMeta
+                                                    ? undefined
+                                                    : orderedForRow.find(t => t.status === TaskStatus.SUBMITTED);
                                                 return (
                                                 <tr key={row.userId} className="hover:bg-slate-800/40 transition-colors group">
                                                     <td className="px-6 py-4">
                                                         <button
                                                             onClick={() => {
-                                                                if (project.workflowSourceType === 'vlm-review' && targetTasksForRow.length > 0) {
+                                                                if (useServerReviewMeta) {
+                                                                    const isReviewer = role === UserRole.REVIEWER;
+                                                                    const tid = isReviewer
+                                                                        ? (row.firstSubmittedTaskId || row.firstApprovedTaskId || row.sampleTaskId)
+                                                                        : (row.firstOpenTaskId || row.sampleTaskId);
+                                                                    if (tid) {
+                                                                        onSelectTask(tid, reviewScopeOpts);
+                                                                        return;
+                                                                    }
+                                                                    if (Number(row.allocated || 0) > 0) {
+                                                                        alert(`해당 작업자(${row.userId})에게 할당된 작업을 찾을 수 없습니다.`);
+                                                                    }
+                                                                    return;
+                                                                }
+                                                                if (targetTasksForRow.length > 0) {
                                                                     const isReviewer = role === UserRole.REVIEWER;
                                                                     const incompleteTask = isReviewer
                                                                         ? (orderedForRow.find(t => t.status === TaskStatus.SUBMITTED) || orderedForRow.find(t => t.status === TaskStatus.APPROVED) || orderedForRow[0])
                                                                         : (orderedForRow.find(t => t.status !== TaskStatus.APPROVED && t.status !== TaskStatus.SUBMITTED) || orderedForRow[0]);
-                                                                    onSelectTask(incompleteTask.id);
-                                                                } else if (project.workflowSourceType === 'vlm-review') {
-                                                                    alert(`해당 작업자(${row.userId})에게 할당된 작업을 찾을 수 없습니다.`);
+                                                                    onSelectTask(incompleteTask.id, isReviewer ? reviewScopeOpts : undefined);
                                                                 }
                                                             }}
-                                                            className={`flex items-center gap-3 w-full text-left group-hover:bg-slate-800/60 p-1 -m-1 rounded-lg transition-all ${project.workflowSourceType === 'vlm-review' ? 'cursor-pointer hover:ring-1 hover:ring-sky-500/50' : 'cursor-default'}`}
-                                                            title={project.workflowSourceType === 'vlm-review' ? `${row.userId}의 VLM 폴더로 이동` : undefined}
+                                                            className={`flex items-center gap-3 w-full text-left group-hover:bg-slate-800/60 p-1 -m-1 rounded-lg transition-all ${useServerReviewMeta ? 'cursor-pointer hover:ring-1 hover:ring-sky-500/50' : 'cursor-default'}`}
+                                                            title={useServerReviewMeta ? `${row.userId}의 작업으로 이동` : undefined}
                                                         >
                                                             <div className="w-8 h-8 rounded-full bg-slate-800 flex items-center justify-center text-[10px] font-bold text-slate-400 border border-white/5 group-hover:bg-sky-600/20 group-hover:text-sky-300 group-hover:border-sky-500/50 transition-all shadow-inner">
                                                                 {row.userId?.substring(0, 1)?.toUpperCase() || '?'}
@@ -3792,13 +5660,49 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                             <button
                                                                 type="button"
                                                                 onClick={async () => {
+                                                                    if (useServerReviewMeta) {
+                                                                        if (row.firstSubmittedTaskId) {
+                                                                            onSelectTask(row.firstSubmittedTaskId, reviewScopeOpts);
+                                                                            return;
+                                                                        }
+                                                                        const fallback = row.firstApprovedTaskId || row.sampleTaskId;
+                                                                        if (submittedCountForRow === 0 && fallback) {
+                                                                            onSelectTask(fallback, reviewScopeOpts);
+                                                                            return;
+                                                                        }
+                                                                        if (submittedCountForRow === 0 && Number(row.completed || 0) > 0) {
+                                                                            try {
+                                                                                await Storage.fetchAndMergeWorkerTasks(row.userId);
+                                                                                onRefresh?.();
+                                                                                const tasksNow = Storage.getTasks();
+                                                                                const names = projectFolderNamesForRow;
+                                                                                const inProject = (t: Task) =>
+                                                                                    t.assignedWorker === row.userId &&
+                                                                                    (names.includes(t.folder) ||
+                                                                                        (t.sourceType === 'vlm-review' && vlmSfSet.has(String(t.sourceFile || ''))));
+                                                                                const inProjectList = tasksNow.filter(inProject).sort((a, b) =>
+                                                                                    isVlmProject ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true })
+                                                                                );
+                                                                                const first = inProjectList.find(t => t.status === TaskStatus.SUBMITTED)
+                                                                                    || inProjectList.find(t => t.status === TaskStatus.APPROVED)
+                                                                                    || inProjectList[0];
+                                                                                if (first) onSelectTask(first.id, reviewScopeOpts);
+                                                                                else alert('검수 대기 건이 없습니다.');
+                                                                            } catch (_e) {
+                                                                                alert('해당 작업자 작업을 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.');
+                                                                            }
+                                                                            return;
+                                                                        }
+                                                                        alert('검수 대기 건이 없습니다. 새로고침 후 다시 시도해 주세요.');
+                                                                        return;
+                                                                    }
                                                                     if (firstSubmittedForRow) {
-                                                                        onSelectTask(firstSubmittedForRow.id);
+                                                                        onSelectTask(firstSubmittedForRow.id, reviewScopeOpts);
                                                                         return;
                                                                     }
                                                                     if (submittedCountForRow === 0 && targetTasksForRow.length > 0) {
                                                                         const next = orderedForRow.find(t => t.status === TaskStatus.APPROVED) || orderedForRow[0];
-                                                                        if (next) onSelectTask(next.id);
+                                                                        if (next) onSelectTask(next.id, reviewScopeOpts);
                                                                         return;
                                                                     }
                                                                     if (submittedCountForRow === 0 && Number(row.completed || 0) > 0) {
@@ -3806,17 +5710,14 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                                             await Storage.fetchAndMergeWorkerTasks(row.userId);
                                                                             onRefresh?.();
                                                                             const tasksNow = Storage.getTasks();
-                                                                            const names = (project.workflowSourceType === 'vlm-review' && project.vlmSourceFile)
-                                                                                ? (folders.length > 0 ? folders.map(f => f.folder) : [project.vlmSourceFile, `VLM_${(project.vlmSourceFile || '').replace(/\.json$/i, '')}`].filter(Boolean))
-                                                                                : folders.map(f => f.folder);
+                                                                            const names = folders.map(f => f.folder);
                                                                             const inProject = (t: Task) =>
-                                                                                t.assignedWorker === row.userId &&
-                                                                                (names.includes(t.folder) || (t.sourceType === 'vlm-review' && project.vlmSourceFile && t.sourceFile === project.vlmSourceFile));
-                                                                            const inProjectList = tasksNow.filter(inProject).sort((a, b) => a.id.localeCompare(b.id));
+                                                                                t.assignedWorker === row.userId && names.includes(t.folder);
+                                                                            const inProjectList = tasksNow.filter(inProject).sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
                                                                             const first = inProjectList.find(t => t.status === TaskStatus.SUBMITTED)
                                                                                 || inProjectList.find(t => t.status === TaskStatus.APPROVED)
                                                                                 || inProjectList[0];
-                                                                            if (first) onSelectTask(first.id);
+                                                                            if (first) onSelectTask(first.id, reviewScopeOpts);
                                                                             else alert('검수 대기 건이 없습니다.');
                                                                         } catch (_e) {
                                                                             alert('해당 작업자 작업을 불러오지 못했습니다. 새로고침 후 다시 시도해 주세요.');
@@ -3826,7 +5727,9 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                                     if (submittedCountForRow === 0) {
                                                                         alert('검수 대기 건이 없습니다. 새로고침 후 다시 시도해 주세요.');
                                                                     } else {
-                                                                        onSelectTask(firstSubmittedForRow!.id);
+                                                                        const fs = firstSubmittedForRow || orderedForRow.find(t => t.status === TaskStatus.SUBMITTED);
+                                                                        if (fs) onSelectTask(fs.id, reviewScopeOpts);
+                                                                        else alert('검수 대기 건이 표시되었으나 태스크를 찾지 못했습니다. 새로고침 후 다시 시도해 주세요.');
                                                                     }
                                                                 }}
                                                                 className="px-3 py-1.5 rounded-lg text-xs font-bold border transition-all bg-amber-900/30 text-amber-300 border-amber-700/50 hover:bg-amber-800/50 hover:border-amber-600 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -3854,26 +5757,72 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                             </div>
 
                             <div className="bg-slate-900/40 backdrop-blur-xl border border-white/5 rounded-3xl overflow-hidden shadow-[0_8px_30px_rgb(0,0,0,0.4)]">
-                                <div className="px-6 py-4 border-b border-white/5 bg-slate-900/60 text-sm font-bold text-slate-200">폴더 진행 현황</div>
+                                <div className="px-6 py-4 border-b border-white/5 bg-slate-900/60 flex flex-wrap items-center justify-between gap-3">
+                                    <div>
+                                        <span className="text-sm font-bold text-slate-200">
+                                            {isVlmProjectDetail ? '폴더 진행 현황' : '매핑 폴더 · 배정 현황'}
+                                        </span>
+                                        {!isVlmProjectDetail && (
+                                            <p className="text-[11px] text-slate-500 mt-1 max-w-xl">
+                                                한 폴더에 여러 작업자가 나뉘어 있을 수 있어, 폴더당 <span className="text-slate-400">미배정/배정</span>은 DB 행 기준입니다. (작업자별 합계는 왼쪽 표를 보세요.)
+                                            </p>
+                                        )}
+                                    </div>
+                                    {isVlmProjectDetail && (
+                                        <label className="flex items-center gap-2 text-xs text-slate-400 shrink-0">
+                                            <span className="whitespace-nowrap font-semibold">작업자 필터</span>
+                                            <select
+                                                value={folderWorkerFilter}
+                                                onChange={(e) => setFolderWorkerFilter(e.target.value)}
+                                                className="bg-slate-950 border border-slate-600 rounded-lg pl-3 pr-8 py-2 text-sm text-slate-100 outline-none focus:border-cyan-500 min-w-[10.5rem]"
+                                                title="표시할 폴더를 작업자로 한정합니다"
+                                            >
+                                                <option value="ALL">전체</option>
+                                                {folderWorkerOptions.map((name) => (
+                                                    <option key={name} value={name}>{name}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                    )}
+                                </div>
                                 <div className="overflow-auto">
-                                    <table className="w-full text-left">
+                                    <table className="w-full text-left table-fixed">
+                                        <colgroup>
+                                            {folderTableWidths.map((w, i) => (
+                                                <col key={i} style={{ width: w, minWidth: 48 }} />
+                                            ))}
+                                        </colgroup>
                                         <thead className="bg-slate-900/80 text-slate-400 text-[11px] font-bold uppercase tracking-wider border-b border-white/5">
                                             <tr>
-                                                <th className="px-6 py-4">폴더</th>
-                                                <th className="px-6 py-4">작업자</th>
-                                                <th className="px-6 py-4">완료 / 전체</th>
-                                                <th className="px-6 py-4">진행률</th>
-                                                <th className="px-6 py-4">검수 진행</th>
-                                                {onSyncFolders && <th className="px-6 py-4 w-20">동기화</th>}
+                                                {(isVlmProjectDetail
+                                                    ? (['폴더', '작업자', '완료 / 전체', '진행률', '검수 진행', '배정 해제'] as const)
+                                                    : (['폴더', '미배정 / 배정됨', '완료 / 전체', '진행률', '검수 진행', '배정 해제'] as const)
+                                                ).map((label, i) => (
+                                                    <th
+                                                        key={`${label}-${i}`}
+                                                        className={`relative py-4 align-bottom whitespace-nowrap ${i === 0 ? 'pl-6 pr-2 min-w-0' : 'px-4'} ${i === 1 && isVlmProjectDetail ? 'text-left' : ''}`}
+                                                        style={{ width: folderTableWidths[i] }}
+                                                    >
+                                                        <span className={i === 0 ? 'block truncate pr-1' : undefined}>{label}</span>
+                                                        <button
+                                                            type="button"
+                                                            aria-label={`${label} 열 너비 조절`}
+                                                            title="드래그하여 너비 조절"
+                                                            onPointerDown={(e) => onFolderTableColResizeStart(i, e)}
+                                                            className="absolute right-0 top-0 z-20 h-full w-2 max-w-[8px] cursor-col-resize border-0 bg-transparent p-0 hover:bg-cyan-500/35 active:bg-cyan-500/55"
+                                                        />
+                                                    </th>
+                                                ))}
                                             </tr>
                                         </thead>
                                         <tbody className="divide-y divide-white/5">
                                             {(() => {
                                                 const groups = groupByTopLevel(filteredFolders, (r) => r.folder);
+                                                const colSpan = 6;
                                                 if (filteredFolders.length === 0) {
                                                     return (
                                                         <tr>
-                                                            <td colSpan={onSyncFolders ? 6 : 5} className="px-6 py-10 text-center">
+                                                            <td colSpan={colSpan} className="px-6 py-10 text-center">
                                                                 {folders.length > 0 ? (
                                                                     <span className="text-slate-500 italic">선택한 작업자에 해당하는 폴더가 없습니다.</span>
                                                                 ) : (
@@ -3892,7 +5841,7 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                 }
                                                 return groups.flatMap(({ groupName, items }) => [
                                                     <tr key={`group-${groupName}`} className="bg-slate-700/70 border-t border-b border-cyan-500/30">
-                                                        <td colSpan={onSyncFolders ? 6 : 5} className="px-6 py-3 text-base font-bold text-cyan-200 border-l-4 border-cyan-500 bg-slate-800/90">
+                                                        <td colSpan={colSpan} className="px-6 py-3 text-base font-bold text-cyan-200 border-l-4 border-cyan-500 bg-slate-800/90">
                                                             {groupName}
                                                         </td>
                                                     </tr>,
@@ -3908,69 +5857,111 @@ const ProjectDetailView: React.FC<{ projectId: string; role: string; onBack: () 
                                                         const reviewProgress = reviewTarget > 0
                                                             ? Math.round((reviewDone / reviewTarget) * 100)
                                                             : 0;
+                                                        const un = Number(row.unassignedTaskCount ?? row.taskCount ?? 0);
+                                                        const as = Number(row.assignedTaskCount ?? Math.max(0, Number(row.taskCount || 0) - un));
+                                                        const reviewCell = (
+                                                            <>
+                                                                {reviewTarget > 0 ? (
+                                                                    <div className="flex flex-col gap-1.5 min-w-0 max-w-full">
+                                                                        <div className="flex justify-between items-center text-[10px] font-bold">
+                                                                            <span className="text-slate-400">Review</span>
+                                                                            <span className="text-violet-400">{reviewProgress}%</span>
+                                                                        </div>
+                                                                        <div className="h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner relative">
+                                                                            <div className="absolute inset-y-0 left-0 bg-violet-500 shadow-[0_0_8px_rgba(139,92,246,0.4)]" style={{ width: `${reviewProgress}%` }} />
+                                                                        </div>
+                                                                        <div className="flex gap-2 text-[9px] font-black uppercase tracking-tighter opacity-70 group-hover:opacity-100 transition-opacity">
+                                                                            <span className="text-lime-400">OK {approvedCount}</span>
+                                                                            <span className="text-rose-400">RE {rejectedCount}</span>
+                                                                            <span className="text-amber-400">WAIT {submittedCount}</span>
+                                                                        </div>
+                                                                    </div>
+                                                                ) : (
+                                                                    <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest italic">No Review</span>
+                                                                )}
+                                                            </>
+                                                        );
+                                                        const unassignCell = (
+                                                            <button
+                                                                type="button"
+                                                                disabled={isArchived || unassigningFolder !== null}
+                                                                onClick={() => void handleUnassignFolderRow(row.folder)}
+                                                                className="px-2 py-1.5 rounded text-[11px] font-bold border border-rose-700/50 bg-rose-950/40 text-rose-200 hover:bg-rose-900/50 hover:border-rose-600 disabled:opacity-40 disabled:cursor-not-allowed"
+                                                                title="프로젝트 맵·project_id 및 작업자 맵·assignedWorker 해제"
+                                                            >
+                                                                {unassigningFolder === row.folder ? '처리 중…' : '배정 해제'}
+                                                            </button>
+                                                        );
+                                                        if (!isVlmProjectDetail) {
+                                                            return (
+                                                                <tr key={row.folder} className="hover:bg-slate-800/40 transition-colors group">
+                                                                    <td className="px-6 py-4 min-w-0 align-top">
+                                                                        <button
+                                                                            type="button"
+                                                                            onClick={() => onOpenFolder(row.folder, project?.workflowSourceType)}
+                                                                            className="text-left w-full max-w-full text-slate-200 font-bold text-sm hover:text-cyan-300 hover:underline underline-offset-4 transition-all tracking-tight truncate block"
+                                                                            title={`${row.folder} 열기`}
+                                                                        >
+                                                                            {row.folder}
+                                                                        </button>
+                                                                    </td>
+                                                                    <td className="px-4 py-4 align-top whitespace-nowrap">
+                                                                        <div className="flex items-baseline gap-1">
+                                                                            <span className="text-amber-200/90 font-bold font-mono text-sm">{un.toLocaleString()}</span>
+                                                                            <span className="text-slate-500 font-mono text-xs">/ </span>
+                                                                            <span className="text-sky-300 font-mono text-xs">{as.toLocaleString()}</span>
+                                                                        </div>
+                                                                    </td>
+                                                                    <td className="px-4 py-4 align-top whitespace-nowrap">
+                                                                        <div className="flex items-baseline gap-1">
+                                                                            <span className="text-slate-200 font-bold font-mono text-sm">{Number(row.completedCount || 0).toLocaleString()}</span>
+                                                                            <span className="text-slate-500 font-mono text-xs">/ {Number(row.taskCount || 0).toLocaleString()}</span>
+                                                                        </div>
+                                                                    </td>
+                                                                    <td className="px-4 py-4 align-top whitespace-nowrap">
+                                                                        <div className="flex items-center gap-2 min-w-0">
+                                                                            <div className="flex-1 min-w-0 h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                                                <div className="h-full bg-cyan-500 shadow-[0_0_8px_rgba(34,211,238,0.4)]" style={{ width: `${progress}%` }} />
+                                                                            </div>
+                                                                            <span className="text-cyan-400 font-mono text-xs font-bold shrink-0">{progress}%</span>
+                                                                        </div>
+                                                                    </td>
+                                                                    <td className="px-4 py-4 align-top">{reviewCell}</td>
+                                                                    <td className="px-4 py-4 align-top whitespace-nowrap">{unassignCell}</td>
+                                                                </tr>
+                                                            );
+                                                        }
                                                         return (
                                                             <tr key={row.folder} className="hover:bg-slate-800/40 transition-colors group">
-                                                                <td className="px-6 py-4">
+                                                                <td className="px-6 py-4 min-w-0 align-top">
                                                                     <button
+                                                                        type="button"
                                                                         onClick={() => onOpenFolder(row.folder, project?.workflowSourceType)}
-                                                                        className="text-slate-200 font-bold text-sm hover:text-cyan-300 hover:underline underline-offset-4 transition-all tracking-tight"
+                                                                        className="text-left w-full max-w-full text-slate-200 font-bold text-sm hover:text-cyan-300 hover:underline underline-offset-4 transition-all tracking-tight truncate block"
                                                                         title={`${row.folder} 열기`}
                                                                     >
                                                                         {row.folder}
                                                                     </button>
                                                                 </td>
-                                                                <td className="px-6 py-4">
+                                                                <td className="px-4 py-4 align-top whitespace-nowrap">
                                                                     <span className="text-slate-300 text-sm">{row.assignedWorker || 'Unassigned'}</span>
                                                                 </td>
-                                                                <td className="px-6 py-4">
+                                                                <td className="px-4 py-4 align-top whitespace-nowrap">
                                                                     <div className="flex items-baseline gap-1">
                                                                         <span className="text-slate-200 font-bold font-mono text-sm">{Number(row.completedCount || 0).toLocaleString()}</span>
                                                                         <span className="text-slate-500 font-mono text-xs">/ {Number(row.taskCount || 0).toLocaleString()}</span>
                                                                     </div>
                                                                 </td>
-                                                                <td className="px-6 py-4">
-                                                                    <div className="flex items-center gap-3 min-w-[100px]">
-                                                                        <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                                <td className="px-4 py-4 align-top whitespace-nowrap">
+                                                                    <div className="flex items-center gap-2 min-w-0">
+                                                                        <div className="flex-1 min-w-0 h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner">
                                                                             <div className="h-full bg-cyan-500 shadow-[0_0_8px_rgba(34,211,238,0.4)]" style={{ width: `${progress}%` }} />
                                                                         </div>
-                                                                        <span className="text-cyan-400 font-mono text-xs font-bold">{progress}%</span>
+                                                                        <span className="text-cyan-400 font-mono text-xs font-bold shrink-0">{progress}%</span>
                                                                     </div>
                                                                 </td>
-                                                                <td className="px-6 py-4">
-                                                                    {reviewTarget > 0 ? (
-                                                                        <div className="flex flex-col gap-1.5 min-w-[140px]">
-                                                                            <div className="flex justify-between items-center text-[10px] font-bold">
-                                                                                <span className="text-slate-400">Review</span>
-                                                                                <span className="text-violet-400">{reviewProgress}%</span>
-                                                                            </div>
-                                                                            <div className="h-1.5 bg-slate-950 rounded-full overflow-hidden shadow-inner relative">
-                                                                                <div className="absolute inset-y-0 left-0 bg-violet-500 shadow-[0_0_8px_rgba(139,92,246,0.4)]" style={{ width: `${reviewProgress}%` }} />
-                                                                            </div>
-                                                                            <div className="flex gap-2 text-[9px] font-black uppercase tracking-tighter opacity-70 group-hover:opacity-100 transition-opacity">
-                                                                                <span className="text-lime-400">OK {approvedCount}</span>
-                                                                                <span className="text-rose-400">RE {rejectedCount}</span>
-                                                                                <span className="text-amber-400">WAIT {submittedCount}</span>
-                                                                            </div>
-                                                                        </div>
-                                                                            ) : (
-                                                                        <span className="text-[10px] text-slate-500 font-bold uppercase tracking-widest italic">No Review</span>
-                                                                    )}
-                                                                </td>
-                                                                {onSyncFolders && (
-                                                                    <td className="px-6 py-4">
-                                                                        <button
-                                                                            type="button"
-                                                                            onClick={() => {
-                                                                                const ok = window.confirm(`"${row.folder}" 폴더만 디스크와 동기화할까요?`);
-                                                                                if (ok) onSyncFolders([row.folder]);
-                                                                            }}
-                                                                            className="px-2 py-1 rounded text-xs font-bold border border-slate-600 bg-slate-800 text-slate-300 hover:bg-slate-700 hover:border-slate-500"
-                                                                            title="이 폴더만 동기화"
-                                                                        >
-                                                                            Sync
-                                                                        </button>
-                                                                    </td>
-                                                                )}
+                                                                <td className="px-4 py-4 align-top">{reviewCell}</td>
+                                                                <td className="px-4 py-4 align-top whitespace-nowrap">{unassignCell}</td>
                                                             </tr>
                                                         );
                                                     })
@@ -4005,7 +5996,7 @@ const NoticeEditor: React.FC<{ initialContent: string; onSave: (content: string)
                 reader.onload = async () => {
                     const base64Content = reader.result as string;
                     try {
-                        const response = await fetch('/api/upload-image', {
+                        const response = await fetch(apiUrl('/api/upload-image'), {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
                             body: JSON.stringify({ fileName: file.name, content: base64Content })
@@ -4112,7 +6103,27 @@ const NoticeHomeView: React.FC<{ notice: string; onStart: () => void }> = ({ not
     );
 };
 
-const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, onRefresh, onSync, onSyncProject, onSyncFolders, onLightRefresh, tasks, username, token, openIssueRequestsSignal, openUserManagementSignal }) => {
+const Dashboard: React.FC<DashboardProps> = ({
+    role,
+    accountType,
+    onSelectTask,
+    onRefresh,
+    onSync,
+    onFullDiskSync,
+    onSyncProject,
+    onSyncFolders,
+    onAdoptFolders,
+    onLightRefresh,
+    onFolderPrepareLoading,
+    tasks,
+    username,
+    token,
+    openIssueRequestsSignal,
+    openUserManagementSignal,
+    workerOverviewRefreshKey = 0,
+    reviewerScopeWorker = null,
+    onClearReviewerScope
+}) => {
     const [workers, setWorkers] = useState<string[]>([]);
     const [workerProjectOverview, setWorkerProjectOverview] = useState<Storage.ProjectOverviewPayload | null>(null);
 
@@ -4126,7 +6137,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             }
         };
         fetchProjectOverview();
-    }, [accountType, tasks.length]);
+        /** tasks.length 제외: 작업 목록 변동마다 overview 재호출 → 서버 대기열·pending 폭주 방지 */
+    }, [accountType, workerOverviewRefreshKey]);
 
     const hiddenWorkerProjectIds = useMemo(() => {
         if (accountType === AccountType.ADMIN || !workerProjectOverview) return new Set<string>();
@@ -4141,7 +6153,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
     const isWorkerVisibleFolder = (folderName: string): boolean => {
         if (accountType === AccountType.ADMIN || !workerProjectOverview) return true;
-        const projectId = workerProjectOverview.projectMap?.[folderName]?.projectId;
+        const projectId = resolveProjectMapEntryForFolder(folderName, workerProjectOverview.projectMap || {})?.projectId;
         if (!projectId) return true;
         return !hiddenWorkerProjectIds.has(String(projectId));
     };
@@ -4172,7 +6184,62 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             lastUpdated?: number;
         }>();
 
-        const sourceTasks = role === UserRole.WORKER ? visibleTasks : tasks;
+        /** 작업자 Work List·폴더 요약: (folder,effectiveWorker) breakdown 우선 — 전체 폴더 한 줄과 슬라이더 불일치 방지 */
+        if (role === UserRole.WORKER && workerProjectOverview) {
+            const uid = String(username || '').trim();
+            const breakdown = workerProjectOverview.workerFolderBreakdown;
+            if (breakdown?.length) {
+                return breakdown
+                    .filter((row) => String(row.assignedWorker || '').trim() === uid && isWorkerVisibleFolder(row.folder))
+                    .map((row) => {
+                        const count = Math.max(0, Number(row.taskCount || 0));
+                        const completed = Math.max(0, Math.min(count, Number(row.completedCount || 0)));
+                        const rest = Math.max(0, count - completed);
+                        return {
+                            name: row.folder,
+                            count,
+                            completed,
+                            todo: rest,
+                            inProgress: 0,
+                            submitted: 0,
+                            approved: 0,
+                            rejected: 0,
+                            assignedWorker: row.assignedWorker,
+                            lastUpdated: row.lastUpdated
+                        };
+                    })
+                    .sort((a, b) => a.name.localeCompare(b.name));
+            }
+            if (workerProjectOverview.folders?.length) {
+                return workerProjectOverview.folders
+                    .filter((row) => String(row.assignedWorker || '').trim() === uid && isWorkerVisibleFolder(row.folder))
+                    .map((row) => {
+                        const count = Math.max(0, Number(row.taskCount || 0));
+                        const completed = Math.max(0, Math.min(count, Number(row.completedCount || 0)));
+                        const rest = Math.max(0, count - completed);
+                        return {
+                            name: row.folder,
+                            count,
+                            completed,
+                            todo: rest,
+                            inProgress: 0,
+                            submitted: 0,
+                            approved: 0,
+                            rejected: 0,
+                            assignedWorker: row.assignedWorker,
+                            lastUpdated: row.lastUpdated
+                        };
+                    })
+                    .sort((a, b) => a.name.localeCompare(b.name));
+            }
+        }
+
+        const sourceTasks =
+            role === UserRole.WORKER
+                ? visibleTasks
+                : role === UserRole.REVIEWER && reviewerScopeWorker
+                  ? tasks.filter((t) => String(t.assignedWorker || '').trim() === reviewerScopeWorker)
+                  : tasks;
         sourceTasks.forEach(t => {
             if (!map.has(t.folder)) {
                 map.set(t.folder, {
@@ -4205,7 +6272,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         });
 
         return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
-    }, [role, tasks, visibleTasks]);
+    }, [role, tasks, visibleTasks, workerProjectOverview, username, accountType, hiddenWorkerProjectIds, reviewerScopeWorker]);
 
     const assignedWorkListFolders = useMemo(() => {
         return folderOverviews
@@ -4214,10 +6281,18 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             .sort((a, b) => a.name.localeCompare(b.name));
     }, [folderOverviews, username, accountType, workerProjectOverview, hiddenWorkerProjectIds]);
 
+    const assignedWorkListGrouped = useMemo(
+        () => groupByTopLevel(assignedWorkListFolders, (f) => f.name),
+        [assignedWorkListFolders]
+    );
+
+    /** Work List 경로 그룹 접기(기본 접힘); 펼친 그룹 키만 보관 */
+    const [workListExpandedPathGroups, setWorkListExpandedPathGroups] = useState<Set<string>>(() => new Set());
+
     useEffect(() => {
         const fetchWorkers = async () => {
             try {
-                const res = await fetch('/api/users', {
+                const res = await fetch(apiUrl('/api/users'), {
                     headers: token ? { 'Authorization': `Bearer ${token}` } : {}
                 });
                 if (res.ok) {
@@ -4233,29 +6308,6 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         };
         fetchWorkers();
     }, [token]);
-
-    const [todayWorkTime, setTodayWorkTime] = useState(0);
-
-    useEffect(() => {
-        const fetchTodayStats = async () => {
-            const now = new Date();
-            const stats = await Storage.getDailyStats(now);
-            // Sum up work time from all users for today
-            const total = stats.reduce((acc: number, curr: any) => acc + (curr.workTime || 0), 0);
-            setTodayWorkTime(total);
-        };
-        fetchTodayStats();
-    }, []); // Run once on mount
-
-    const statsSourceTasks = role === UserRole.WORKER ? visibleTasks : tasks;
-    const globalStats = {
-        total: statsSourceTasks.length,
-        completed: statsSourceTasks.filter(t => t.status === TaskStatus.SUBMITTED || t.status === TaskStatus.APPROVED).length,
-        totalAnnotations: statsSourceTasks.reduce((acc, t) => acc + (t.annotations || []).length, 0),
-        totalTime: todayWorkTime
-    };
-
-
 
     const [selectedFolder, setSelectedFolder] = useState<string>(role === UserRole.WORKER ? NOTICE_HOME_VIEW : '');
     const [folderMeta, setFolderMeta] = useState<FolderMetadata>({ tags: [], memo: '' });
@@ -4274,6 +6326,17 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     const [folderReturnView, setFolderReturnView] = useState<string>('');
     const [activeProjectWorkflowSourceType, setActiveProjectWorkflowSourceType] = useState<'' | 'native-yolo' | 'vlm-review' | 'image-classification'>('');
     const [overviewRefreshKey, setOverviewRefreshKey] = useState(0);
+    /** 폴더 상세: 서버 페이지네이션 + folder-metrics */
+    const [folderPager, setFolderPager] = useState<{
+        folder: string;
+        sort: 'name' | 'id';
+        items: Task[];
+        total: number;
+        metrics: Storage.FolderMetricsPayload | null;
+        loading: boolean;
+        loadingMore: boolean;
+    } | null>(null);
+    const [continueWorkLoading, setContinueWorkLoading] = useState(false);
     const isProjectDetailView = selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX);
     const selectedProjectId = isProjectDetailView ? selectedFolder.substring(PROJECT_DETAIL_VIEW_PREFIX.length) : '';
 
@@ -4290,7 +6353,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             SCHEDULE_VIEW,
             ISSUE_REQUEST_VIEW,
             PROJECT_OVERVIEW_VIEW,
-            DATA_IMPORT_EXPORT_VIEW
+            DATA_IMPORT_EXPORT_VIEW,
+            REVIEW_QUEUE_VIEW
         ]);
         if (nonFolderViews.has(selectedFolder) || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX)) return;
         if (!isWorkerVisibleFolder(selectedFolder)) {
@@ -4301,7 +6365,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     useEffect(() => {
         const fetchNotice = async () => {
             try {
-                const res = await fetch('/api/label?path=datasets/_notice.txt');
+                const res = await fetch(apiUrl('/api/label?path=datasets/_notice.txt'));
                 if (res.ok) {
                     const text = await res.text();
                     setNoticeContent(text);
@@ -4315,7 +6379,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
     const handleSaveNotice = async (content: string) => {
         try {
-            await fetch('/api/save', {
+            await fetch(apiUrl('/api/save'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -4353,7 +6417,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             WEEKLY_REPORT_VIEW,
             DAILY_REPORT_VIEW,
             SCHEDULE_VIEW,
-            ISSUE_REQUEST_VIEW
+            ISSUE_REQUEST_VIEW,
+            REVIEW_QUEUE_VIEW
         ]);
         if (selectedFolder && (nonFolderViews.has(selectedFolder) || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX))) {
             setFolderReturnView('');
@@ -4373,6 +6438,11 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         }
     }, [accountType, openUserManagementSignal]);
 
+    useEffect(() => {
+        if (role === UserRole.WORKER && selectedFolder === REVIEW_QUEUE_VIEW) {
+            setSelectedFolder(PROJECT_OVERVIEW_VIEW);
+        }
+    }, [role, selectedFolder]);
 
     useEffect(() => {
         const handleFolderEntry = async () => {
@@ -4386,7 +6456,8 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                 WEEKLY_REPORT_VIEW,
                 DAILY_REPORT_VIEW,
                 SCHEDULE_VIEW,
-                ISSUE_REQUEST_VIEW
+                ISSUE_REQUEST_VIEW,
+                REVIEW_QUEUE_VIEW
             ]);
             if (selectedFolder && !nonFolderViews.has(selectedFolder) && !selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX)) {
                 const meta = Storage.getFolderMetadata(selectedFolder);
@@ -4398,6 +6469,82 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         };
         handleFolderEntry();
     }, [selectedFolder]);
+
+    /** 실제 datasets 폴더 선택 시: 서버 folder-metrics + 페이지 단위 목록(캐시 머지) */
+    const folderHydrateSeqRef = useRef(0);
+    useEffect(() => {
+        const nonFolderViews = new Set([
+            DASHBOARD_HOME_VIEW,
+            WORK_LIST_VIEW,
+            DATA_IMPORT_EXPORT_VIEW,
+            PROJECT_OVERVIEW_VIEW,
+            USER_MANAGEMENT_VIEW,
+            WORKER_REPORT_VIEW,
+            WEEKLY_REPORT_VIEW,
+            DAILY_REPORT_VIEW,
+            SCHEDULE_VIEW,
+            ISSUE_REQUEST_VIEW,
+            NOTICE_HOME_VIEW,
+            REVIEW_QUEUE_VIEW
+        ]);
+        if (!selectedFolder || nonFolderViews.has(selectedFolder) || selectedFolder.startsWith(PROJECT_DETAIL_VIEW_PREFIX)) {
+            setFolderPager(null);
+            return;
+        }
+        const seq = ++folderHydrateSeqRef.current;
+        let loadingShown = false;
+        if (onFolderPrepareLoading) {
+            onFolderPrepareLoading(true);
+            loadingShown = true;
+        }
+        void (async () => {
+            try {
+                setFolderPager({
+                    folder: selectedFolder,
+                    sort: 'name',
+                    items: [],
+                    total: 0,
+                    metrics: null,
+                    loading: true,
+                    loadingMore: false
+                });
+                const [metrics, peek, count] = await Promise.all([
+                    Storage.fetchFolderMetricsFromServer(selectedFolder),
+                    Storage.peekFolderFirstTaskRemote(selectedFolder),
+                    Storage.getFolderTaskCountFromServer(selectedFolder)
+                ]);
+                if (seq !== folderHydrateSeqRef.current) return;
+                const sort: 'name' | 'id' = peek?.sourceType === 'vlm-review' ? 'id' : 'name';
+                const page = await Storage.fetchFolderTaskPageIntoCache(
+                    selectedFolder,
+                    0,
+                    Storage.FOLDER_TASK_LIST_PAGE_SIZE,
+                    sort
+                );
+                if (seq !== folderHydrateSeqRef.current) return;
+                onRefresh();
+                const total = count ?? metrics?.total ?? page.length;
+                setFolderPager({
+                    folder: selectedFolder,
+                    sort,
+                    items: page,
+                    total,
+                    metrics,
+                    loading: false,
+                    loadingMore: false
+                });
+            } catch (e) {
+                console.error('Folder task hydrate failed', e);
+                if (seq === folderHydrateSeqRef.current) {
+                    setFolderPager(null);
+                }
+            } finally {
+                if (loadingShown && seq === folderHydrateSeqRef.current) {
+                    onFolderPrepareLoading?.(false);
+                }
+            }
+        })();
+    }, [selectedFolder, onRefresh, onFolderPrepareLoading]);
 
     const handleSaveMeta = async () => {
         Storage.saveFolderMetadata(selectedFolder, tempMeta);
@@ -4426,30 +6573,189 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     const tasksInFolder = useMemo(() => {
         if (!selectedFolder) return [];
 
-        const useProjectWorkflowFilter = Boolean(folderReturnView && activeProjectWorkflowSourceType);
-        const allInFolder = visibleTasks.filter((t) => t.folder === selectedFolder);
-        const isVlmFolder = allInFolder.length > 0 && allInFolder.some((t) => t.sourceType === 'vlm-review');
-        const sortBy = (a: { id: string; name: string }, b: { id: string; name: string }) =>
-            isVlmFolder ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true });
-        if (!useProjectWorkflowFilter) {
-            return allInFolder.sort(sortBy);
+        const applyWorkflowFilterAndSort = (base: Task[]): Task[] => {
+            const useProjectWorkflowFilter = Boolean(folderReturnView && activeProjectWorkflowSourceType);
+            const isVlmFolder = base.length > 0 && base.some((t) => t.sourceType === 'vlm-review');
+            const sortBy = (a: { id: string; name: string }, b: { id: string; name: string }) =>
+                isVlmFolder ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true });
+            if (!useProjectWorkflowFilter) {
+                return [...base].sort(sortBy);
+            }
+            const filtered = base.filter((t) => {
+                const sourceType =
+                    t.sourceType === 'vlm-review'
+                        ? 'vlm-review'
+                        : t.sourceType === 'image-classification'
+                          ? 'image-classification'
+                          : 'native-yolo';
+                return sourceType === activeProjectWorkflowSourceType;
+            });
+            const effective = filtered.length > 0 ? filtered : base;
+            return [...effective].sort(sortBy);
+        };
+
+        let out: Task[];
+        if (folderPager && folderPager.folder === selectedFolder) {
+            if (!folderPager.loading && folderPager.items.length >= 0) {
+                out = applyWorkflowFilterAndSort(folderPager.items);
+            } else {
+                const fallback = visibleTasks.filter((t) => t.folder === selectedFolder);
+                out = applyWorkflowFilterAndSort(fallback);
+            }
+        } else {
+            const allInFolder = visibleTasks.filter((t) => t.folder === selectedFolder);
+            out = applyWorkflowFilterAndSort(allInFolder);
         }
-        const filtered = allInFolder.filter((t) => {
-            const sourceType = t.sourceType === 'vlm-review' ? 'vlm-review' : 'native-yolo';
-            return sourceType === activeProjectWorkflowSourceType;
-        });
-        const effective = filtered.length > 0 ? filtered : allInFolder;
-        return effective.sort(sortBy);
-    }, [visibleTasks, selectedFolder, activeProjectWorkflowSourceType, folderReturnView, workerProjectOverview]);
+        if (role === UserRole.REVIEWER && reviewerScopeWorker) {
+            return out.filter((t) => String(t.assignedWorker || '').trim() === reviewerScopeWorker);
+        }
+        return out;
+    }, [visibleTasks, selectedFolder, activeProjectWorkflowSourceType, folderReturnView, workerProjectOverview, folderPager, role, reviewerScopeWorker]);
+
+    /** 작업 이어하기: 폴더 전체 페이지를 캐시에 받은 뒤 미완료 태스크 검색(첫 페이지만 보던 버그 방지) */
+    const handleContinueWorkInFolder = useCallback(
+        async (mode: 'todo-only' | 'pending-worker') => {
+            const folder = String(selectedFolder || '').trim();
+            if (!folder) return;
+
+            let sort: 'name' | 'id' | 'updated' =
+                folderPager?.folder === folder ? folderPager.sort : 'name';
+            let totalHint: number | null =
+                folderPager?.folder === folder ? folderPager.total ?? null : null;
+
+            try {
+                setContinueWorkLoading(true);
+                onFolderPrepareLoading?.(true);
+
+                if (!folderPager || folderPager.folder !== folder) {
+                    const peek = await Storage.peekFolderFirstTaskRemote(folder);
+                    sort = peek?.sourceType === 'vlm-review' ? 'id' : 'name';
+                    totalHint = await Storage.getFolderTaskCountFromServer(folder);
+                }
+
+                await Storage.fetchAllFolderPagesIntoCache(folder, sort, totalHint);
+                onRefresh();
+
+                const allTasks = Storage.getTasks();
+                const raw = allTasks.filter((t) => t.folder === folder);
+                let base: Task[];
+                if (role === UserRole.WORKER) {
+                    base = raw.filter(
+                        (t) =>
+                            t.assignedWorker === username &&
+                            t.status !== TaskStatus.APPROVED &&
+                            isWorkerVisibleFolder(t.folder)
+                    );
+                } else if (role === UserRole.REVIEWER && reviewerScopeWorker) {
+                    base = raw.filter((t) => String(t.assignedWorker || '').trim() === reviewerScopeWorker);
+                } else {
+                    base = raw;
+                }
+
+                const useProjectWorkflowFilter = Boolean(folderReturnView && activeProjectWorkflowSourceType);
+                const isVlmFolder = base.length > 0 && base.some((t) => t.sourceType === 'vlm-review');
+                const sortBy = (a: { id: string; name: string }, b: { id: string; name: string }) =>
+                    isVlmFolder ? a.id.localeCompare(b.id) : a.name.localeCompare(b.name, undefined, { numeric: true });
+
+                let folderTasks: Task[];
+                if (!useProjectWorkflowFilter) {
+                    folderTasks = [...base].sort(sortBy);
+                } else {
+                    const filtered = base.filter((t) => {
+                        const sourceType =
+                            t.sourceType === 'vlm-review'
+                                ? 'vlm-review'
+                                : t.sourceType === 'image-classification'
+                                  ? 'image-classification'
+                                  : 'native-yolo';
+                        return sourceType === activeProjectWorkflowSourceType;
+                    });
+                    const effective = filtered.length > 0 ? filtered : base;
+                    folderTasks = [...effective].sort(sortBy);
+                }
+
+                setFolderPager((p) => {
+                    if (!p || p.folder !== folder) return p;
+                    return {
+                        ...p,
+                        items: folderTasks,
+                        total: folderTasks.length,
+                        loading: false,
+                        loadingMore: false,
+                        sort: sort === 'updated' ? p.sort : (sort as 'name' | 'id')
+                    };
+                });
+
+                if (mode === 'todo-only') {
+                    const first = folderTasks.find((t) => t.status === TaskStatus.TODO);
+                    if (first) onSelectTask(first.id);
+                    else alert('이 폴더에서 TODO 상태 작업을 찾지 못했습니다.');
+                    return;
+                }
+
+                const firstPending = folderTasks.find(
+                    (t) =>
+                        t.status === TaskStatus.TODO ||
+                        t.status === TaskStatus.IN_PROGRESS ||
+                        t.status === TaskStatus.REJECTED
+                );
+                if (firstPending) onSelectTask(firstPending.id);
+                else alert('이 폴더에서 진행할 작업(TODO/진행중/반려)을 찾지 못했습니다.');
+            } catch (e) {
+                console.error('Continue work / full folder load failed', e);
+                alert('폴더 작업 목록을 불러오지 못했습니다. 네트워크 또는 서버를 확인해 주세요.');
+            } finally {
+                onFolderPrepareLoading?.(false);
+                setContinueWorkLoading(false);
+            }
+        },
+        [
+            selectedFolder,
+            folderPager,
+            role,
+            username,
+            folderReturnView,
+            activeProjectWorkflowSourceType,
+            onRefresh,
+            onSelectTask,
+            onFolderPrepareLoading,
+            isWorkerVisibleFolder,
+            reviewerScopeWorker
+        ]
+    );
 
     const activeFolderStats = useMemo(() => {
         if (!selectedFolder) return null;
-        return folderOverviews.find(f => f.name === selectedFolder);
-    }, [folderOverviews, selectedFolder, tasksInFolder]);
+        const ov = folderOverviews.find(f => f.name === selectedFolder);
+        const reviewerScoped = role === UserRole.REVIEWER && Boolean(reviewerScopeWorker);
+        /** 서버 metrics는 폴더 전체 — 검수자·특정 작업자 범위일 때는 캐시 집계(ov·태스크)만 사용 */
+        if (!reviewerScoped && folderPager && folderPager.folder === selectedFolder && folderPager.metrics) {
+            const m = folderPager.metrics;
+            return {
+                name: selectedFolder,
+                count: m.total,
+                completed: m.completed,
+                todo: m.todo,
+                inProgress: m.inProgress,
+                submitted: m.submitted,
+                approved: m.approved,
+                rejected: m.rejected,
+                assignedWorker: ov?.assignedWorker,
+                lastUpdated: ov?.lastUpdated
+            };
+        }
+        return ov ?? null;
+    }, [folderOverviews, selectedFolder, folderPager, role, reviewerScopeWorker]);
 
     const activeFolderDetails = useMemo(() => {
         if (!selectedFolder) return null;
-        const allInFolder = tasks.filter(t => t.folder === selectedFolder);
+        if (folderPager && folderPager.folder === selectedFolder && folderPager.metrics) {
+            return { modifiedCount: folderPager.metrics.modifiedCount, classCount: 0 };
+        }
+        let allInFolder = tasks.filter(t => t.folder === selectedFolder);
+        if (role === UserRole.REVIEWER && reviewerScopeWorker) {
+            allInFolder = allInFolder.filter((t) => String(t.assignedWorker || '').trim() === reviewerScopeWorker);
+        }
         const modifiedCount = allInFolder.filter(t => t.isModified).length;
         const uniqueClasses = new Set<number>();
         allInFolder.forEach(t => {
@@ -4458,27 +6764,51 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
             }
         });
         return { modifiedCount, classCount: uniqueClasses.size };
-    }, [tasks, selectedFolder]);
+    }, [tasks, selectedFolder, folderPager, role, reviewerScopeWorker]);
 
-    const displayLimit = 10;
-    const renderedTasks = tasksInFolder.slice(0, displayLimit);
+    const renderedTasks = tasksInFolder;
     const representativeTask = tasksInFolder.length > 0 ? tasksInFolder[0] : null;
 
-    const formatTime = (seconds: number) => {
-        const h = Math.floor(seconds / 3600);
-        const m = Math.floor((seconds % 3600) / 60);
-        return `${h}h ${m}m`;
+    const handleLoadMoreFolderTasks = async () => {
+        if (!folderPager || folderPager.folder !== selectedFolder || folderPager.loadingMore || folderPager.loading) return;
+        if (folderPager.items.length >= folderPager.total) return;
+        const sort = folderPager.sort;
+        const offset = folderPager.items.length;
+        setFolderPager((p) => (p && p.folder === selectedFolder ? { ...p, loadingMore: true } : p));
+        try {
+            const next = await Storage.fetchFolderTaskPageIntoCache(selectedFolder, offset, Storage.FOLDER_TASK_LIST_PAGE_SIZE, sort);
+            onRefresh();
+            setFolderPager((p) => {
+                if (!p || p.folder !== selectedFolder) return p;
+                return { ...p, items: [...p.items, ...next], loadingMore: false };
+            });
+        } catch (e) {
+            console.error('Load more folder tasks failed', e);
+            setFolderPager((p) => (p && p.folder === selectedFolder ? { ...p, loadingMore: false } : p));
+        }
     };
 
+    /** DB·캐시만 갱신 (디스크 스캔 없음) */
     const handleSync = async () => {
-        const confirmed = window.confirm('데이터를 서버 상태로 동기화할까요? 진행 중인 변경사항이 있으면 최신 상태로 다시 불러옵니다.');
-        if (!confirmed) return;
         setIsSyncing(true);
         try {
             await onSync();
         } catch (e) {
             console.error(e);
-            alert("Sync failed");
+            alert('새로고침에 실패했습니다.');
+        } finally {
+            setIsSyncing(false);
+        }
+    };
+
+    const handleFullDiskSyncClick = async () => {
+        if (!onFullDiskSync) return;
+        setIsSyncing(true);
+        try {
+            await onFullDiskSync();
+        } catch (e) {
+            console.error(e);
+            alert('전체 디스크 스캔에 실패했습니다.');
         } finally {
             setIsSyncing(false);
         }
@@ -4512,29 +6842,9 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
     return (
         <div className="w-full h-full flex flex-col bg-slate-950 p-6 overflow-hidden">
 
-            {/* --- Top Status Card --- */}
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 mb-6 shadow-md flex flex-wrap gap-8 items-center justify-between shrink-0">
-                <div className="flex gap-10">
-                    <div>
-                        <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Total Progress</p>
-                        <div className="flex items-baseline gap-2">
-                            <span className="text-2xl font-bold text-white">{globalStats.completed}</span>
-                            <span className="text-lg text-slate-600 font-medium">/ {globalStats.total}</span>
-                        </div>
-                    </div>
-                    <div className="w-px bg-slate-800 h-10 self-center"></div>
-                    <div>
-                        <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Total Tasks</p>
-                        <p className="text-2xl font-bold text-sky-500">{globalStats.total}</p>
-                    </div>
-                    <div className="w-px bg-slate-800 h-10 self-center"></div>
-                    <div>
-                        <p className="text-slate-500 text-xs font-bold uppercase tracking-wider mb-1">Today's Time</p>
-                        <p className="text-2xl font-bold text-lime-500">{formatTime(globalStats.totalTime)}</p>
-                    </div>
-                </div>
-
-                <div className="flex gap-3">
+            {/* --- 상단 액션 (Total Progress/Tasks/Time 제거: 전량 datasets 로드 유발) --- */}
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 mb-6 shadow-md flex flex-wrap gap-8 items-center justify-end shrink-0">
+                <div className="flex gap-3 flex-wrap justify-end">
                     {accountType === AccountType.ADMIN && (
                         <>
                             <button
@@ -4556,19 +6866,30 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                             <button
                                 onClick={handleSync}
                                 disabled={isSyncing || isLightRefreshing}
-                                className="bg-slate-800 hover:bg-slate-700 text-slate-300 border border-slate-700 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
-                                title="datasets 폴더 스캔 후 DB 갱신 및 목록 새로고침"
+                                className="bg-slate-800 hover:bg-slate-700 text-emerald-300 border border-emerald-700/50 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
+                                title="디스크 스캔 없이 DB 기준 작업 목록·통계만 새로고침"
                             >
                                 {isSyncing ? (
-                                    <svg className="animate-spin h-4 w-4 text-sky-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                                    <svg className="animate-spin h-4 w-4 text-emerald-400" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
                                         <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                                         <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                                     </svg>
                                 ) : (
                                     <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" /></svg>
                                 )}
-                                {isSyncing ? 'Syncing...' : 'Sync Data'}
+                                {isSyncing ? '새로고침…' : 'DB 새로고침'}
                             </button>
+                            {onFullDiskSync && (
+                                <button
+                                    type="button"
+                                    onClick={() => void handleFullDiskSyncClick()}
+                                    disabled={isSyncing || isLightRefreshing}
+                                    className="bg-slate-900 hover:bg-slate-800 text-amber-200/90 border border-amber-800/60 px-4 py-2.5 rounded-lg text-sm font-bold flex items-center gap-2 transition-all shadow active:scale-[0.98] disabled:opacity-50"
+                                    title="datasets 전체 디스크 스캔 — 프로젝트 상세의 동기화를 권장"
+                                >
+                                    전체 디스크 스캔
+                                </button>
+                            )}
                         </>
                     )}
                     {accountType !== AccountType.ADMIN && onLightRefresh && (
@@ -4649,6 +6970,18 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                     <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7h18M6 12h12M9 17h6" /></svg>
                                     Project Overview
                                 </button>
+                                {role === UserRole.REVIEWER && (
+                                    <button
+                                        onClick={() => setSelectedFolder(REVIEW_QUEUE_VIEW)}
+                                        className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${selectedFolder === REVIEW_QUEUE_VIEW
+                                            ? 'bg-purple-900/40 text-purple-100 border border-purple-600/50 shadow-sm'
+                                            : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
+                                            }`}
+                                    >
+                                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" /></svg>
+                                        검수 큐
+                                    </button>
+                                )}
                                 <button
                                     onClick={() => setSelectedFolder(WORKER_REPORT_VIEW)}
                                     className={`w-full flex items-center gap-3 px-3 py-2.5 rounded-lg text-base font-bold transition-all mb-2 ${(selectedFolder === WORKER_REPORT_VIEW || selectedFolder === WEEKLY_REPORT_VIEW || selectedFolder === DAILY_REPORT_VIEW)
@@ -4696,9 +7029,29 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
                 {/* Center Content: Task List */}
                 <div className="flex-1 bg-slate-900 border border-slate-800 rounded-xl shadow-md overflow-hidden flex flex-col relative min-w-0">
+                    {role === UserRole.REVIEWER && reviewerScopeWorker && (
+                        <div className="shrink-0 flex items-center justify-between gap-3 px-4 py-2 bg-purple-950/40 border-b border-purple-800/40 text-xs text-purple-100">
+                            <span>
+                                검수 범위:{' '}
+                                <span className="font-bold text-white">{reviewerScopeWorker}</span>
+                                <span className="text-purple-300/90"> 배정 태스크만 표시</span>
+                            </span>
+                            {onClearReviewerScope && (
+                                <button
+                                    type="button"
+                                    onClick={() => onClearReviewerScope()}
+                                    className="shrink-0 px-2 py-1 rounded-md bg-slate-800/80 hover:bg-slate-700 text-purple-200 text-[11px] font-semibold border border-purple-700/40"
+                                >
+                                    전체 보기
+                                </button>
+                            )}
+                        </div>
+                    )}
 
                     {/* --- ADMIN VIEWS & FOLDER MODES --- */}
-                    {selectedFolder === NOTICE_HOME_VIEW && accountType !== AccountType.ADMIN ? (
+                    {selectedFolder === REVIEW_QUEUE_VIEW && accountType === AccountType.ADMIN && role === UserRole.REVIEWER ? (
+                        <ReviewQueuePanel workers={workers} tasks={tasks} onSelectTask={onSelectTask} onRefresh={onRefresh} />
+                    ) : selectedFolder === NOTICE_HOME_VIEW && accountType !== AccountType.ADMIN ? (
                         <NoticeHomeView
                             notice={noticeContent}
                             onStart={() => setSelectedFolder(WORK_LIST_VIEW)}
@@ -4730,57 +7083,139 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                     </td>
                                                 </tr>
                                             ) : (
-                                                assignedWorkListFolders.map((folder) => {
-                                                    const progress = folder.count > 0 ? Math.round((folder.completed / folder.count) * 100) : 0;
+                                                assignedWorkListGrouped.flatMap(({ groupName, items }) => {
+                                                    const gKey = groupName || '__root__';
+                                                    const isFlatOnly = items.length === 1 && items[0].name === groupName;
 
-                                                    // Resolve Project Name using mapped projectId
-                                                    const projectId = workerProjectOverview?.projectMap?.[folder.name]?.projectId;
-                                                    const project = projectId ? workerProjectOverview?.projects?.find(p => String(p.id) === String(projectId)) : null;
-                                                    const projectName = project ? project.name : getTopLevelGroup(folder.name);
+                                                    const renderFolderRow = (folder: (typeof items)[0], pathLabel: string, pathTitle?: string) => {
+                                                        const progress = folder.count > 0 ? Math.round((folder.completed / folder.count) * 100) : 0;
+                                                        const projectId = resolveProjectMapEntryForFolder(folder.name, workerProjectOverview?.projectMap || {})?.projectId;
+                                                        const project = projectId ? workerProjectOverview?.projects?.find((p) => String(p.id) === String(projectId)) : null;
+                                                        const projectName = project ? project.name : getTopLevelGroup(folder.name);
+                                                        return (
+                                                            <tr
+                                                                key={folder.name}
+                                                                onClick={() => {
+                                                                    setFolderReturnView(WORK_LIST_VIEW);
+                                                                    setActiveProjectWorkflowSourceType('');
+                                                                    setSelectedFolder(folder.name);
+                                                                }}
+                                                                className="hover:bg-cyan-500/5 transition-all duration-200 group cursor-pointer"
+                                                            >
+                                                                <td className="px-6 py-6 whitespace-nowrap">
+                                                                    <span className="inline-flex items-center px-4 py-1.5 rounded-md bg-slate-800 text-slate-300 text-[14px] font-bold border border-white/10 group-hover:border-cyan-500/40 group-hover:text-cyan-300 transition-colors">
+                                                                        {projectName}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="px-6 py-6">
+                                                                    <div
+                                                                        className="text-[17px] font-bold text-slate-200 group-hover:text-white transition-colors break-all leading-relaxed"
+                                                                        title={pathTitle || folder.name}
+                                                                    >
+                                                                        {pathLabel}
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-6 py-6">
+                                                                    <div className="flex items-center gap-4">
+                                                                        <div className="flex-1 h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
+                                                                            <div
+                                                                                className="h-full bg-gradient-to-r from-cyan-600 to-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.4)] transition-all duration-500"
+                                                                                style={{ width: `${progress}%` }}
+                                                                            />
+                                                                        </div>
+                                                                        <span className="text-[17px] font-black font-mono text-cyan-400 w-16 text-right whitespace-nowrap">{progress}%</span>
+                                                                    </div>
+                                                                </td>
+                                                                <td className="px-6 py-6 text-right whitespace-nowrap">
+                                                                    <div className="flex items-baseline justify-end gap-2">
+                                                                        <span className="text-[20px] font-bold text-amber-400 font-mono tracking-tighter drop-shadow-[0_0_8px_rgba(251,191,36,0.3)]">
+                                                                            {Number(folder.completed || 0).toLocaleString()}
+                                                                        </span>
+                                                                        <span className="text-[15px] text-white font-mono font-bold opacity-90">
+                                                                            / {Number(folder.count || 0).toLocaleString()}
+                                                                        </span>
+                                                                    </div>
+                                                                </td>
+                                                            </tr>
+                                                        );
+                                                    };
 
-                                                    return (
+                                                    if (isFlatOnly) {
+                                                        return [renderFolderRow(items[0], items[0].name)];
+                                                    }
+
+                                                    const expanded = workListExpandedPathGroups.has(gKey);
+                                                    const aggCompleted = items.reduce((s, f) => s + Number(f.completed || 0), 0);
+                                                    const aggCount = items.reduce((s, f) => s + Number(f.count || 0), 0);
+                                                    const aggProgress = aggCount > 0 ? Math.round((aggCompleted / aggCount) * 100) : 0;
+                                                    const showSlash = items.some((i) => i.name !== groupName);
+
+                                                    const headerRow = (
                                                         <tr
-                                                            key={folder.name}
-                                                            onClick={() => {
-                                                                setFolderReturnView(WORK_LIST_VIEW);
-                                                                setActiveProjectWorkflowSourceType('');
-                                                                setSelectedFolder(folder.name);
+                                                            key={`grp-${gKey}`}
+                                                            className="hover:bg-cyan-500/5 transition-all duration-200 group cursor-pointer select-none"
+                                                            onClick={(e) => {
+                                                                e.preventDefault();
+                                                                e.stopPropagation();
+                                                                setWorkListExpandedPathGroups((prev) => {
+                                                                    const next = new Set(prev);
+                                                                    if (next.has(gKey)) next.delete(gKey);
+                                                                    else next.add(gKey);
+                                                                    return next;
+                                                                });
                                                             }}
-                                                            className="hover:bg-cyan-500/5 transition-all duration-200 group cursor-pointer"
                                                         >
-                                                            <td className="px-6 py-6 whitespace-nowrap">
-                                                                <span className="inline-flex items-center px-4 py-1.5 rounded-md bg-slate-800 text-slate-300 text-[14px] font-bold border border-white/10 group-hover:border-cyan-500/40 group-hover:text-cyan-300 transition-colors">
-                                                                    {projectName}
+                                                            <td className="px-6 py-6 whitespace-nowrap align-middle">
+                                                                <span className="inline-flex items-center gap-2 px-4 py-1.5 rounded-md bg-slate-800 text-slate-300 text-[14px] font-bold border border-white/10 group-hover:border-cyan-500/40 group-hover:text-cyan-300 transition-colors">
+                                                                    <span className="text-cyan-400 font-mono text-xs" aria-hidden>
+                                                                        {expanded ? '▼' : '▶'}
+                                                                    </span>
+                                                                    {items.length}개 폴더
                                                                 </span>
                                                             </td>
-                                                            <td className="px-6 py-6">
-                                                                <div className="text-[17px] font-bold text-slate-200 group-hover:text-white transition-colors break-all leading-relaxed">
-                                                                    {folder.name}
+                                                            <td className="px-6 py-6 align-middle">
+                                                                <div
+                                                                    className="text-[17px] font-bold text-slate-200 group-hover:text-white transition-colors break-all leading-relaxed"
+                                                                    title={items.map((i) => i.name).join('\n')}
+                                                                >
+                                                                    {groupName}
+                                                                    {showSlash ? '/' : ''}
+                                                                </div>
+                                                                <div className="text-[12px] text-slate-500 font-medium mt-1">
+                                                                    클릭하여 {expanded ? '접기' : '펼치기'}
                                                                 </div>
                                                             </td>
-                                                            <td className="px-6 py-6">
+                                                            <td className="px-6 py-6 align-middle">
                                                                 <div className="flex items-center gap-4">
                                                                     <div className="flex-1 h-2 bg-slate-950 rounded-full overflow-hidden shadow-inner">
                                                                         <div
                                                                             className="h-full bg-gradient-to-r from-cyan-600 to-cyan-400 shadow-[0_0_10px_rgba(34,211,238,0.4)] transition-all duration-500"
-                                                                            style={{ width: `${progress}%` }}
+                                                                            style={{ width: `${aggProgress}%` }}
                                                                         />
                                                                     </div>
-                                                                    <span className="text-[17px] font-black font-mono text-cyan-400 w-16 text-right whitespace-nowrap">{progress}%</span>
+                                                                    <span className="text-[17px] font-black font-mono text-cyan-400 w-16 text-right whitespace-nowrap">
+                                                                        {aggProgress}%
+                                                                    </span>
                                                                 </div>
                                                             </td>
-                                                            <td className="px-6 py-6 text-right whitespace-nowrap">
+                                                            <td className="px-6 py-6 text-right whitespace-nowrap align-middle">
                                                                 <div className="flex items-baseline justify-end gap-2">
                                                                     <span className="text-[20px] font-bold text-amber-400 font-mono tracking-tighter drop-shadow-[0_0_8px_rgba(251,191,36,0.3)]">
-                                                                        {Number(folder.completed || 0).toLocaleString()}
+                                                                        {Number(aggCompleted).toLocaleString()}
                                                                     </span>
                                                                     <span className="text-[15px] text-white font-mono font-bold opacity-90">
-                                                                        / {Number(folder.count || 0).toLocaleString()}
+                                                                        / {Number(aggCount).toLocaleString()}
                                                                     </span>
                                                                 </div>
                                                             </td>
                                                         </tr>
                                                     );
+
+                                                    if (!expanded) {
+                                                        return [headerRow];
+                                                    }
+
+                                                    return [headerRow, ...items.map((folder) => renderFolderRow(folder, folderPathAfterGroup(folder.name, groupName), folder.name))];
                                                 })
                                             )}
                                         </tbody>
@@ -4797,13 +7232,17 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                             onRefresh={onRefresh}
                             onRefreshTasksFromServer={onLightRefresh}
                             onSyncProject={onSyncProject}
-                            onSyncFolders={onSyncFolders}
                             workerNames={workers}
                             onOpenFolder={async (folderName, workflowSourceType) => {
                                 const wf = workflowSourceType === 'vlm-review' ? 'vlm-review' : workflowSourceType === 'image-classification' ? 'image-classification' : 'native-yolo';
                                 if (wf === 'image-classification') {
-                                    await Storage.fetchAndMergeTasksByFolder(folderName);
-                                    onRefresh?.();
+                                    onFolderPrepareLoading?.(true);
+                                    try {
+                                        await Storage.fetchAndMergeTasksByFolder(folderName);
+                                        onRefresh?.();
+                                    } finally {
+                                        onFolderPrepareLoading?.(false);
+                                    }
                                 }
                                 setFolderReturnView(`${PROJECT_DETAIL_VIEW_PREFIX}${selectedProjectId}`);
                                 setActiveProjectWorkflowSourceType(wf);
@@ -4814,15 +7253,77 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                         />
                     ) : selectedFolder === PROJECT_OVERVIEW_VIEW && accountType === AccountType.ADMIN ? (
                         <ProjectOverviewView
-                            onSync={handleSync}
+                            onSync={async () => {
+                                setIsSyncing(true);
+                                try {
+                                    await onSync();
+                                    Storage.invalidateProjectOverviewCache();
+                                    setOverviewRefreshKey((k) => k + 1);
+                                } catch (e) {
+                                    console.error(e);
+                                    alert('새로고침에 실패했습니다.');
+                                } finally {
+                                    setIsSyncing(false);
+                                }
+                            }}
+                            onFullDiskSync={
+                                onFullDiskSync
+                                    ? async () => {
+                                          setIsSyncing(true);
+                                          try {
+                                              await onFullDiskSync();
+                                              Storage.invalidateProjectOverviewCache();
+                                              setOverviewRefreshKey((k) => k + 1);
+                                          } catch (e) {
+                                              console.error(e);
+                                              alert('전체 디스크 스캔에 실패했습니다.');
+                                          } finally {
+                                              setIsSyncing(false);
+                                          }
+                                      }
+                                    : undefined
+                            }
+                            onSyncFolders={
+                                onSyncFolders
+                                    ? async (folders) => {
+                                          setIsSyncing(true);
+                                          try {
+                                              await onSyncFolders(folders);
+                                              setOverviewRefreshKey((k) => k + 1);
+                                          } catch (e) {
+                                              console.error(e);
+                                              alert('선택 폴더 스캔에 실패했습니다.');
+                                          } finally {
+                                              setIsSyncing(false);
+                                          }
+                                      }
+                                    : undefined
+                            }
+                            onAdoptFolders={
+                                onAdoptFolders
+                                    ? async (paths, projectId, assignedWorker) => {
+                                          setIsSyncing(true);
+                                          try {
+                                              await onAdoptFolders(paths, projectId, assignedWorker);
+                                              setOverviewRefreshKey((k) => k + 1);
+                                          } catch (e) {
+                                              console.error(e);
+                                              alert('프로젝트 등록·스캔에 실패했습니다.');
+                                          } finally {
+                                              setIsSyncing(false);
+                                          }
+                                      }
+                                    : undefined
+                            }
                             isSyncing={isSyncing}
                             onOpenProject={(projectId) => setSelectedFolder(`${PROJECT_DETAIL_VIEW_PREFIX}${projectId}`)}
                             overviewRefreshKey={overviewRefreshKey}
+                            workerNames={workers}
                         />
                     ) : selectedFolder === USER_MANAGEMENT_VIEW && accountType === AccountType.ADMIN ? (
                         <UserManagementView token={token} />
                     ) : (selectedFolder === WORKER_REPORT_VIEW || selectedFolder === WEEKLY_REPORT_VIEW || selectedFolder === DAILY_REPORT_VIEW) && accountType === AccountType.ADMIN ? (
-                        <UnifiedReportsView tasks={tasks} validWorkers={workers} onOpenSchedule={() => setSelectedFolder(SCHEDULE_VIEW)} />
+                        <UnifiedReportsView validWorkers={workers} onOpenSchedule={() => setSelectedFolder(SCHEDULE_VIEW)} />
                     ) : selectedFolder === ISSUE_REQUEST_VIEW && accountType === AccountType.ADMIN ? (
                         <IssueRequestView currentAdmin={username} onSelectTask={onSelectTask} />
                     ) : selectedFolder === SCHEDULE_VIEW && accountType === AccountType.ADMIN ? (
@@ -4860,7 +7361,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                     <div className="bg-slate-900 border border-slate-800 rounded-xl overflow-hidden min-h-[250px] flex items-center justify-center">
                                         {representativeTask ? (
                                             <img
-                                                src={representativeTask.imageUrl}
+                                                src={resolveDatasetPublicUrl(representativeTask.imageUrl)}
                                                 alt={representativeTask.name}
                                                 className="w-full h-full object-contain bg-black"
                                             />
@@ -4913,17 +7414,10 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                     />
                                                     <div className="flex gap-2">
                                                         <button
-                                                            onClick={() => {
-                                                                const folderTasks = [...tasksInFolder];
-                                                                folderTasks.sort((a, b) => a.name.localeCompare(b.name));
-                                                                const firstTodo = folderTasks.find(t => t.status === TaskStatus.TODO);
-                                                                if (firstTodo) {
-                                                                    onSelectTask(firstTodo.id);
-                                                                } else {
-                                                                    alert("No pending tasks found in this folder!");
-                                                                }
-                                                            }}
-                                                            className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
+                                                            type="button"
+                                                            disabled={continueWorkLoading}
+                                                            onClick={() => void handleContinueWorkInFolder('todo-only')}
+                                                            className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20 disabled:opacity-50 disabled:pointer-events-none"
                                                         >
                                                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                                                             작업 이어하기
@@ -4977,21 +7471,10 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                         {/* Action Buttons */}
                                         <div className="flex gap-2">
                                             <button
-                                                onClick={() => {
-                                                    const folderTasks = [...tasksInFolder];
-                                                    folderTasks.sort((a, b) => a.name.localeCompare(b.name));
-                                                    const firstPending = folderTasks.find(t =>
-                                                        t.status === TaskStatus.TODO ||
-                                                        t.status === TaskStatus.IN_PROGRESS ||
-                                                        t.status === TaskStatus.REJECTED
-                                                    );
-                                                    if (firstPending) {
-                                                        onSelectTask(firstPending.id);
-                                                    } else {
-                                                        alert("No pending tasks (TODO, IN_PROGRESS, REJECTED) found in this folder!");
-                                                    }
-                                                }}
-                                                className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20"
+                                                type="button"
+                                                disabled={continueWorkLoading}
+                                                onClick={() => void handleContinueWorkInFolder('pending-worker')}
+                                                className="bg-sky-600 hover:bg-sky-500 text-white px-4 py-2 rounded-lg text-sm font-bold flex items-center gap-2 transition-colors shadow-lg shadow-sky-900/20 disabled:opacity-50 disabled:pointer-events-none"
                                             >
                                                 <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
                                                 작업 이어하기
@@ -5043,7 +7526,7 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                                             <span className="text-xs text-slate-500">/ {activeFolderStats.count}</span>
                                                         </div>
                                                         <div className="w-full bg-slate-700 h-1 mt-2 rounded-full overflow-hidden">
-                                                            <div className="bg-sky-500 h-full" style={{ width: `${(activeFolderStats.completed / activeFolderStats.count) * 100}%` }}></div>
+                                                            <div className="bg-sky-500 h-full" style={{ width: `${activeFolderStats.count > 0 ? (activeFolderStats.completed / activeFolderStats.count) * 100 : 0}%` }}></div>
                                                         </div>
                                                     </div>
                                                 )}
@@ -5066,14 +7549,25 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
 
                                 {/* Task Grid */}
                                 <div className="flex-1 overflow-y-auto p-6 bg-slate-900/50">
-                                    <div className="flex justify-between items-center mb-4">
+                                    <div className="flex justify-between items-center mb-4 flex-wrap gap-2">
                                         <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider">
-                                            Task List {tasksInFolder.length > displayLimit && `(Showing ${displayLimit})`}
+                                            Task List
+                                            {folderPager && folderPager.folder === selectedFolder && (
+                                                <span className="text-slate-600 normal-case font-medium ml-2">
+                                                    ({tasksInFolder.length}
+                                                    {folderPager.total > 0 ? ` / ${folderPager.total}` : ''}
+                                                    {folderPager.loading ? ' · 로딩…' : ''})
+                                                </span>
+                                            )}
                                         </h3>
                                     </div>
 
                                     <div className="grid grid-cols-1 gap-3">
-                                        {renderedTasks.length === 0 ? (
+                                        {folderPager && folderPager.folder === selectedFolder && folderPager.loading && renderedTasks.length === 0 ? (
+                                            <div className="h-40 flex items-center justify-center text-slate-500 text-sm italic border border-dashed border-slate-800 rounded-xl">
+                                                폴더 작업 목록을 불러오는 중…
+                                            </div>
+                                        ) : renderedTasks.length === 0 ? (
                                             <div className="h-40 flex items-center justify-center text-slate-500 text-sm italic border border-dashed border-slate-800 rounded-xl">
                                                 No pending tasks.
                                             </div>
@@ -5111,6 +7605,16 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
                                             ))
                                         )}
                                     </div>
+                                    {folderPager && folderPager.folder === selectedFolder && folderPager.items.length < folderPager.total && !folderPager.loading && (
+                                        <button
+                                            type="button"
+                                            onClick={() => void handleLoadMoreFolderTasks()}
+                                            disabled={folderPager.loadingMore}
+                                            className="mt-4 w-full py-2.5 rounded-lg text-sm font-bold border border-slate-700 text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                                        >
+                                            {folderPager.loadingMore ? '불러오는 중…' : `더 보기 (${folderPager.items.length} / ${folderPager.total})`}
+                                        </button>
+                                    )}
                                 </div>
                             </>
                         ) : (
@@ -5157,5 +7661,10 @@ const Dashboard: React.FC<DashboardProps> = ({ role, accountType, onSelectTask, 
         </div>
     );
 };
+
+/** 디스크 스캔·동기화 후 App 등에서 호출 — 열린 프로젝트 상세가 옛 통계를 쓰지 않도록 */
+export function invalidateProjectDetailCache() {
+    projectDetailCache.clear();
+}
 
 export default Dashboard;

@@ -1,0 +1,44 @@
+:root {
+  --accent-blue: #52B6FF;
+  --accent-lime: #A8E61B;
+  --accent-purple: #B08ED4;
+  --bg-deep: #1A1A2E;
+  --glass-bg: rgba(26, 26, 46, 0.6);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --glass-border-strong: rgba(255, 255, 255, 0.12);
+}
+
+html,
+body,
+#root {
+  font-family: 'Pretendard Variable', Pretendard, -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  background-color: var(--bg-deep);
+}
+
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid var(--glass-border);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.2);
+}
+
+.glass-card {
+  background: rgba(26, 26, 46, 0.5);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--glass-border-strong);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.25);
+}
+
+/* Progress range slider thumb */
+input[type="range"].progress-slider::-webkit-slider-thumb {
+  background: var(--accent-blue);
+}
+input[type="range"].progress-slider::-moz-range-thumb {
+  background: var(--accent-blue);
+}

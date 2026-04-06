@@ -70,6 +70,48 @@
 
 ---
 
+2026-03-03 (화) 개발일지 — 태스크 부분 로드 · API read/write · 회귀 문서
+1) 배경
+- C: 로그인 직후 태스크 **초기 배치만** 동기화, 나머지는 백그라운드 `loadMoreTasks`로 보강 (`services/storage.ts`, `App.tsx`).
+- D: `YOLO_API_STUDIO` 라우트에서 조회는 `getReadDb`, 쓰기·sync는 `getWriteDb` 분리; `DB_READ_PATH`는 `.env.example`에 설명 추가.
+2) 이번에 한 일
+- 수동 점검용 [`docs/regression-checklist.md`](docs/regression-checklist.md) 추가 (로그인·fullSync·작업자/VLM/매핑·이슈·read 경로 스모크).
+- [`docs/task-cache-dependencies.md`](docs/task-cache-dependencies.md): `cachedTasks` / `getTasks` / `getTaskById` 의존 화면 정리(부분 로드 이후 리스크).
+3) 다음 백로그(미착수)
+- 대시보드 서버 페이지네이션·요약 API, 폴더/필터 단위 로드 확대, PG 마이그레이션 등.
+
+2026-03-03 (대시보드 API 요약 1차) — 프로젝트 상세 VLM 작업자 행
+- `YOLO_API_STUDIO` `buildProjectDetailPayload`: VLM `sourceFile` 기준 작업자별 `reviewPendingCount`, `firstSubmittedTaskId`, `firstApprovedTaskId`, `firstOpenTaskId`, `sampleTaskId` SQL 집계.
+- `Dashboard` `ProjectDetailView`: VLM 프로젝트는 위 필드로 검수 건수·진입 태스크 선택 — 클라이언트 전체 `tasks` 스캔 제거(해당 테이블 행).
+- `storage` `ProjectDetailPayload.workers` 타입 확장.
+
+2026-03-03 (작업자 작업목록·홈 snapshot) — 부분 캐시 + 폴더 요약
+- `Dashboard`: `AccountType.WORKER` 이고 `selectedFolder` 가 작업 목록 또는 대시보드 홈일 때 `fetchAndMergeWorkerTasks(username)` 후 `onRefresh` (시퀀스·로딩 동일 패턴).
+- `folderOverviews` / 상단 `globalStats` 가 로그인 직후 drain 전에도 본인 기준으로 맞게 됨.
+
+2026-03-03 (폴더 진입 hydrate) — 부분 캐시 + 폴더 화면
+- `Dashboard`: 실제 폴더 경로 선택 시 `fetchAndMergeTasksByFolder` + `onRefresh` (시퀀스 가드). `onFolderPrepareLoading` 으로 대량 fetch 시 로딩 표시.
+- 작업자/관리자 공통: 폴더 내 목록·`activeFolderDetails` 등이 drain 완료 전에도 정합.
+
+2026-03-03 (대시보드 API 요약 2차) — 폴더 매핑 프로젝트(YOLO·분류·VLM 폴더형)
+- `buildProjectDetailPayload` else 분기: 프로젝트 폴더 `IN (...)` 로 작업자별 동일 집계 enrich (`tasks` 또는 `vlm_tasks`).
+- `ProjectDetailView`: `useServerReviewMeta = VLM 워크플로 || row.sampleTaskId` 로 서버 메타 통합 — 네이티브/분류도 상세 화면에서 `tasks` 스캔 생략(해당 표).
+
+2026-03-03 (이어서) — 검수/작업 이전·다음 + 부분 캐시
+- `App.tsx`: `findNextTaskWithFolderHydration` — 캐시에서 이전/다음을 못 찾으면 `fetchAndMergeTasksByFolder` 후 재시도 (제출·검수·VLM 이동·이슈 후 자동 다음·점프 인덱스 포함).
+- `docs/task-cache-dependencies.md`에 폴더 보강 동작 반영.
+
+2026-03-03 (todo 마무리) — 폴더 목록 서버 페이징·작업자 init·PG/레플리카 문서
+- API: `GET /api/datasets/count`, `/api/datasets/folder-metrics`, `/api/datasets` 에 `sort`(updated|name|id).
+- `Dashboard`: `folderPager` + 서버 metrics로 폴더 상단 통계·작업 목록 페이지·더 보기.
+- `storage` + `initStorage`: 작업자는 초기 전역 페이징 생략 후 `fetchAndMergeWorkerTasks` 한 번; `App`은 관리자만 `startBackgroundTaskListDrain`.
+- `YOLO_API_STUDIO`: 기동 시 `DB_READ_PATH`===`DB_PATH` 경고, `docs/postgresql-migration.md`, `read-replica-operations.md`.
+
+2026-03-03 (관리자 리포트·안내) — drain과 집계 정합
+- `Dashboard`: 관리자 + Reports/Weekly/Daily 뷰 선택 시 `resyncTasksFromServerFull` → `onRefresh` (시퀀스·`onFolderPrepareLoading` 동일 패턴).
+- `App` → `Dashboard`에 `taskListBackgroundPending` 전달; 관리자·검수자 역할일 때 상단 카드에 백그라운드 로딩 안내.
+- [`docs/performance-scale-sprint.md`](docs/performance-scale-sprint.md) 요약 추가, 회귀 §1.6·`task-cache-dependencies` 갱신.
+
 2026-03-13 (금) 개발일지 — YOLO 로컬툴
 1) 목표
 yolo_localtool 빌드·실행 시 로고 표시, 이미지/라벨 로딩 깜빡임 제거, 상단/하단 UI 요소 위치 조정
@@ -95,7 +137,7 @@ UI 배치
 
 ---
 
-이미지 분류(멀티라벨링) 개발
+2026-03-13 (금) 개발일지 — 이미지 분류(멀티라벨링) 개발
 1) 목표
 YOLO·VLM과 동일한 프로젝트/폴더 구조에서 이미지당 단일 클래스 선택 라벨링 워크플로우 추가
 2) 작업 내용
